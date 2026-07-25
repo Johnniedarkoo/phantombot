@@ -227,6 +227,67 @@ export const DEFAULT_RETRIEVAL: RetrievalSettings = {
   graphExpansion: DEFAULT_GRAPH_EXPANSION,
 };
 
+/**
+ * Durable-facts settings (PhantomOps-style, adapted). Two halves:
+ *
+ *   WRITE (extract-at-cliff): when a turn ages out of the ~30-turn live
+ *   window, an out-of-band temp-0 pass on the PRIMARY harness pulls durable
+ *   facts out of it BEFORE it is lost, and stores them in the `durable_facts`
+ *   table. Non-blocking — it never delays the interactive reply.
+ *
+ *   READ (inject-every-prompt): at prompt-assembly time a plain SQL SELECT
+ *   pulls the top facts for this persona/conversation (confidence + recency)
+ *   into the system prompt. No model call on the read path.
+ *
+ * Optional on Config (like retrieval): `loadConfig` always populates it, but
+ * ad-hoc test configs may omit it, in which case the `make*` factories return
+ * undefined and neither half runs.
+ */
+export interface DurableFactsSettings {
+  /** Master switch for BOTH the extract and inject halves. */
+  enabled: boolean;
+  /** Max facts injected into the system prompt per turn (read path). */
+  maxInjected: number;
+  /** Only inject facts at or above this confidence (0..1). */
+  minConfidence: number;
+  /** Max evicted turns extracted from in one out-of-band pass. */
+  maxExtractPerTurn: number;
+  /**
+   * Crash-recovery lease window (ms) for a claimed-but-not-yet-committed turn.
+   * If the pass that claimed a turn dies without committing or releasing it,
+   * the lease expires after this long and the turn becomes re-claimable. The
+   * common failure (harness reject/timeout) releases immediately and does not
+   * wait this out; only a hard process crash does.
+   *
+   * MUST outlast a full harness extraction, or a slow-but-successful pass would
+   * have its lease expire mid-call and let a concurrent pass re-claim the same
+   * turn — a duplicate model call plus a stale late write (Kai, PR #320).
+   * buildDurableFactsConfig floors this at harnessHardTimeoutMs plus a commit
+   * margin, so only a genuine crash (which never finishes) can hit expiry.
+   */
+  leaseMs: number;
+}
+
+/**
+ * Safety margin (ms) added on top of the harness hard timeout when flooring
+ * leaseMs — covers the commit/release write that runs AFTER a slow extraction
+ * returns, so the lease can't lapse in the gap between the harness completing
+ * and the commit landing.
+ */
+export const LEASE_COMMIT_MARGIN_MS = 300_000;
+
+export const DEFAULT_DURABLE_FACTS: DurableFactsSettings = {
+  enabled: true,
+  maxInjected: 8,
+  minConfidence: 0.5,
+  maxExtractPerTurn: 4,
+  // Default harness hard timeout (3_600_000) + LEASE_COMMIT_MARGIN_MS. Kept
+  // self-consistent with the default hard timeout so even a Config assembled
+  // without buildDurableFactsConfig (e.g. an ad-hoc test) is race-safe;
+  // buildDurableFactsConfig re-enforces the floor against the ACTUAL timeout.
+  leaseMs: 3_900_000,
+};
+
 export interface TelegramStreamingSettings {
   /** Coalesce progress narration bubbles to at most this cadence. */
   narrationFlushMs: number;
@@ -359,6 +420,15 @@ export interface Config {
    */
   retrieval?: RetrievalSettings;
 
+  /**
+   * Durable facts (extract-at-cliff + inject-every-prompt). See
+   * DurableFactsSettings. Optional on the type so ad-hoc Config constructors
+   * needn't spell it out — `loadConfig` ALWAYS populates it. When absent (or
+   * `enabled: false`), `makeFactExtractor`/`makeDurableFactPuller` return
+   * undefined and neither half runs.
+   */
+  durableFacts?: DurableFactsSettings;
+
   voice: import("./lib/voice.ts").VoiceConfig;
 
   /**
@@ -453,6 +523,10 @@ export async function loadConfig(): Promise<Config> {
     string,
     unknown
   >;
+  const tomlDurableFacts = (toml.durable_facts ?? {}) as Record<
+    string,
+    unknown
+  >;
   const tomlVoice = (toml.voice ?? {}) as Record<string, unknown>;
 
   const configuredChain =
@@ -470,6 +544,16 @@ export async function loadConfig(): Promise<Config> {
     );
   }
   if (migratedChain.length === 0) migratedChain.push(...DEFAULT_HARNESS_CHAIN);
+
+  // Resolved once here (not just inline in the object) because the durable-fact
+  // lease floor is derived from it — see buildDurableFactsConfig.
+  const harnessHardTimeoutMs =
+    asInt(process.env.PHANTOMBOT_HARNESS_HARD_TIMEOUT_MS) ??
+    (asInt(toml.harness_hard_timeout_s) !== undefined
+      ? asInt(toml.harness_hard_timeout_s)! * 1000
+      : undefined) ??
+    legacyTurnTimeoutMs(toml) ??
+    3_600_000;
 
   return {
     defaultPersona:
@@ -501,13 +585,7 @@ export async function loadConfig(): Promise<Config> {
       legacyTurnTimeoutMs(toml) ??
       300_000,
 
-    harnessHardTimeoutMs:
-      asInt(process.env.PHANTOMBOT_HARNESS_HARD_TIMEOUT_MS) ??
-      (asInt(toml.harness_hard_timeout_s) !== undefined
-        ? asInt(toml.harness_hard_timeout_s)! * 1000
-        : undefined) ??
-      legacyTurnTimeoutMs(toml) ??
-      3_600_000,
+    harnessHardTimeoutMs,
 
     personasDir:
       process.env.PHANTOMBOT_PERSONAS_DIR ??
@@ -583,6 +661,10 @@ export async function loadConfig(): Promise<Config> {
     embeddings: buildEmbeddingsConfig(tomlEmbeddings, tomlGemini),
 
     retrieval: buildRetrievalConfig(tomlRetrieval, tomlTurnIndexing),
+    durableFacts: buildDurableFactsConfig(
+      tomlDurableFacts,
+      harnessHardTimeoutMs,
+    ),
 
     voice: buildVoiceConfig(tomlVoice),
 
@@ -763,6 +845,60 @@ function buildTurnIndexingConfig(
     // 0 disables the repair pass. Capped so one sweep can't fire off an
     // unbounded burst of embedding calls at a provider that may be rate-limiting.
     repairBatchSize: Math.max(0, Math.min(1_000, repairBatchSize)),
+  };
+}
+
+/**
+ * Resolve durable-facts settings. Env wins over TOML wins over defaults, and
+ * values are clamped so a fat-fingered config can't blow the per-turn prompt
+ * budget or the extraction fan-out.
+ */
+function buildDurableFactsConfig(
+  toml: Record<string, unknown>,
+  harnessHardTimeoutMs: number,
+): DurableFactsSettings {
+  const enabled =
+    asBool(process.env.PHANTOMBOT_DURABLE_FACTS_ENABLED) ??
+    asBool(toml.enabled) ??
+    DEFAULT_DURABLE_FACTS.enabled;
+  const maxInjected =
+    asInt(process.env.PHANTOMBOT_DURABLE_FACTS_MAX_INJECTED) ??
+    asInt(toml.max_injected) ??
+    DEFAULT_DURABLE_FACTS.maxInjected;
+  // Parsed as a float (not asInt): the default (0.5) is fractional and
+  // Math.floor would round it to 0, silently removing the confidence floor.
+  const minConfidence =
+    asNumber(process.env.PHANTOMBOT_DURABLE_FACTS_MIN_CONFIDENCE) ??
+    asNumber(toml.min_confidence) ??
+    DEFAULT_DURABLE_FACTS.minConfidence;
+  const maxExtractPerTurn =
+    asInt(process.env.PHANTOMBOT_DURABLE_FACTS_MAX_EXTRACT_PER_TURN) ??
+    asInt(toml.max_extract_per_turn) ??
+    DEFAULT_DURABLE_FACTS.maxExtractPerTurn;
+  const leaseMs =
+    asInt(process.env.PHANTOMBOT_DURABLE_FACTS_LEASE_MS) ??
+    asInt(toml.lease_ms) ??
+    DEFAULT_DURABLE_FACTS.leaseMs;
+  return {
+    enabled,
+    // 0 disables injection; capped so one turn can't stuff the prompt.
+    maxInjected: Math.max(0, Math.min(100, maxInjected)),
+    // A probability floor: clamp to 0..1.
+    minConfidence: Math.max(0, Math.min(1, minConfidence)),
+    // At least 1 evicted turn per pass; capped so a long backfill can't fire
+    // an unbounded burst of harness calls in one out-of-band pass.
+    maxExtractPerTurn: Math.max(1, Math.min(100, maxExtractPerTurn)),
+    // Floor at the harness hard timeout + a commit margin (and never below 1s).
+    // A lease that could expire before a slow extraction finishes would let a
+    // concurrent pass re-claim the turn and fire a DUPLICATE model call while
+    // the original is still running, then have the original's late write land
+    // behind it (Kai, PR #320). Flooring above the maximum a single extraction
+    // can take means only a genuine crash — which never completes — hits expiry.
+    leaseMs: Math.max(
+      1000,
+      harnessHardTimeoutMs + LEASE_COMMIT_MARGIN_MS,
+      Math.floor(leaseMs),
+    ),
   };
 }
 
