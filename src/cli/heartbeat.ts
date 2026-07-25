@@ -10,7 +10,9 @@ import { existsSync } from "node:fs";
 
 import { type Config, loadConfig, memoryIndexPath, personaDir } from "../config.ts";
 import { isPhantombotBinary } from "../lib/binaryIdentity.ts";
+import { defaultEmbedder, runEmbedJob } from "../lib/embedJob.ts";
 import { runHeartbeat } from "../lib/heartbeat.ts";
+import { MemoryIndex } from "../lib/memoryIndex.ts";
 import type { WriteSink } from "../lib/io.ts";
 import { log } from "../lib/logger.ts";
 import { currentPlatform } from "../lib/platform.ts";
@@ -50,6 +52,23 @@ export interface RunHeartbeatCliInput {
    * systemd bus and only run if available.
    */
   healSystemd?: false | (() => Promise<void>);
+  /**
+   * Test seam for the fresh-note embed pass. Pass `false` to skip it
+   * entirely (keeps the real Gemini embedder out of the path — this is
+   * effectively what a `provider: "none"` config already does, but the
+   * flag is explicit). Pass a function to substitute a fake that returns
+   * the embed counts the pass should have produced (or `null` to model
+   * "no embedder configured"). Production passes undefined → we build the
+   * real embedder from config and run runEmbedJob against the note index.
+   */
+  embedNotes?: false | (() => Promise<EmbedNotesResult | null>);
+}
+
+/** Outcome of the heartbeat's incremental note-embed pass. */
+export interface EmbedNotesResult {
+  embedded: number;
+  skipped: number;
+  failed: number;
 }
 
 export async function runHeartbeatCli(
@@ -79,8 +98,8 @@ export async function runHeartbeatCli(
 
   // Drain sub-threshold conversation turn tails on the heartbeat's regular
   // cadence. The live service only flushes a conversation when a new message
-  // crosses the 20-turn batch, so a quiet conversation stuck below it (e.g.
-  // 19 turns) would stay unembedded for days — recent chat goes invisible to
+  // crosses the turn-index batch, so a quiet conversation stuck below it
+  // would stay unembedded for days — recent chat goes invisible to
   // recall. This time-based sweep (flushAfterHours) closes that gap for every
   // conversation, mechanically, with no LLM call. Wrapped in try/catch so a
   // turn-flush hiccup never breaks the primary heartbeat work.
@@ -106,6 +125,37 @@ export async function runHeartbeatCli(
     log.warn("heartbeat: turn-flush sweep threw unexpectedly", {
       error: (e as Error).message,
     });
+  }
+
+  // Embed newly-written notes on the heartbeat's regular cadence so a
+  // `memory capture`, a fresh KB note, or a drawer promotion becomes
+  // *semantically* recallable within ~30 min instead of waiting for the
+  // nightly `memory index --rebuild` (a full day of lag). runHeartbeat has
+  // already refreshed the FTS index above, so the `files` table is current;
+  // this incremental pass embeds only chunks whose text_sha changed (new or
+  // edited notes) and skips everything else — no API call for unchanged
+  // content. The nightly rebuild still runs for full consistency (deletions,
+  // model/dim changes, drift repair). Wrapped in try/catch: an embed hiccup
+  // must never break the primary heartbeat work.
+  let noteEmbedLine = "";
+  if (input.embedNotes !== false) {
+    try {
+      const e = input.embedNotes
+        ? await input.embedNotes()
+        : await defaultEmbedNotes(config, dir, persona);
+      if (e && (e.embedded > 0 || e.failed > 0)) {
+        noteEmbedLine = `, embedded ${e.embedded}`;
+        log.info("heartbeat: embedded fresh notes", {
+          embedded: e.embedded,
+          skipped: e.skipped,
+          failed: e.failed,
+        });
+      }
+    } catch (e) {
+      log.warn("heartbeat: note-embed pass threw unexpectedly", {
+        error: (e as Error).message,
+      });
+    }
   }
 
   // Self-heal the service-manager units on the heartbeat's regular cadence.
@@ -141,9 +191,32 @@ export async function runHeartbeatCli(
   out.write(
     `heartbeat ok: promoted ${r.promoted.length}, ` +
       `stale ${r.staleRecent.length}, ` +
-      `indexed ${r.indexedFiles}${updateLine}\n`,
+      `indexed ${r.indexedFiles}${noteEmbedLine}${updateLine}\n`,
   );
   return 0;
+}
+
+/**
+ * Production note-embed pass: build the configured embedder and run an
+ * incremental embed job over the note index. Returns `null` when no
+ * embedder is configured (e.g. `embeddings.provider: "none"` or a missing
+ * Gemini key) so the caller prints no embed line. Owns the MemoryIndex
+ * handle it opens and closes it in a finally.
+ */
+async function defaultEmbedNotes(
+  config: Config,
+  dir: string,
+  persona: string,
+): Promise<EmbedNotesResult | null> {
+  const embedder = defaultEmbedder(config);
+  if (!embedder) return null;
+  const ix = await MemoryIndex.open(indexPath(persona));
+  try {
+    const e = await runEmbedJob({ personaDir: dir, index: ix, embedder });
+    return { embedded: e.embedded, skipped: e.skipped, failed: e.failed };
+  } finally {
+    ix.close();
+  }
 }
 
 /**
@@ -205,7 +278,7 @@ export default defineCommand({
   meta: {
     name: "heartbeat",
     description:
-      "Mechanical 30-min maintenance: promote tagged daily-file lines to drawers, scan ## Recent for staleness, refresh FTS index. No LLM call.",
+      "Mechanical 30-min maintenance: promote tagged daily-file lines to drawers, scan ## Recent for staleness, refresh FTS index, flush due conversation-turn tails, and embed newly-written notes. No LLM call.",
   },
   args: {
     persona: {
