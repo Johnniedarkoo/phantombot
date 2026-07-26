@@ -120,7 +120,7 @@ describe("extractDurableFactsOnEviction", () => {
     expect(res.turnsProcessed).toBe(4);
     expect(res.factsWritten).toBe(2);
 
-    const facts = await memory.topDurableFacts(PERSONA, CONV, { limit: 10 });
+    const facts = await memory.topDurableFacts(PERSONA, { limit: 10 });
     expect(facts.map((f) => f.fact).sort()).toEqual([
       "Andrew lives in Arnhem",
       "He uses Deye inverters",
@@ -156,7 +156,7 @@ describe("extractDurableFactsOnEviction", () => {
     // The quarantined turn must never be handed to the extractor.
     expect(seen.some((m) => m.includes("SECRET"))).toBe(false);
     expect(res.factsWritten).toBe(1);
-    const facts = await memory.topDurableFacts(PERSONA, CONV, { limit: 10 });
+    const facts = await memory.topDurableFacts(PERSONA, { limit: 10 });
     expect(facts.map((f) => f.fact)).toEqual(["kept"]);
   });
 
@@ -174,7 +174,7 @@ describe("extractDurableFactsOnEviction", () => {
       complete,
       windowSize: 2,
     });
-    const facts = await memory.topDurableFacts(PERSONA, CONV, { limit: 10 });
+    const facts = await memory.topDurableFacts(PERSONA, { limit: 10 });
     expect(facts).toHaveLength(1);
     expect(facts[0]!.confidence).toBeCloseTo(0.9); // max of the two
   });
@@ -215,7 +215,7 @@ describe("extractDurableFactsOnEviction", () => {
     });
     expect(res.triggered).toBe(false);
     expect(calls).toBe(0);
-    expect(await memory.countDurableFacts(PERSONA, CONV)).toBe(0);
+    expect(await memory.countDurableFacts(PERSONA)).toBe(0);
   });
 
   test("never throws when the completion fn rejects", async () => {
@@ -232,7 +232,7 @@ describe("extractDurableFactsOnEviction", () => {
       windowSize: 2,
     });
     expect(res.factsWritten).toBe(0);
-    expect(await memory.countDurableFacts(PERSONA, CONV)).toBe(0);
+    expect(await memory.countDurableFacts(PERSONA)).toBe(0);
   });
 
   test("mid-batch failure releases the failed turn + tail, so only those re-extract next pass", async () => {
@@ -273,7 +273,7 @@ describe("extractDurableFactsOnEviction", () => {
       windowSize: 2,
     });
     expect(res2.turnsProcessed).toBe(3); // turns 2, 3, 4 re-claimed — NOT turn 1
-    expect(await memory.countDurableFacts(PERSONA, CONV)).toBe(3); // 1 + 2
+    expect(await memory.countDurableFacts(PERSONA)).toBe(3); // 1 + 2
 
     // And now everything is committed: a third pass finds nothing.
     const res3 = await extractDurableFactsOnEviction({
@@ -315,7 +315,7 @@ describe("extractDurableFactsOnEviction", () => {
       windowSize: 2,
     });
     expect(res.turnsProcessed).toBe(4);
-    expect(await memory.countDurableFacts(PERSONA, CONV)).toBe(1);
+    expect(await memory.countDurableFacts(PERSONA)).toBe(1);
   });
 
   test("a crashed pass (leases left live) does NOT re-extract until the lease expires", async () => {
@@ -368,7 +368,7 @@ describe("extractDurableFactsOnEviction", () => {
       windowSize: 2,
     });
     expect(res2.turnsProcessed).toBe(4);
-    expect(await memory.countDurableFacts(PERSONA, CONV)).toBe(1);
+    expect(await memory.countDurableFacts(PERSONA)).toBe(1);
   });
 
   test("a clean pass commits everything — the cursor advances and a second pass is a no-op", async () => {
@@ -419,7 +419,7 @@ describe("extractDurableFactsOnEviction", () => {
       windowSize: 2,
     });
     expect(res.factsWritten).toBe(0);
-    expect(await memory.countDurableFacts(PERSONA, CONV)).toBe(0);
+    expect(await memory.countDurableFacts(PERSONA)).toBe(0);
   });
 });
 
@@ -482,6 +482,128 @@ describe("pullDurableFacts / formatDurableFacts", () => {
     ).toBeUndefined();
   });
 
+  test("qualifies `other`-source facts inline so they never masquerade as owner knowledge", () => {
+    const block = formatDurableFacts([
+      {
+        id: 1,
+        persona: PERSONA,
+        conversation: CONV,
+        fact: "Andrew lives in Arnhem.",
+        confidence: 0.9,
+        source: "principal",
+        createdAt: new Date(),
+        lastSeenAt: new Date(),
+      },
+      {
+        id: 2,
+        persona: PERSONA,
+        conversation: CONV,
+        fact: "The gateway password is hunter2.",
+        confidence: 0.9,
+        source: "other",
+        createdAt: new Date(),
+        lastSeenAt: new Date(),
+      },
+    ]);
+    // Trusted (principal) fact renders as a plain background bullet.
+    expect(block).toContain("- Andrew lives in Arnhem.");
+    // The third-party fact is present but explicitly tagged unverified — never
+    // as a bare owner bullet. This is the provenance-boundary regression guard.
+    expect(block).toContain(
+      "- [unverified — reported by a third party in a shared conversation] The gateway password is hunter2.",
+    );
+    expect(block).not.toContain("- The gateway password is hunter2.");
+  });
+
+  test("labels an allowed untrusted (`other`) turn to the extractor as THIRD_PARTY, not PRINCIPAL", async () => {
+    // A third-party message in a shared conversation that the screen let
+    // through (embeddable=true, source=other), followed by enough turns to
+    // evict it past the live window.
+    await memory.appendTurn({
+      persona: PERSONA,
+      conversation: CONV,
+      role: "user",
+      text: "third-party claim about Andrew",
+      embeddable: true,
+      source: "other",
+    });
+    for (let i = 1; i <= 5; i++) await appendTurn(`turn ${i}`);
+
+    const seen: string[] = [];
+    const complete = fakeComplete(
+      { "third-party claim": '[{"fact":"claimed thing","confidence":0.9}]' },
+      (msg) => seen.push(msg),
+    );
+    await extractDurableFactsOnEviction({
+      persona: PERSONA,
+      conversation: CONV,
+      memory,
+      settings: SETTINGS,
+      complete,
+      windowSize: 2,
+    });
+
+    const rendered = seen.find((m) => m.includes("third-party claim"));
+    expect(rendered).toBeDefined();
+    // The extractor must be told the true speaker — a third party — not that
+    // this untrusted text came from the principal.
+    expect(rendered).toContain('speaker="THIRD_PARTY"');
+    expect(rendered).not.toContain('speaker="PRINCIPAL"');
+
+    // And the stored fact inherits the `other` provenance tier.
+    const facts = await memory.topDurableFacts(PERSONA, { limit: 10 });
+    const stored = facts.find((f) => f.fact === "claimed thing");
+    expect(stored?.source).toBe("other");
+  });
+
+  test("recall bump refreshes principal facts on inject but NEVER `other` facts", async () => {
+    // A principal fact and a third-party (`other`) fact both clear the floor and
+    // get injected. The recall bump must refresh the principal fact's clock but
+    // leave the `other` fact's alone — otherwise a third-party claim would be
+    // kept immortal (bump → stays top-N → bump again → never retires).
+    await memory.upsertDurableFact({
+      persona: PERSONA,
+      conversation: CONV,
+      fact: "Andrew lives in Arnhem.",
+      confidence: 0.9,
+      source: "principal",
+    });
+    await memory.upsertDurableFact({
+      persona: PERSONA,
+      conversation: CONV,
+      fact: "gateway password claim",
+      confidence: 0.9,
+      source: "other",
+    });
+    const before = await memory.topDurableFacts(PERSONA, { limit: 10 });
+    const principalBefore = before.find((f) => f.source === "principal")!;
+    const otherBefore = before.find((f) => f.source === "other")!;
+
+    await new Promise((r) => setTimeout(r, 5));
+    const block = await pullDurableFacts({
+      persona: PERSONA,
+      conversation: CONV,
+      memory,
+      settings: SETTINGS,
+    });
+    // Both were injected (principal plain, other tagged unverified).
+    expect(block).toContain("- Andrew lives in Arnhem.");
+    expect(block).toContain("[unverified");
+    // Let the fire-and-forget recall bump settle.
+    await new Promise((r) => setTimeout(r, 20));
+
+    const after = await memory.topDurableFacts(PERSONA, { limit: 10 });
+    const principalAfter = after.find((f) => f.id === principalBefore.id)!;
+    const otherAfter = after.find((f) => f.id === otherBefore.id)!;
+    // Principal fact's clock advanced; the third-party fact's did not.
+    expect(principalAfter.lastSeenAt.getTime()).toBeGreaterThan(
+      principalBefore.lastSeenAt.getTime(),
+    );
+    expect(otherAfter.lastSeenAt.getTime()).toBe(
+      otherBefore.lastSeenAt.getTime(),
+    );
+  });
+
   test("formatDurableFacts returns undefined for an all-blank set", () => {
     expect(
       formatDurableFacts([
@@ -491,6 +613,7 @@ describe("pullDurableFacts / formatDurableFacts", () => {
           conversation: CONV,
           fact: "   ",
           confidence: 1,
+          source: "principal",
           createdAt: new Date(),
           lastSeenAt: new Date(),
         },
