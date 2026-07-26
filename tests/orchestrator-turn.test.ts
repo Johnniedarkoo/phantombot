@@ -416,6 +416,133 @@ describe("runTurn — purge-after-ruling (trusted success)", () => {
   });
 });
 
+describe("runTurn — user-turn provenance (userSource / trusted)", () => {
+  /** Wrap the store, capturing the user + assistant records passed to appendTurnPair. */
+  function spyPair(inner: MemoryStore): {
+    store: MemoryStore;
+    calls: Array<{ user: { source?: string }; assistant: { source?: string } }>;
+  } {
+    const calls: Array<{
+      user: { source?: string };
+      assistant: { source?: string };
+    }> = [];
+    const store = new Proxy(inner, {
+      get(target, prop, receiver) {
+        if (prop === "appendTurnPair") {
+          return async (
+            user: { source?: string },
+            assistant: { source?: string },
+          ) => {
+            calls.push({ user, assistant });
+            return (
+              inner.appendTurnPair as (u: unknown, a: unknown) => Promise<void>
+            )(user, assistant);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    return { store, calls };
+  }
+
+  const okHarness = () =>
+    new ScriptedHarness("fake", [{ type: "done", finalText: "ok" }]);
+
+  test("defaults to `other` for an untrusted turn (no userSource)", async () => {
+    const { store, calls } = spyPair(memory);
+    await collect(
+      runTurn({
+        ...baseInput(),
+        memory: store,
+        userMessage: "ambient",
+        harnesses: [okHarness()],
+      }),
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.user.source).toBe("other");
+    expect(calls[0]!.assistant.source).toBe("self");
+  });
+
+  test("stamps `principal` for a trusted turn (no userSource)", async () => {
+    const { store, calls } = spyPair(memory);
+    await collect(
+      runTurn({
+        ...baseInput(),
+        memory: store,
+        userMessage: "do it",
+        harnesses: [okHarness()],
+        trusted: true,
+      }),
+    );
+    expect(calls[0]!.user.source).toBe("principal");
+  });
+
+  test("userSource + assistantSource down-tier BOTH turns to `other` (task wake)", async () => {
+    const { store, calls } = spyPair(memory);
+    await collect(
+      runTurn({
+        ...baseInput(),
+        memory: store,
+        userMessage: "scheduled work",
+        harnesses: [okHarness()],
+        // A tick task wake: may ingest untrusted content mid-turn, so every
+        // fact it produces is pinned to the untrusted tier. NOT trusted.
+        userSource: "other",
+        assistantSource: "other",
+      }),
+    );
+    expect(calls[0]!.user.source).toBe("other");
+    // The assistant reply is down-tiered too — this is the laundering vector.
+    expect(calls[0]!.assistant.source).toBe("other");
+  });
+
+  test("assistantSource alone overrides only the assistant turn", async () => {
+    const { store, calls } = spyPair(memory);
+    await collect(
+      runTurn({
+        ...baseInput(),
+        memory: store,
+        userMessage: "hi",
+        harnesses: [okHarness()],
+        assistantSource: "other",
+      }),
+    );
+    // User turn keeps its default (untrusted → other here); assistant overridden.
+    expect(calls[0]!.user.source).toBe("other");
+    expect(calls[0]!.assistant.source).toBe("other");
+  });
+
+  test("assistant turn defaults to `self` when not overridden", async () => {
+    const { store, calls } = spyPair(memory);
+    await collect(
+      runTurn({
+        ...baseInput(),
+        memory: store,
+        userMessage: "hi",
+        harnesses: [okHarness()],
+        trusted: true,
+      }),
+    );
+    expect(calls[0]!.assistant.source).toBe("self");
+  });
+
+  test("userSource wins over the trusted default", async () => {
+    const { store, calls } = spyPair(memory);
+    await collect(
+      runTurn({
+        ...baseInput(),
+        memory: store,
+        userMessage: "scheduled work",
+        harnesses: [okHarness()],
+        trusted: true,
+        userSource: "other",
+      }),
+    );
+    // Explicit override beats the trusted→principal default.
+    expect(calls[0]!.user.source).toBe("other");
+  });
+});
+
 describe("runTurn — noHistory option", () => {
   test("skips loading prior turns AND skips persisting this turn", async () => {
     await memory.appendTurn({
