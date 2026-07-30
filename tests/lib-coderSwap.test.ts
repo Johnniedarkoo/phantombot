@@ -5,7 +5,7 @@
  *   - the persistent per-conversation /coder override store
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -15,6 +15,7 @@ import {
   CODER_SWAP_THRESHOLD,
   coderSwapStatePath,
   CONTEXT_DEFAULTS,
+  DEFAULT_CODER_SWAP_OVERRIDE_TTL_MS,
   getCoderSwapOverride,
   normalizeCoderSwapRequest,
   resolveSwapModel,
@@ -339,5 +340,68 @@ describe("override store", () => {
     expect(
       await getCoderSwapOverride({ persona: "lena", conversation: "telegram:2" }),
     ).toBeUndefined();
+  });
+});
+
+describe("override decay (sliding idle TTL)", () => {
+  const SAVED = process.env.PHANTOMBOT_CODER_SWAP_STATE;
+  let dir: string;
+  const who = { persona: "lena", conversation: "telegram:1" };
+  const t0 = new Date("2026-06-24T12:00:00.000Z");
+  const at = (ms: number) => new Date(t0.getTime() + ms);
+  const MIN = 60_000;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "phantombot-coder-swap-decay-"));
+    process.env.PHANTOMBOT_CODER_SWAP_STATE = join(dir, "state.json");
+  });
+  afterEach(async () => {
+    if (SAVED === undefined) delete process.env.PHANTOMBOT_CODER_SWAP_STATE;
+    else process.env.PHANTOMBOT_CODER_SWAP_STATE = SAVED;
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test("default: 10 min idle TTL (mirrors reply-mode)", () => {
+    expect(DEFAULT_CODER_SWAP_OVERRIDE_TTL_MS).toBe(600_000);
+  });
+
+  test("live within idle window", async () => {
+    await setCoderSwapOverride({ ...who, mode: "on", now: t0 });
+    expect(await getCoderSwapOverride({ ...who, now: at(9 * MIN) })).toBe("on");
+  });
+
+  test("releases after idle TTL with no activity", async () => {
+    await setCoderSwapOverride({ ...who, mode: "on", now: t0 });
+    expect(
+      await getCoderSwapOverride({ ...who, now: at(11 * MIN) }),
+    ).toBeUndefined();
+    // Expired entry is pruned from disk on read.
+    const raw = JSON.parse(await readFile(coderSwapStatePath(), "utf8"));
+    expect(Object.keys(raw)).toHaveLength(0);
+  });
+
+  test("idle window slides forward on each active read", async () => {
+    await setCoderSwapOverride({ ...who, mode: "on", now: t0 });
+    // A consult at +8m keeps it alive AND refreshes touchedAt...
+    expect(await getCoderSwapOverride({ ...who, now: at(8 * MIN) })).toBe("on");
+    // ...so a consult at +16m (8m after the last) is still within the window.
+    expect(await getCoderSwapOverride({ ...who, now: at(16 * MIN) })).toBe("on");
+  });
+
+  test("stays live indefinitely while actively used — no absolute cap", async () => {
+    await setCoderSwapOverride({ ...who, mode: "on", now: t0 });
+    // A long coding session: sub-TTL consults keep it warm for hours. There is
+    // deliberately NO absolute backstop — /coder is idle-decayed only, exactly
+    // like reply-mode, so a genuinely active session is never yanked mid-work.
+    for (let m = 8; m <= 12 * 60; m += 8) {
+      expect(await getCoderSwapOverride({ ...who, now: at(m * MIN) })).toBe("on");
+    }
+  });
+
+  test("re-issuing /coder refreshes the idle window", async () => {
+    await setCoderSwapOverride({ ...who, mode: "on", now: t0 });
+    // Re-issue at +8m → fresh touchedAt, so +17m (9m after re-issue) is live.
+    await setCoderSwapOverride({ ...who, mode: "on", now: at(8 * MIN) });
+    expect(await getCoderSwapOverride({ ...who, now: at(17 * MIN) })).toBe("on");
   });
 });
