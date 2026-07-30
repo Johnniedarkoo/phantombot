@@ -60,6 +60,7 @@
  * moved binary by inspecting the registered task XML.
  */
 
+import { existsSync } from "node:fs";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -71,6 +72,27 @@ import type { WriteSink } from "./io.ts";
 import { log } from "./logger.ts";
 
 export const TASK_FOLDER = "\\Phantombot";
+
+/**
+ * Boot-machinery schema version. Bumped whenever the SHAPE of the installed
+ * tasks changes in a way a running box can't detect from the binary path
+ * alone — new triggers, a new companion task (e.g. the login-fallback task),
+ * a changed principal/logon layout, a launcher rewrite that needs matching
+ * task args, etc.
+ *
+ * The version is stamped into the per-persona logon marker at install time.
+ * On every `phantombot run` start, {@link bootSchemaNeedsMigration} compares
+ * the stamped version against this constant; a mismatch means an update
+ * changed the boot machinery, so the daemon re-runs the idempotent install to
+ * migrate its own tasks in place. This is what stops an update that changes
+ * the boot method from bricking a box whose tasks were written by the old
+ * scheme.
+ *
+ * History:
+ *   0 — implicit; pre-versioning installs (no schemaVersion in the marker).
+ *   1 — adds the interactive login-fallback task in password mode.
+ */
+export const BOOT_SCHEMA_VERSION = 1;
 
 /**
  * Legacy task names (pre persona-scoping). Installations registered before
@@ -95,6 +117,15 @@ export interface TaskNames {
   heartbeat: string;
   nightly: string;
   tick: string;
+  /**
+   * Interactive login-fallback task. Registered ONLY in password mode: an
+   * InteractiveToken twin of the always-on daemon that starts at logon, so if
+   * the stored Windows password later goes stale (corporate rotation) and the
+   * Password-principal boot task can no longer authenticate, the daemon still
+   * comes up the next time the user logs in. The single-instance run-lock
+   * makes it a no-op when the boot task already started the daemon.
+   */
+  login: string;
   all: readonly string[];
 }
 
@@ -103,7 +134,18 @@ export function taskNames(persona: string): TaskNames {
   const heartbeat = `${TASK_FOLDER}\\heartbeat-${persona}`;
   const nightly = `${TASK_FOLDER}\\nightly-${persona}`;
   const tick = `${TASK_FOLDER}\\tick-${persona}`;
-  return { main, heartbeat, nightly, tick, all: [main, heartbeat, nightly, tick] };
+  const login = `${TASK_FOLDER}\\login-${persona}`;
+  return {
+    main,
+    heartbeat,
+    nightly,
+    tick,
+    login,
+    // `all` intentionally omits the login task: it is conditionally
+    // registered (password mode only), so heal/ownership sweeps address it
+    // explicitly rather than assuming it always exists.
+    all: [main, heartbeat, nightly, tick],
+  };
 }
 
 /**
@@ -157,9 +199,14 @@ function legacyLogonMarkerPath(): string {
 export async function writeTaskLogon(
   persona: string,
   logon: TaskLogon,
+  schemaVersion: number = BOOT_SCHEMA_VERSION,
 ): Promise<void> {
   await mkdir(launcherDir(), { recursive: true });
-  await writeFile(logonMarkerPath(persona), JSON.stringify(logon, null, 2), "utf8");
+  await writeFile(
+    logonMarkerPath(persona),
+    JSON.stringify({ ...logon, schemaVersion }, null, 2),
+    "utf8",
+  );
   // The legacy shared marker is deliberately LEFT IN PLACE: it is the only
   // record of the logon mode for personas installed before the scoping, and
   // deleting it here (when persona B installs) would silently downgrade
@@ -173,22 +220,55 @@ export async function writeTaskLogon(
  * pre-scoping install isn't mis-healed as interactive before its next
  * reinstall. */
 export async function readTaskLogon(persona: string): Promise<TaskLogon> {
+  return (await readTaskLogonRecord(persona)).logon;
+}
+
+/** Persisted marker contents: the logon choice plus the boot-schema version
+ * the tasks were last written under (absent/`0` for pre-versioning installs). */
+export interface TaskLogonRecord {
+  logon: TaskLogon;
+  schemaVersion: number;
+}
+
+/** Read the full persisted marker (logon + schema version), trying the
+ * persona-scoped marker first and falling back to the legacy shared one. */
+export async function readTaskLogonRecord(
+  persona: string,
+): Promise<TaskLogonRecord> {
   for (const path of [logonMarkerPath(persona), legacyLogonMarkerPath()]) {
     try {
       const raw = JSON.parse(await readFile(path, "utf8"));
+      const schemaVersion =
+        typeof raw?.schemaVersion === "number" ? raw.schemaVersion : 0;
       if (raw && raw.mode === "password" && typeof raw.username === "string") {
-        return { mode: "password", username: raw.username };
+        return { logon: { mode: "password", username: raw.username }, schemaVersion };
       }
-      if (raw && raw.mode === "interactive") return { mode: "interactive" };
+      if (raw && raw.mode === "interactive") {
+        return { logon: { mode: "interactive" }, schemaVersion };
+      }
     } catch {
       // Missing/corrupt marker → try the next one.
     }
   }
-  return { mode: "interactive" };
+  return { logon: { mode: "interactive" }, schemaVersion: 0 };
+}
+
+/**
+ * Does the box need a boot-schema migration? True when the tasks on disk were
+ * written under a different schema version than the running binary expects —
+ * i.e. an update changed the boot machinery. The caller responds by re-running
+ * the idempotent install so the tasks are rewritten to the current shape.
+ *
+ * Only meaningful once tasks are actually installed: a box that never ran
+ * `phantombot install` has no marker (schemaVersion 0) but also no tasks to
+ * migrate, so callers gate this on "tasks exist" separately.
+ */
+export function bootSchemaNeedsMigration(installedVersion: number): boolean {
+  return installedVersion !== BOOT_SCHEMA_VERSION;
 }
 
 /** Short label used for the per-task log filenames. */
-type TaskLabel = "phantombot" | "heartbeat" | "nightly" | "tick";
+type TaskLabel = "phantombot" | "heartbeat" | "nightly" | "tick" | "login";
 
 function logsDir(): string {
   return join(xdgDataHome(), "phantombot", "logs");
@@ -453,6 +533,42 @@ export function generatePhantombotTaskXml(
     executionTimeLimit: "PT0S", // unlimited — long-running daemon
     restartOnFailure: true,
     logon,
+  });
+}
+
+/**
+ * Generate the interactive login-fallback task XML. This is the InteractiveToken
+ * twin of the always-on daemon, registered ONLY in password mode. It carries a
+ * LogonTrigger + 1-minute keep-alive but NO BootTrigger and NO stored password,
+ * so it always authenticates as the interactive user. Its job: if the stored
+ * Windows password later goes stale and the Password-principal boot task can no
+ * longer start, this still brings the daemon up at the next logon. The
+ * single-instance run-lock makes it a no-op whenever the boot task already
+ * started the daemon.
+ */
+export function generateLoginFallbackTaskXml(
+  sid: string,
+  binPath: string,
+  persona: string,
+): string {
+  const triggers =
+    "    <LogonTrigger>\n" +
+    "      <Enabled>true</Enabled>\n" +
+    `      <UserId>${xmlEscape(sid)}</UserId>\n` +
+    "    </LogonTrigger>\n" +
+    repeatingTimeTrigger("PT1M");
+  return generateTaskXml({
+    uri: taskNames(persona).login,
+    description: `phantombot login-fallback daemon (interactive; recovers from a stale stored password) [${persona}]`,
+    sid,
+    persona,
+    label: "login",
+    binPath,
+    args: ["run"],
+    triggersXml: triggers,
+    executionTimeLimit: "PT0S", // unlimited — long-running daemon
+    restartOnFailure: true,
+    logon: { mode: "interactive" },
   });
 }
 
@@ -953,6 +1069,13 @@ interface TaskSpec {
   name: string;
   label: TaskLabel;
   xml: string;
+  /**
+   * Effective logon for THIS task. Usually the install-wide choice, but the
+   * login-fallback task is always interactive even inside a password-mode
+   * install — so heal/import must decide per-task whether a credential is
+   * needed rather than assuming the whole set shares one mode.
+   */
+  logon: TaskLogon & { password?: string };
 }
 
 /**
@@ -971,8 +1094,8 @@ async function importTaskSpec(
   spec: TaskSpec,
   xmlDir: string,
   schtasks: SchtasksRunner,
-  logon?: TaskLogon & { password?: string },
 ): Promise<SchtasksResult> {
+  const logon = spec.logon;
   const xmlPath = join(xmlDir, `phantombot-task-${spec.label}.xml`);
   await writeTaskXml(xmlPath, spec.xml);
   const args = ["/Create", "/TN", spec.name, "/XML", xmlPath];
@@ -997,22 +1120,40 @@ function allTaskSpecs(
       name: taskNames(persona).main,
       label: "phantombot",
       xml: generatePhantombotTaskXml(sid, binPath, persona, logon),
+      logon,
     },
     {
       name: taskNames(persona).heartbeat,
       label: "heartbeat",
       xml: generateHeartbeatTaskXml(sid, binPath, persona, logon),
+      logon,
     },
     {
       name: taskNames(persona).nightly,
       label: "nightly",
       xml: generateNightlyTaskXml(sid, binPath, persona, logon),
+      logon,
     },
     {
       name: taskNames(persona).tick,
       label: "tick",
       xml: generateTickTaskXml(sid, binPath, persona, logon),
+      logon,
     },
+    // Password mode only: the interactive login-fallback twin of the daemon,
+    // so a later stale password can't leave the box with no way back in. It is
+    // itself INTERACTIVE (no stored credential), so heal/import never treats it
+    // as needing the Windows password.
+    ...(logon.mode === "password"
+      ? [
+          {
+            name: taskNames(persona).login,
+            label: "login" as const,
+            xml: generateLoginFallbackTaskXml(sid, binPath, persona),
+            logon: { mode: "interactive" as const },
+          },
+        ]
+      : []),
   ];
 }
 
@@ -1140,9 +1281,18 @@ export async function installPhantombotTasks(
   const xmlDir = opts.xmlDir ?? tmpdir();
   const logon = opts.logon ?? { mode: "interactive" as const };
 
-  // Persist the logon choice BEFORE registering, so a later heal sees it even
-  // if a registration below fails halfway.
-  await writeTaskLogon(opts.persona, { mode: logon.mode, username: logon.username });
+  // Persist the logon MODE before registering, so a later heal sees it even if
+  // a registration below fails halfway. But do NOT advance the boot-schema
+  // version yet: keep the prior version until every task registers. Otherwise a
+  // partial `/Create` failure would leave the marker stamped current while the
+  // tasks are still the old shape, and `migrateBootSchemaIfNeeded` would see
+  // `current` and permanently skip the retry — bricking the boot path.
+  const priorSchemaVersion = (await readTaskLogonRecord(opts.persona)).schemaVersion;
+  await writeTaskLogon(
+    opts.persona,
+    { mode: logon.mode, username: logon.username },
+    priorSchemaVersion,
+  );
 
   const r = await ensureTasksCurrent({
     binPath: opts.binPath,
@@ -1162,6 +1312,16 @@ export async function installPhantombotTasks(
     return { installed: false };
   }
 
+  // Every task registered — only now is it safe to advance the schema marker to
+  // the current version (transactional with successful registration, so a
+  // failed install above leaves the marker at its prior version and the next
+  // `phantombot run` retries the migration instead of skipping it forever).
+  await writeTaskLogon(
+    opts.persona,
+    { mode: logon.mode, username: logon.username },
+    BOOT_SCHEMA_VERSION,
+  );
+
   // Remove pre-rename legacy task names so an upgrade never double-supervises.
   // Only tasks provably owned by THIS Windows account are touched.
   const legacy = await deleteLegacyTasks(
@@ -1178,10 +1338,120 @@ export async function installPhantombotTasks(
     );
   }
 
+  // The login-fallback task belongs to password mode only. Reinstalling in
+  // interactive mode over a previous password install must remove it, or an
+  // orphaned interactive daemon task would linger (ownership-guarded so a
+  // concurrent persona's task is never touched).
+  if (logon.mode !== "password") {
+    const outcome = await deleteTaskIfOwned(
+      opts.schtasks,
+      taskNames(opts.persona).login,
+      owner,
+    );
+    if (outcome === "deleted") {
+      opts.out.write(
+        `removed login-fallback task ${taskNames(opts.persona).login} (interactive mode)\n`,
+      );
+    }
+  }
+
   opts.out.write(
-    `registered ${taskNames(opts.persona).main} + heartbeat + nightly + tick\n`,
+    logon.mode === "password"
+      ? `registered ${taskNames(opts.persona).main} + heartbeat + nightly + tick + login-fallback\n`
+      : `registered ${taskNames(opts.persona).main} + heartbeat + nightly + tick\n`,
   );
   return { installed: true };
+}
+
+export interface MigrateBootSchemaOptions {
+  binPath: string;
+  /** Persona whose tasks to migrate. Defaults to the current persona. */
+  persona?: string;
+  sid?: string;
+  xmlDir?: string;
+  schtasks: SchtasksRunner;
+  out: WriteSink;
+  err: WriteSink;
+  /**
+   * Supplies the saved Windows password for a password-mode migration (a
+   * schema change may add a task that needs re-registration, which schtasks
+   * can't do without the credential). Returns null when none is available —
+   * then the migration is skipped loudly rather than half-registering.
+   */
+  readWindowsPassword?: () => Promise<string | null>;
+}
+
+export interface MigrateBootSchemaResult {
+  migrated: boolean;
+  reason:
+    | "migrated"
+    | "not-installed"
+    | "current"
+    | "password-unavailable"
+    | "failed";
+  from?: number;
+  to?: number;
+}
+
+/**
+ * Reconcile the installed boot machinery with the version the running binary
+ * expects. Called once at `phantombot run` startup (Windows only): if an update
+ * changed the boot-task shape (BOOT_SCHEMA_VERSION bumped), re-run the
+ * idempotent install so the tasks are migrated in place — the thing that stops
+ * an update that changes the boot method from bricking a box whose tasks were
+ * written by the old scheme.
+ *
+ * Only an already-installed box migrates (a never-installed box has nothing to
+ * migrate, and `run` must never silently install itself). A password-mode
+ * migration needs the saved Windows password; when none is available the
+ * migration is skipped with a loud log rather than half-registering.
+ */
+export async function migrateBootSchemaIfNeeded(
+  opts: MigrateBootSchemaOptions,
+): Promise<MigrateBootSchemaResult> {
+  const persona = opts.persona ?? (await currentPersonaName());
+  const record = await readTaskLogonRecord(persona);
+
+  const mainQ = await opts.schtasks.run([
+    "/Query",
+    "/TN",
+    taskNames(persona).main,
+    "/XML",
+  ]);
+  if (mainQ.exitCode !== 0) return { migrated: false, reason: "not-installed" };
+
+  const from = record.schemaVersion;
+  const to = BOOT_SCHEMA_VERSION;
+  if (!bootSchemaNeedsMigration(from)) {
+    return { migrated: false, reason: "current", from, to };
+  }
+
+  let logon: TaskLogon & { password?: string } = record.logon;
+  if (logon.mode === "password") {
+    const pw = opts.readWindowsPassword ? await opts.readWindowsPassword() : null;
+    if (!pw) {
+      log.warn(
+        "taskScheduler: boot-schema migration needs the saved Windows password but none is available — run `phantombot install` to migrate the boot tasks",
+        { persona, from, to },
+      );
+      return { migrated: false, reason: "password-unavailable", from, to };
+    }
+    logon = { ...logon, password: pw };
+  }
+
+  const r = await installPhantombotTasks({
+    binPath: opts.binPath,
+    persona,
+    sid: opts.sid,
+    xmlDir: opts.xmlDir,
+    logon,
+    schtasks: opts.schtasks,
+    out: opts.out,
+    err: opts.err,
+  });
+  if (!r.installed) return { migrated: false, reason: "failed", from, to };
+  log.info("taskScheduler: migrated boot schema", { persona, from, to });
+  return { migrated: true, reason: "migrated", from, to };
 }
 
 export interface UninstallTaskSchedulerOptions {
@@ -1215,7 +1485,16 @@ export async function uninstallPhantombotTasks(
     username: opts.accountName ?? currentUserName(),
   };
   const names = taskNames(persona);
-  const ordered = [names.tick, names.nightly, names.heartbeat, names.main];
+  // Includes the login-fallback task: it only exists after a password-mode
+  // install, but deleting an absent task is a quiet no-op, so listing it
+  // unconditionally is safe and keeps uninstall total.
+  const ordered = [
+    names.login,
+    names.tick,
+    names.nightly,
+    names.heartbeat,
+    names.main,
+  ];
   const legacyOutcomes: OwnedDeleteOutcome[] = [];
   for (const name of [...ordered, ...LEGACY_TASK_NAMES]) {
     const outcome = await deleteTaskIfOwned(opts.schtasks, name, owner);
@@ -1355,18 +1634,27 @@ export async function ensureTasksCurrent(
   const failed: string[] = [];
   let ensuredDirs = false;
 
+  // A registered task whose XML is healthy is still broken if the hidden
+  // launcher it invokes (wscript.exe //B "<launcher>.vbs" ...) has been
+  // deleted from disk — the task fires and immediately fails because
+  // wscript.exe can't find the script. The task XML alone can't reveal this,
+  // so probe the file too and treat a missing launcher as drift (#311).
+  const launcherPresent = existsSync(launcherVbsPath(persona));
+
   for (const spec of allTaskSpecs(sid, opts.binPath, persona, logon)) {
     const q = await opts.schtasks.run(["/Query", "/TN", spec.name, "/XML"]);
     const registered = q.exitCode === 0;
     const current =
-      registered && xmlReferencesBin(q.stdout, opts.binPath);
-    if (current && !opts.force) continue; // registered and points at this binary
+      registered && xmlReferencesBin(q.stdout, opts.binPath) && launcherPresent;
+    if (current && !opts.force) continue; // registered, points at this binary, launcher on disk
 
     // Password-mode heal without a credential: schtasks /Create would demand
     // /RP interactively, so instead patch the registered task's action
     // arguments in place (credential untouched). A MISSING task can't be
-    // patched — that needs a re-install with the password.
-    if (logon.mode === "password" && !logon.password) {
+    // patched — that needs a re-install with the password. Keyed off THIS
+    // task's logon: the interactive login-fallback task carries no password
+    // and re-imports normally even inside a password-mode install.
+    if (spec.logon.mode === "password" && !spec.logon.password) {
       if (!registered) {
         failed.push(spec.name);
         log.warn("taskScheduler: password-mode task missing; re-run `phantombot install` to restore it", {
@@ -1379,6 +1667,13 @@ export async function ensureTasksCurrent(
         // branch is defensive only.
         failed.push(spec.name);
         continue;
+      }
+      // The task XML may be healthy and only the launcher file missing
+      // (#311). Patching the action alone would leave the task pointing at a
+      // .vbs that isn't there, so restore the launcher before patching.
+      if (!launcherPresent) {
+        await mkdir(logsDir(), { recursive: true });
+        await writeLauncherVbs(persona);
       }
       const { out: outLog, err: errLog } = taskLogPaths(spec.label);
       const newArgs = buildLauncherArguments(
@@ -1412,7 +1707,7 @@ export async function ensureTasksCurrent(
       await writeLauncherVbs(persona);
       ensuredDirs = true;
     }
-    const r = await importTaskSpec(spec, xmlDir, opts.schtasks, logon);
+    const r = await importTaskSpec(spec, xmlDir, opts.schtasks);
     if (r.exitCode === 0) {
       rewrote.push(spec.name);
     } else {
@@ -1430,7 +1725,8 @@ export async function ensureTasksCurrent(
 
 /** Subcommand line each task label runs — kept in sync with allTaskSpecs. */
 function specArgsForLabel(label: TaskLabel): string[] {
-  return [label === "phantombot" ? "run" : label];
+  // Both the always-on daemon and its login-fallback twin run `phantombot run`.
+  return [label === "phantombot" || label === "login" ? "run" : label];
 }
 
 export interface TaskSchedulerServiceControl {

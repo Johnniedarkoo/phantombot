@@ -40,8 +40,12 @@ import {
   uninstallPhantombotTasks,
   taskNames,
   readTaskLogon,
+  readTaskLogonRecord,
   writeTaskLogon,
   LEGACY_TASK_NAMES,
+  BOOT_SCHEMA_VERSION,
+  bootSchemaNeedsMigration,
+  migrateBootSchemaIfNeeded,
 } from "../src/lib/taskScheduler.ts";
 
 const SID = "S-1-5-21-1111111111-2222222222-3333333333-1001";
@@ -307,6 +311,9 @@ describe("installPhantombotTasks", () => {
       `/Delete /TN ${LEGACY_TASK_NAMES[2]} /F`,
       `/Query /TN ${LEGACY_TASK_NAMES[3]} /XML`,
       `/Delete /TN ${LEGACY_TASK_NAMES[3]} /F`,
+      // Interactive install also sweeps a stale password-mode login-fallback
+      // task (absent here, so just the ownership probe, no delete).
+      `/Query /TN ${NAMES.login} /XML`,
     ]);
     expect(out.text).toContain("registered");
   });
@@ -441,6 +448,9 @@ describe("uninstallPhantombotTasks", () => {
     const result = await uninstallPhantombotTasks({ persona: PERSONA, sid: SID, schtasks: st, out, err });
     expect(result.removed).toBe(true);
     expect(st.calls.map((c) => c.join(" "))).toEqual([
+      // Login-fallback task is swept first; absent here (only NAMES.all is
+      // registered), so just the ownership probe.
+      `/Query /TN ${NAMES.login} /XML`,
       `/Query /TN ${NAMES.tick} /XML`,
       `/Delete /TN ${NAMES.tick} /F`,
       `/Query /TN ${NAMES.nightly} /XML`,
@@ -573,7 +583,8 @@ describe("uninstallPhantombotTasks", () => {
     const result = await uninstallPhantombotTasks({ persona: PERSONA, sid: SID, schtasks: st, out, err });
     expect(result.removed).toBe(true);
     expect(st.calls.filter((c) => c[0] === "/Delete")).toEqual([]);
-    expect(st.calls.filter((c) => c[0] === "/Query").length).toBe(8);
+    // 4 persona tasks + the login-fallback probe + 4 legacy names = 9 queries.
+    expect(st.calls.filter((c) => c[0] === "/Query").length).toBe(9);
     expect(out.text).not.toContain("removed scheduled task");
   });
 });
@@ -590,6 +601,16 @@ describe("ensureTasksCurrent (heartbeat self-heal)", () => {
       [NAMES.nightly]: generateNightlyTaskXml(SID, bin, PERSONA),
       [NAMES.tick]: generateTickTaskXml(SID, bin, PERSONA),
     };
+  }
+
+  /** Model a genuinely healthy box: the hidden launcher exists on disk.
+   * Without this a "healthy" registry is still treated as drift, because a
+   * task pointing at a missing .vbs is broken (#311). */
+  async function primeLauncher(persona = PERSONA): Promise<void> {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const { dirname } = await import("node:path");
+    mkdirSync(dirname(launcherVbsPath(persona)), { recursive: true });
+    writeFileSync(launcherVbsPath(persona), LAUNCHER_VBS, "utf8");
   }
 
   /**
@@ -621,6 +642,7 @@ describe("ensureTasksCurrent (heartbeat self-heal)", () => {
   }
 
   test("healthy box: every task already points at the binary → no re-import", async () => {
+    await primeLauncher();
     const st = new HealFake(registeredXml(BIN));
     const r = await ensureTasksCurrent({
       binPath: BIN,
@@ -660,6 +682,7 @@ describe("ensureTasksCurrent (heartbeat self-heal)", () => {
   });
 
   test("a single missing task is re-registered; the current ones are left alone", async () => {
+    await primeLauncher();
     const xml = registeredXml(BIN);
     xml[NAMES.tick] = undefined as unknown as string; // tick was deleted
     const st = new HealFake(xml);
@@ -677,6 +700,7 @@ describe("ensureTasksCurrent (heartbeat self-heal)", () => {
   test("path casing differences alone are not treated as drift", async () => {
     // schtasks may echo the command line back with different casing; a mere
     // case difference must not trigger a needless re-import.
+    await primeLauncher();
     const st = new HealFake(registeredXml(BIN.toUpperCase()));
     const r = await ensureTasksCurrent({
       binPath: BIN.toLowerCase(),
@@ -687,6 +711,31 @@ describe("ensureTasksCurrent (heartbeat self-heal)", () => {
     });
     expect(r.rewrote).toEqual([]);
     expect(st.created()).toEqual([]);
+  });
+
+  test("healthy XML but launcher .vbs deleted → all tasks re-registered and launcher restored (#311)", async () => {
+    // Every task's XML is healthy and points at the current binary, but the
+    // hidden launcher the actions invoke has been deleted from disk (AV
+    // quarantine, cleanup script). The tasks are live but broken — heal must
+    // catch this even though the XML alone looks current.
+    const { existsSync } = await import("node:fs");
+    expect(existsSync(launcherVbsPath(PERSONA))).toBe(false);
+    const st = new HealFake(registeredXml(BIN));
+    const r = await ensureTasksCurrent({
+      binPath: BIN,
+      persona: PERSONA,
+      sid: SID,
+      xmlDir: workdir,
+      schtasks: st,
+    });
+    expect(r.rewrote).toEqual([
+      NAMES.main,
+      NAMES.heartbeat,
+      NAMES.nightly,
+      NAMES.tick,
+    ]);
+    // The launcher is written back so the re-registered tasks can actually run.
+    expect(existsSync(launcherVbsPath(PERSONA))).toBe(true);
   });
 });
 
@@ -1094,13 +1143,20 @@ describe("password logon mode (run when logged off)", () => {
     });
     expect(result.installed).toBe(true);
     const creates = st.calls.filter((c) => c[0] === "/Create");
-    expect(creates.length).toBe(4);
-    for (const c of creates) {
+    // 4 password tasks + the interactive login-fallback twin = 5 registrations.
+    expect(creates.length).toBe(5);
+    const loginCreate = creates.find((c) => c.includes(NAMES.login))!;
+    const passwordCreates = creates.filter((c) => !c.includes(NAMES.login));
+    expect(passwordCreates.length).toBe(4);
+    for (const c of passwordCreates) {
       expect(c).toContain("/RU");
       expect(c).toContain(ACCOUNT);
       expect(c).toContain("/RP");
       expect(c).toContain("s3cret");
     }
+    // The login-fallback task is INTERACTIVE — it never carries the credential.
+    expect(loginCreate).not.toContain("/RP");
+    expect(loginCreate).not.toContain("s3cret");
     // The marker remembers the mode + account for the heal path, but the
     // password stays with Task Scheduler — never on our disk.
     expect(await readTaskLogon(PERSONA)).toEqual({
@@ -1111,6 +1167,14 @@ describe("password logon mode (run when logged off)", () => {
 
   test("heal patches a drifted password-mode task's action in place (no credential needed)", async () => {
     await writeTaskLogon(PERSONA, { mode: "password", username: ACCOUNT });
+    // Launcher present on disk so only the binary-path drift is healed, not a
+    // launcher-missing (#311) rewrite of every task.
+    {
+      const { mkdirSync, writeFileSync } = await import("node:fs");
+      const { dirname } = await import("node:path");
+      mkdirSync(dirname(launcherVbsPath(PERSONA)), { recursive: true });
+      writeFileSync(launcherVbsPath(PERSONA), LAUNCHER_VBS, "utf8");
+    }
     const OLD_BIN = "C:\\old\\phantombot.exe";
     const registered: Record<string, string | undefined> = {
       [NAMES.main]: generatePhantombotTaskXml(SID, OLD_BIN, PERSONA, {
@@ -1130,6 +1194,7 @@ describe("password logon mode (run when logged off)", () => {
         username: ACCOUNT,
       }),
     };
+    const creates: string[] = [];
     const st: SchtasksRunner = {
       async run(args: readonly string[]): Promise<SchtasksResult> {
         if (args[0] === "/Query") {
@@ -1138,7 +1203,19 @@ describe("password logon mode (run when logged off)", () => {
             ? { exitCode: 1, stdout: "", stderr: "cannot find" }
             : { exitCode: 0, stdout: xml, stderr: "" };
         }
-        throw new Error("password-mode heal must NOT re-import via schtasks");
+        // The interactive login-fallback task needs no credential, so a
+        // missing one IS re-imported by the heal. Any /Create of a
+        // PASSWORD-mode task without a credential would be the bug this test
+        // guards against.
+        if (args[0] === "/Create") {
+          const tn = args[args.indexOf("/TN") + 1]!;
+          if (tn !== NAMES.login) {
+            throw new Error(`password-mode heal must NOT re-import ${tn}`);
+          }
+          creates.push(tn);
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
       },
     };
     const patched: Array<[string, string]> = [];
@@ -1153,21 +1230,27 @@ describe("password logon mode (run when logged off)", () => {
         return { ok: true };
       },
     });
-    // Only the drifted daemon task was patched, with the new binary path in
-    // the launcher arguments.
-    expect(r.rewrote).toEqual([NAMES.main]);
+    // The drifted daemon task was patched in place (credential preserved); the
+    // absent interactive login-fallback task was re-imported (no credential).
+    expect(r.rewrote).toEqual([NAMES.main, NAMES.login]);
     expect(r.failed).toEqual([]);
     expect(patched.length).toBe(1);
     expect(patched[0]![0]).toBe(NAMES.main);
     expect(patched[0]![1]).toContain(BIN);
     expect(patched[0]![1]).not.toContain(OLD_BIN);
+    expect(creates).toEqual([NAMES.login]);
   });
 
   test("heal cannot recreate a MISSING password-mode task — it says to re-install", async () => {
     await writeTaskLogon(PERSONA, { mode: "password", username: ACCOUNT });
     const st: SchtasksRunner = {
-      async run(): Promise<SchtasksResult> {
-        return { exitCode: 1, stdout: "", stderr: "cannot find" };
+      async run(args: readonly string[]): Promise<SchtasksResult> {
+        // Every task is missing (/Query fails); /Create succeeds — but the
+        // password tasks never reach /Create without a credential.
+        if (args[0] === "/Query") {
+          return { exitCode: 1, stdout: "", stderr: "cannot find" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
       },
     };
     const r = await ensureTasksCurrent({
@@ -1178,7 +1261,9 @@ describe("password logon mode (run when logged off)", () => {
       schtasks: st,
       patchAction: async () => ({ ok: true }),
     });
-    expect(r.rewrote).toEqual([]);
+    // The 4 password tasks can't be recreated without the credential; the
+    // interactive login-fallback twin needs none, so it IS restored.
+    expect(r.rewrote).toEqual([NAMES.login]);
     expect(r.failed).toEqual([
       NAMES.main,
       NAMES.heartbeat,
@@ -1277,5 +1362,279 @@ describe("per-persona logon marker", () => {
       JSON.stringify({ mode: "password", username: "PC\\old" }),
     );
     expect(await readTaskLogon("newbot")).toEqual({ mode: "interactive" });
+  });
+});
+
+describe("boot-schema versioning + migration", () => {
+  /** A schtasks fake: /Query answers from a registry (missing → exit 1),
+   * /Create + everything else succeed and are recorded. */
+  class MigrateFake implements SchtasksRunner {
+    calls: string[][] = [];
+    constructor(private registry: Record<string, string | undefined> = {}) {}
+    async run(args: readonly string[]): Promise<SchtasksResult> {
+      this.calls.push([...args]);
+      if (args[0] === "/Query") {
+        const xml = this.registry[args[args.indexOf("/TN") + 1]!];
+        return xml === undefined
+          ? { exitCode: 1, stdout: "", stderr: "cannot find" }
+          : { exitCode: 0, stdout: xml, stderr: "" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }
+    created(): string[] {
+      return this.calls
+        .filter((c) => c[0] === "/Create")
+        .map((c) => c[c.indexOf("/TN") + 1]!);
+    }
+  }
+
+  test("bootSchemaNeedsMigration: 0 (pre-versioning) needs it, current does not", () => {
+    expect(bootSchemaNeedsMigration(0)).toBe(true);
+    expect(bootSchemaNeedsMigration(BOOT_SCHEMA_VERSION)).toBe(false);
+  });
+
+  test("writeTaskLogon stamps the schema version; readTaskLogonRecord returns it", async () => {
+    await writeTaskLogon(PERSONA, { mode: "interactive" });
+    const rec = await readTaskLogonRecord(PERSONA);
+    expect(rec.logon).toEqual({ mode: "interactive" });
+    expect(rec.schemaVersion).toBe(BOOT_SCHEMA_VERSION);
+  });
+
+  test("a marker written without a version reads back as schemaVersion 0", async () => {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(join(workdir, "phantombot"), { recursive: true });
+    writeFileSync(
+      join(workdir, "phantombot", `windows-logon-${PERSONA}.json`),
+      JSON.stringify({ mode: "interactive" }), // no schemaVersion
+    );
+    expect((await readTaskLogonRecord(PERSONA)).schemaVersion).toBe(0);
+  });
+
+  test("a never-installed box does not migrate (and never self-installs)", async () => {
+    const st = new MigrateFake({}); // main task not registered
+    const r = await migrateBootSchemaIfNeeded({
+      binPath: BIN,
+      persona: PERSONA,
+      sid: SID,
+      xmlDir: workdir,
+      schtasks: st,
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+    });
+    expect(r).toEqual({ migrated: false, reason: "not-installed" });
+    expect(st.created()).toEqual([]);
+  });
+
+  test("an up-to-date box does not migrate", async () => {
+    await writeTaskLogon(PERSONA, { mode: "interactive" }); // stamps current version
+    const st = new MigrateFake({ [NAMES.main]: principalXml(SID) });
+    const r = await migrateBootSchemaIfNeeded({
+      binPath: BIN,
+      persona: PERSONA,
+      sid: SID,
+      xmlDir: workdir,
+      schtasks: st,
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+    });
+    expect(r.reason).toBe("current");
+    expect(r.migrated).toBe(false);
+    expect(st.created()).toEqual([]);
+  });
+
+  test("an interactive box on an old schema migrates by re-installing", async () => {
+    // Old-schema marker (version 0) + a registered main task = installed but stale.
+    await writeTaskLogon(PERSONA, { mode: "interactive" }, 0);
+    const st = new MigrateFake({ [NAMES.main]: principalXml(SID) });
+    const r = await migrateBootSchemaIfNeeded({
+      binPath: BIN,
+      persona: PERSONA,
+      sid: SID,
+      xmlDir: workdir,
+      schtasks: st,
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+    });
+    expect(r.migrated).toBe(true);
+    expect(r.from).toBe(0);
+    expect(r.to).toBe(BOOT_SCHEMA_VERSION);
+    // Re-registered the four interactive tasks (no login task in interactive mode).
+    expect(st.created()).toContain(NAMES.main);
+    // The marker is stamped current, so a second start does not re-migrate.
+    expect((await readTaskLogonRecord(PERSONA)).schemaVersion).toBe(
+      BOOT_SCHEMA_VERSION,
+    );
+  });
+
+  test("a password box migrates using the saved vault password (adds the login task)", async () => {
+    await writeTaskLogon(PERSONA, { mode: "password", username: "PC\\me" }, 0);
+    const st = new MigrateFake({ [NAMES.main]: passwordPrincipalXml("PC\\me") });
+    const r = await migrateBootSchemaIfNeeded({
+      binPath: BIN,
+      persona: PERSONA,
+      sid: SID,
+      xmlDir: workdir,
+      schtasks: st,
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      readWindowsPassword: async () => "saved-pw",
+    });
+    expect(r.migrated).toBe(true);
+    // The login-fallback task is now part of the set.
+    expect(st.created()).toContain(NAMES.login);
+    // The saved password was applied via /RP on the password tasks.
+    const mainCreate = st.calls.find(
+      (c) => c[0] === "/Create" && c.includes(NAMES.main),
+    )!;
+    expect(mainCreate).toContain("saved-pw");
+  });
+
+  test("a password box with no saved password is skipped loudly, not half-migrated", async () => {
+    await writeTaskLogon(PERSONA, { mode: "password", username: "PC\\me" }, 0);
+    const st = new MigrateFake({ [NAMES.main]: passwordPrincipalXml("PC\\me") });
+    const r = await migrateBootSchemaIfNeeded({
+      binPath: BIN,
+      persona: PERSONA,
+      sid: SID,
+      xmlDir: workdir,
+      schtasks: st,
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      readWindowsPassword: async () => null,
+    });
+    expect(r).toEqual({
+      migrated: false,
+      reason: "password-unavailable",
+      from: 0,
+      to: BOOT_SCHEMA_VERSION,
+    });
+    expect(st.created()).toEqual([]);
+  });
+
+  test("a partial registration failure does NOT advance the marker, so the next run retries", async () => {
+    // Old-schema interactive box: installed but stale, so a migration is due.
+    await writeTaskLogon(PERSONA, { mode: "interactive" }, 0);
+
+    // A runner whose main task exists (migration proceeds) but that fails the
+    // tick /Create the first time through, then heals.
+    class FlakyMigrateFake implements SchtasksRunner {
+      calls: string[][] = [];
+      failCreate = true;
+      constructor(private registry: Record<string, string | undefined>) {}
+      async run(args: readonly string[]): Promise<SchtasksResult> {
+        this.calls.push([...args]);
+        if (args[0] === "/Query") {
+          const xml = this.registry[args[args.indexOf("/TN") + 1]!];
+          return xml === undefined
+            ? { exitCode: 1, stdout: "", stderr: "cannot find" }
+            : { exitCode: 0, stdout: xml, stderr: "" };
+        }
+        if (args[0] === "/Create" && this.failCreate && args.includes(NAMES.tick)) {
+          return { exitCode: 1, stdout: "", stderr: "access denied" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+    }
+
+    const st = new FlakyMigrateFake({ [NAMES.main]: principalXml(SID) });
+
+    // First attempt: the tick /Create fails → migration reports failure and the
+    // marker MUST stay at the prior schema (0), not jump to current.
+    const first = await migrateBootSchemaIfNeeded({
+      binPath: BIN,
+      persona: PERSONA,
+      sid: SID,
+      xmlDir: workdir,
+      schtasks: st,
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+    });
+    expect(first).toEqual({
+      migrated: false,
+      reason: "failed",
+      from: 0,
+      to: BOOT_SCHEMA_VERSION,
+    });
+    // The critical assertion: a half-migrated box is still marked stale, so the
+    // migration is retried rather than permanently skipped.
+    expect((await readTaskLogonRecord(PERSONA)).schemaVersion).toBe(0);
+
+    // The transient fault clears; the next `phantombot run` retries and completes.
+    st.failCreate = false;
+    const second = await migrateBootSchemaIfNeeded({
+      binPath: BIN,
+      persona: PERSONA,
+      sid: SID,
+      xmlDir: workdir,
+      schtasks: st,
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+    });
+    expect(second.migrated).toBe(true);
+    expect((await readTaskLogonRecord(PERSONA)).schemaVersion).toBe(
+      BOOT_SCHEMA_VERSION,
+    );
+  });
+});
+
+describe("#309 cold-start recovery: `phantombot install` restores a fully-wiped set", () => {
+  /** Records /Create names; /Query always misses (every task deleted). */
+  class ColdStartFake implements SchtasksRunner {
+    calls: string[][] = [];
+    async run(args: readonly string[]): Promise<SchtasksResult> {
+      this.calls.push([...args]);
+      if (args[0] === "/Query") {
+        return { exitCode: 1, stdout: "", stderr: "cannot find" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }
+    created(): string[] {
+      return this.calls
+        .filter((c) => c[0] === "/Create")
+        .map((c) => c[c.indexOf("/TN") + 1]!);
+    }
+  }
+
+  test("all tasks deleted → interactive install re-registers the four-task set", async () => {
+    const st = new ColdStartFake();
+    const result = await installPhantombotTasks({
+      binPath: BIN,
+      persona: PERSONA,
+      sid: SID,
+      xmlDir: workdir,
+      schtasks: st,
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+    });
+    expect(result.installed).toBe(true);
+    expect(st.created()).toEqual([
+      NAMES.main,
+      NAMES.heartbeat,
+      NAMES.nightly,
+      NAMES.tick,
+    ]);
+  });
+
+  test("all tasks deleted → logged-off install re-registers all five (incl. login-fallback)", async () => {
+    const st = new ColdStartFake();
+    const result = await installPhantombotTasks({
+      binPath: BIN,
+      persona: PERSONA,
+      sid: SID,
+      accountName: "PC\\me",
+      xmlDir: workdir,
+      logon: { mode: "password", username: "PC\\me", password: "pw" },
+      schtasks: st,
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+    });
+    expect(result.installed).toBe(true);
+    expect(st.created()).toEqual([
+      NAMES.main,
+      NAMES.heartbeat,
+      NAMES.nightly,
+      NAMES.tick,
+      NAMES.login,
+    ]);
   });
 });
