@@ -79,6 +79,15 @@ Flow:
 3. **Log in as usual** — `phantombot mcp login google-mcp`. Browser approve →
    loopback captures the code → tokens land in the vault; refresh is automatic.
 
+> **Same-host redirect.** The redirect target is `http://127.0.0.1:<port>`, so
+> the approving browser must run on the **same host** as `mcp login` (SSH/RDP
+> into the box, or tunnel the port). `login` holds the loopback listener open
+> **~180s** by default (`--wait <ms>`; `--wait 0` = manual only) — earlier it
+> tore the listener down the instant the URL printed, so every redirect hit a
+> dead port. If the browser is elsewhere, copy the `?code=` value from the
+> redirect and finish out-of-band:
+> `phantombot mcp login <id> --code <CODE> --redirect-url <URL>`.
+
 The pre-registered client lives in a **durable** vault row
 (`<tokenRef>__CLIENT_STATIC`) that `invalidateCredentials` never wipes, so a
 token-refresh failure re-runs consent instead of falling back to DCR (which the

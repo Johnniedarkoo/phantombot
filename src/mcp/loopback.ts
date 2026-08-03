@@ -20,6 +20,8 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 
+import { log } from "../lib/logger.ts";
+
 export interface LoopbackCapture {
   /** The redirect_uri to register with the auth server (e.g. http://127.0.0.1:54321/callback). */
   redirectUrl: string;
@@ -41,21 +43,32 @@ export async function startLoopbackCapture(path = "/callback"): Promise<Loopback
 
   const server: Server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    // Never log the raw `code`/`error` query values — codes are single-use
+    // secrets. Log only presence + path so a failed round-trip is diagnosable.
+    log.info("mcp.oauth.loopback request received", {
+      path: url.pathname,
+      hasCode: url.searchParams.has("code"),
+      hasError: url.searchParams.has("error"),
+    });
     if (url.pathname !== path) {
+      log.warn("mcp.oauth.loopback request to unexpected path", { path: url.pathname, expected: path });
       res.writeHead(404).end("not found");
       return;
     }
     const error = url.searchParams.get("error");
     const code = url.searchParams.get("code");
     if (error) {
+      log.warn("mcp.oauth.loopback authorization error returned", { error });
       res.writeHead(400, { "content-type": "text/plain" }).end(`Authorization failed: ${error}`);
       if (!settled) { settled = true; rejectCode?.(new Error(`authorization error: ${error}`)); }
       return;
     }
     if (!code) {
+      log.warn("mcp.oauth.loopback callback missing code");
       res.writeHead(400, { "content-type": "text/plain" }).end("Missing authorization code.");
       return;
     }
+    log.info("mcp.oauth.loopback authorization code captured");
     res
       .writeHead(200, { "content-type": "text/html" })
       .end("<html><body><h3>Authorized.</h3><p>You can close this tab and return to phantombot.</p></body></html>");
@@ -69,6 +82,7 @@ export async function startLoopbackCapture(path = "/callback"): Promise<Loopback
 
   const addr = server.address() as AddressInfo;
   const redirectUrl = `http://127.0.0.1:${addr.port}${path}`;
+  log.info("mcp.oauth.loopback listening", { host: "127.0.0.1", port: addr.port, path });
 
   return {
     redirectUrl,
@@ -76,9 +90,11 @@ export async function startLoopbackCapture(path = "/callback"): Promise<Loopback
       return new Promise<string>((resolve, reject) => {
         resolveCode = resolve;
         rejectCode = reject;
+        log.info("mcp.oauth.loopback waiting for redirect", { timeoutMs, redirectUrl });
         const timer = setTimeout(() => {
           if (!settled) {
             settled = true;
+            log.warn("mcp.oauth.loopback timed out waiting for redirect", { timeoutMs });
             reject(new Error(`timed out after ${timeoutMs}ms waiting for the OAuth redirect`));
           }
         }, timeoutMs);
@@ -88,6 +104,7 @@ export async function startLoopbackCapture(path = "/callback"): Promise<Loopback
     close(): void {
       try {
         server.close();
+        log.debug("mcp.oauth.loopback listener closed", { port: addr.port });
       } catch {
         /* already closed */
       }

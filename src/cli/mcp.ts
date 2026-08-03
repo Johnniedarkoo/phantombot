@@ -425,6 +425,13 @@ export async function runMcpCall(input: {
 
 // ─── login ────────────────────────────────────────────────────────────────────
 
+/**
+ * How long `mcp login` keeps the loopback listener open awaiting the browser
+ * redirect when the user doesn't pass `--wait`. Chosen to comfortably cover a
+ * human clicking through a provider's consent screen. `--wait 0` opts out.
+ */
+export const DEFAULT_LOGIN_WAIT_MS = 180_000;
+
 export async function runMcpLogin(input: {
   id: string;
   persona?: string;
@@ -454,16 +461,29 @@ export async function runMcpLogin(input: {
       out.write(`'${input.id}' authorized.\n`);
       return 0;
     }
+    // Default: hold the loopback listener open long enough for the user to
+    // approve in the browser and get redirected back. Without this the listener
+    // was torn down the instant the URL was printed, so the callback always hit
+    // a dead port (ERR_CONNECTION_REFUSED) — even on the same host. Pass
+    // `--wait 0` to opt out and drive the manual `--code` path from the start.
+    const waitMs = input.waitMs ?? DEFAULT_LOGIN_WAIT_MS;
     const result = await beginLogin(input.id, entry, vault, {
-      waitForRedirectMs: input.waitMs ?? 0,
+      waitForRedirectMs: waitMs,
       onUrl: (url) => out.write(`Open this URL and approve:\n  ${url}\n`),
+      onWaiting: ({ redirectUrl }) =>
+        out.write(
+          `Waiting up to ${Math.round(waitMs / 1000)}s for you to approve in the browser…\n` +
+            `If the browser is on another machine and can't reach this host, copy the '?code='\n` +
+            `value from the redirect URL and run:\n` +
+            `  phantombot mcp login ${input.id} --code <CODE> --redirect-url ${redirectUrl}\n`,
+        ),
     });
     if (result.status === "authorized") {
       out.write(`'${input.id}' authorized.\n`);
       return 0;
     }
     out.write(
-      `Waiting for approval. If the browser can't reach this host, copy the '?code=' value from the redirect and run:\n` +
+      `\nNo redirect received yet. Copy the '?code=' value from the redirect and run:\n` +
         `  phantombot mcp login ${input.id} --code <CODE> --redirect-url ${result.redirectUrl}\n`,
     );
     return 0;
@@ -624,7 +644,7 @@ export default defineCommand({
         id: { type: "positional", required: true, description: "Server id." },
         code: { type: "string", description: "Complete a login with a pasted authorization code." },
         "redirect-url": { type: "string", description: "The redirect URL printed when the flow began (needed with --code)." },
-        wait: { type: "string", description: "Wait up to N ms for the browser redirect on the loopback listener." },
+        wait: { type: "string", description: "Milliseconds to hold the loopback listener open for the browser redirect (default 180000; '0' = manual --code path only)." },
         ...personaArg,
       },
       async run({ args }) {

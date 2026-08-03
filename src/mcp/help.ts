@@ -59,6 +59,12 @@ THE THREE AUTH METHODS (this is the whole ecosystem in practice)
        You then:  run  phantombot mcp login <id>  — this prints an authorization
                   URL. Tell the user "open this link and approve"; the callback
                   is captured on a loopback listener and tokens are saved.
+                  login holds the listener open ~180s for the approval (change
+                  with --wait <ms>; --wait 0 = manual only). Loopback is
+                  127.0.0.1, so the browser must be on THIS host (e.g. RDP into
+                  the box). If it's on another machine, copy the '?code=' value
+                  from the redirect and finish with:
+                    phantombot mcp login <id> --code <CODE> --redirect-url <URL>
 
      PRE-REGISTERED CLIENT (skip-DCR) — for providers that REJECT dynamic client
      registration. Google's remote MCP servers are the main case: 'mcp login'
