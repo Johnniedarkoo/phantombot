@@ -18,6 +18,7 @@
 
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 
+import { log } from "../lib/logger.ts";
 import type { Vault } from "../lib/vault.ts";
 import { VaultOAuthClientProvider } from "./authProvider.ts";
 import { startLoopbackCapture } from "./loopback.ts";
@@ -48,9 +49,15 @@ export async function beginLogin(
   serverId: string,
   entry: McpServerEntry,
   vault: Pick<Vault, "get" | "set" | "unset">,
-  opts: { waitForRedirectMs?: number; onUrl?: (url: string) => void } = {},
+  opts: {
+    waitForRedirectMs?: number;
+    onUrl?: (url: string) => void;
+    onWaiting?: (info: { redirectUrl: string; waitMs: number }) => void;
+  } = {},
 ): Promise<LoginResult> {
   const { url, auth: oauth } = oauthEntry(serverId, entry);
+  const waitMs = opts.waitForRedirectMs ?? 0;
+  log.info("mcp.oauth.login begin", { serverId, waitForRedirectMs: waitMs });
   const capture = await startLoopbackCapture();
   let authorizationUrl: string | undefined;
   const provider = new VaultOAuthClientProvider(vault, {
@@ -59,6 +66,7 @@ export async function beginLogin(
     scopes: oauth.scopes,
     onAuthorizationUrl: (u) => {
       authorizationUrl = u.href;
+      log.info("mcp.oauth.login authorization url issued", { serverId });
       opts.onUrl?.(u.href);
     },
   });
@@ -67,16 +75,20 @@ export async function beginLogin(
     const result = await auth(provider, { serverUrl: url });
     if (result === "AUTHORIZED") {
       // Already had a valid token / completed without a redirect.
+      log.info("mcp.oauth.login authorized without redirect", { serverId });
       return { status: "authorized" };
     }
     // result === "REDIRECT": provider.redirectToAuthorization has run, so we
     // have the URL and the verifier is saved. Wait for the loopback callback
     // if asked, else hand back for the manual code path.
     if (!authorizationUrl) throw new Error("oauth: SDK requested a redirect but produced no URL");
-    const waitMs = opts.waitForRedirectMs ?? 0;
     if (waitMs <= 0) {
+      log.info("mcp.oauth.login pending (no wait requested)", { serverId });
       return { status: "pending", authorizationUrl, redirectUrl: capture.redirectUrl };
     }
+    // Hold the listener open and let the caller surface the manual fallback
+    // NOW (not only on timeout), so a cross-host browser has an escape hatch.
+    opts.onWaiting?.({ redirectUrl: capture.redirectUrl, waitMs });
     let code: string;
     try {
       code = await capture.waitForCode(waitMs);
@@ -87,12 +99,18 @@ export async function beginLogin(
       // pending so the caller can print the paste-the-code instructions.
       const msg = (e as Error).message;
       if (/timed out|authorization error/.test(msg)) {
+        log.warn("mcp.oauth.login redirect not captured — falling back to manual code", {
+          serverId,
+          reason: msg,
+        });
         return { status: "pending", authorizationUrl, redirectUrl: capture.redirectUrl };
       }
       throw e;
     }
+    log.info("mcp.oauth.login redirect captured — exchanging code", { serverId });
     const done = await auth(provider, { serverUrl: url, authorizationCode: code });
     if (done !== "AUTHORIZED") throw new Error(`oauth: token exchange returned ${done}`);
+    log.info("mcp.oauth.login authorized", { serverId });
     return { status: "authorized" };
   } finally {
     capture.close();
@@ -116,6 +134,8 @@ export async function completeLogin(
     redirectUrl,
     scopes: oauth.scopes,
   });
+  log.info("mcp.oauth.login completing with pasted code", { serverId });
   const result = await auth(provider, { serverUrl: url, authorizationCode });
   if (result !== "AUTHORIZED") throw new Error(`oauth: token exchange returned ${result}`);
+  log.info("mcp.oauth.login authorized (manual code)", { serverId });
 }
