@@ -47,6 +47,7 @@ import { listPiModels } from "../lib/piModels.ts";
 import type { MemoryStore } from "../memory/store.ts";
 import { DEFAULT_HISTORY_LIMIT } from "../orchestrator/turn.ts";
 import { VERSION } from "../version.ts";
+import { gatherStatusProbes } from "./statusProbes.ts";
 
 export interface ActiveTurnHandle {
   controller: AbortController;
@@ -112,6 +113,17 @@ export interface SlashCommandContext {
    * degrades to its historical behaviour of aborting only the active turn.
    */
   flushBacklog?: () => number;
+  /**
+   * This persona's PhantomChat identity as an `npub…` (bech32 public key) —
+   * the shareable address a user pastes into the PWA to DM this bot. Shown on
+   * a `phantomchat:` line in /status so the operator can read the bot's own
+   * npub without digging through phantomchat.json.
+   *
+   * Optional: undefined when the persona has no PhantomChat identity
+   * configured (no phantomchat.json / nsec), or in tests that don't set it —
+   * the /status line is simply omitted in that case.
+   */
+  phantomchatNpub?: string;
 }
 
 export interface SlashCommandResult {
@@ -680,14 +692,32 @@ async function handleStatus(
       ? `\nrunning: ${truncateLine(ctx.activeTurn.lastProgressNote, 120)}`
       : "";
 
+  // The persona's own PhantomChat address (npub…), when it has one. Kept on
+  // its own line so it's easy to copy into the PWA / an allowlist.
+  const npubLine = ctx.phantomchatNpub
+    ? `phantomchat: ${ctx.phantomchatNpub}\n`
+    : "";
+
+  // Live subsystem health probes — fresh on every /status (it's a
+  // troubleshooting tool). Each line is omitted when its subsystem isn't
+  // configured. See statusProbes.ts.
+  const probes = await gatherStatusProbes(ctx.config, ctx.persona);
+  const probeLines =
+    (probes.telegram ? `telegram: ${probes.telegram}\n` : "") +
+    (probes.acp ? `acp:     ${probes.acp}\n` : "") +
+    (probes.memory ? `memory:  ${probes.memory}\n` : "") +
+    (probes.voice ? `voice:   ${probes.voice}\n` : "");
+
   return {
     reply:
       `phantom: ${ctx.persona} (pid ${process.pid}, v${VERSION})\n` +
+      npubLine +
       `harness: ${primary}\n` +
       `chain:   ${chain}\n` +
       modelsLine +
       `uptime:  ${formatElapsedSeconds(uptimeS)}\n` +
       `context: ~${pct}% (≈${approxTokens.toLocaleString()} / ${windowTokens.toLocaleString()} tokens, last ${DEFAULT_HISTORY_LIMIT} turns)\n` +
+      probeLines +
       `active:  ${active}` +
       runningLine,
   };
