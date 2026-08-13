@@ -1,5 +1,9 @@
 /**
- * Tiny structured logger. Writes JSON lines to stdout.
+ * Tiny structured logger. Writes JSON lines to stderr.
+ *
+ * ALL levels (debug, info, warn, error) go to stderr. stdout is a protocol
+ * channel for two entrypoints (ACP stdio server + MCP proxy) — any stray
+ * write there corrupts the JSON-RPC wire and the editor drops the connection.
  *
  * Replace with pino / winston / etc. if you outgrow this. The interface here
  * is intentionally narrow so the swap stays small.
@@ -37,9 +41,9 @@ function emit(level: LogLevel, msg: string, fields?: Record<string, unknown>): v
     msg,
     ...(fields ?? {}),
   };
-  // stderr for warn/error so log shippers can split if desired.
-  const stream = level === "warn" || level === "error" ? process.stderr : process.stdout;
-  stream.write(redactForLog(JSON.stringify(line)) + "\n");
+  // ALL levels go to stderr. stdout is a protocol channel for two entrypoints
+  // (ACP stdio server + MCP proxy) — any stray write there corrupts the wire.
+  process.stderr.write(redactForLog(JSON.stringify(line)) + "\n");
 }
 
 export const log = {

@@ -58,9 +58,9 @@ describe("logger redaction", () => {
     expect(String(line.error)).toContain("[REDACTED]");
   });
 
-  test("redacts a secret in the message itself (info → stdout)", () => {
+  test("redacts a secret in the message itself (info → stderr)", () => {
     log.info("loaded TELEGRAM_BOT_TOKEN=secret-value-123 from env");
-    const line = lastLine(out.lines);
+    const line = lastLine(err.lines);
     expect(String(line.msg)).not.toContain("secret-value-123");
     expect(String(line.msg)).toContain("[REDACTED]");
   });
@@ -86,7 +86,7 @@ describe("logger redaction", () => {
     // `"TELEGRAM_BOT_TOKEN":"secret-value-123"` — no free-text `=` for the
     // label rule to anchor on — so the sink must match the JSON key form.
     log.info("env", { TELEGRAM_BOT_TOKEN: "secret-value-123" });
-    const line = lastLine(out.lines);
+    const line = lastLine(err.lines);
     expect(JSON.stringify(line)).not.toContain("secret-value-123");
     expect(line.TELEGRAM_BOT_TOKEN).toBe("[REDACTED]");
   });
@@ -103,9 +103,22 @@ describe("logger redaction", () => {
 
   test("leaves a clean line untouched and parseable", () => {
     log.info("started", { chatId: 42, persona: "default" });
-    const line = lastLine(out.lines);
+    const line = lastLine(err.lines);
     expect(line.msg).toBe("started");
     expect(line.chatId).toBe(42);
     expect(line.persona).toBe("default");
+  });
+
+  test("stdout stays byte-clean across all log levels", () => {
+    log.info("inf", { k: 1 });
+    log.warn("wrn", { k: 2 });
+    log.error("err", { k: 3 });
+    // stdout must be completely empty - it's a protocol channel for ACP/MCP.
+    expect(out.lines.join("")).toBe("");
+    // stderr must have all three lines.
+    const raw = err.lines.join("");
+    expect(raw).toContain('"msg":"inf"');
+    expect(raw).toContain('"msg":"wrn"');
+    expect(raw).toContain('"msg":"err"');
   });
 });
