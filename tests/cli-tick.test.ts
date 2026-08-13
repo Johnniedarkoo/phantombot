@@ -51,20 +51,20 @@ function installFetchTrap(): { calls: FetchCall[]; restore: () => void } {
   return { calls, restore: () => { globalThis.fetch = original; } };
 }
 
-function captureStdout(): {
+function captureStream(which: "stdout" | "stderr"): {
   lines: string[];
   restore: () => void;
 } {
   const lines: string[] = [];
-  const original = process.stdout.write;
-  process.stdout.write = ((chunk: unknown) => {
+  const original = process[which].write;
+  process[which].write = ((chunk: unknown) => {
     lines.push(String(chunk));
     return true;
   }) as typeof process.stdout.write;
   return {
     lines,
     restore: () => {
-      process.stdout.write = original;
+      process[which].write = original;
     },
   };
 }
@@ -190,7 +190,7 @@ describe("runTick — normal task fire", () => {
       { type: "text", text: "partial " },
       { type: "done", finalText: "partial done" },
     ]);
-    const capture = captureStdout();
+    const capture = captureStream("stderr");
     const trap = installFetchTrap();
     try {
       await runTick({
