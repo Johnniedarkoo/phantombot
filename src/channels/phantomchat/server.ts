@@ -1176,7 +1176,44 @@ export async function runPhantomchatServer(
     // through instructions the user has already superseded. Silent by design:
     // only `/stop` tells the user what it threw away. Gated on an active turn
     // so that a burst of messages sent while idle is still answered in full.
-    const active = activeTurns.get(msg.conversationId);
+    //
+    // GROUP SCOPING: in a multi-bot group every bot's instance sees every
+    // message over the shared relay, so an unscoped interrupt lets a message
+    // addressed to a SIBLING abort THIS bot's in-flight work. The interrupt
+    // must therefore pass the same two gates handle() applies before it runs a
+    // turn: (1) bot senders are always ignored (cascade kill), and (2) when
+    // another bot shares the group, the message must EXPLICITLY name this bot.
+    //
+    // Why explicit-name-only instead of the full decideGroupReply gate: the
+    // follow-up arm of decideGroupReply reads lastAddressed, which is only
+    // written in handle(). While a turn is active, later messages from the
+    // same peer are queued BEHIND that turn, so handle() hasn't run for them
+    // and lastAddressed is stale — a handoff ("kai, you take Y") followed by
+    // a bare follow-up ("and also Z") would read lastAddressed=["lena"] and
+    // abort Lena's in-flight turn, AND the backlog flush would silently drop
+    // the queued handoff. Net: work killed, replacement lost. Requiring an
+    // explicit name match keeps the enqueue check stateless: an unaddressed
+    // follow-up just queues behind the running turn (mild UX cost — "stop,
+    // do Y instead" must name the bot — but strictly safe), while handle()
+    // still applies the full lastAddressed logic when the message runs.
+    // Both checks here are READ-ONLY — no profile fetch, no
+    // lastAddressed/buffer mutation; handle() re-decides authoritatively when
+    // the message actually runs. A cold profile cache degrades to the old
+    // behaviour (interrupt fires), never to a lost interrupt.
+    let interrupt = !isBot(msg.senderId);
+    if (interrupt && msg.groupId) {
+      const memberHexes = msg.groupMemberHexes ?? [];
+      const roster = buildRoster(memberHexes);
+      const otherBotPresent =
+        roster.length > 1 ||
+        memberHexes.some((h) => h.toLowerCase() !== ourHex && isBot(h));
+      if (otherBotPresent) {
+        interrupt = matchPersonaNames(msg.text ?? "", roster).some(
+          (n) => n.toLowerCase() === selfName.toLowerCase(),
+        );
+      }
+    }
+    const active = interrupt ? activeTurns.get(msg.conversationId) : undefined;
     if (active) {
       const dropped = backlog.flush(msg.conversationId, "interrupt");
       log.info("phantomchat: new message — interrupting active turn", {
