@@ -219,9 +219,16 @@ export async function retrieveContext(
       // defaults, a genuine ≈4 BM25 match stops clearing the 2.0 floor
       // past ~30 days and tier 2 goes permanently silent for exactly the
       // aged cross-chat memory #377 exists to surface.
+      // Pool width is deliberately wider than crossLimit: crossProvenanceWeight
+      // (below, via selectCrossConversationHits) re-ranks survivors by trust,
+      // and a pool truncated to crossLimit BEFORE that re-rank runs leaves
+      // nothing for it to rerank — it would just rubber-stamp RRF's raw top-N
+      // (#382). Taking the whole fused pool also means hybridSearch's own
+      // decay-ordered slice no longer selects anything, which is why the
+      // re-rank multiplies decayFactor back in — see selectCrossConversationHits.
       const candidates = ix.hybridSearch(query, queryVec, {
         scope: "turns",
-        limit: crossLimit,
+        limit: CROSS_CANDIDATE_POOL,
         decay,
         turnFilter,
       });
@@ -388,6 +395,20 @@ export function crossAttribution(
 }
 
 /**
+ * Width of the tier-2 candidate pool passed into hybridSearch, independent of
+ * crossLimit (the OUTPUT cap applied after provenance and decay re-ranking, in
+ * selectCrossConversationHits).
+ *
+ * 50 is hybridSearch's own ceiling, not an arbitrary number: it clamps `limit`
+ * to 50 and its RRF merge fuses at most 25 FTS + 25 vector paths, so asking
+ * for 50 means "hand me the whole fused pool and let the re-rank decide the
+ * output" — which is the entire point of #382. Cost is bounded by that same
+ * ceiling: the per-hit `lookupScope`/`turnMetaForPath`/`snippetForPath`
+ * round-trips only run on paths that survived the merge, ≤50 of them.
+ */
+export const CROSS_CANDIDATE_POOL = 50;
+
+/**
  * Tier-2 TRUST weights, by `source` (who asserted the content).
  *
  * Weight, do not filter — the principal's call on #377. A low-provenance
@@ -529,11 +550,19 @@ export function selectCrossConversationHits(
   // floor than we have slots for, the slots go to the better-attested ones
   // rather than to whoever happened to rank higher lexically.
   //
+  // decayFactor is folded back in here deliberately: hybridSearch's own
+  // ordering is decay-adjusted, but with the pool now wider than `limit`
+  // (#382) that ordering only decides who ENTERS the pool, not who wins the
+  // final slots — this multiply is what makes decay matter again for a pool
+  // this wide. Without it, a 400-day-old hit at the decay floor can
+  // outrank a same-day hit purely on raw score × provenance (#390 review).
+  // 1 when decay wasn't requested, so this is a no-op in that case.
+  //
   // Ordering only: the weighted value is never written back onto the hit,
   // so nothing downstream can mistake it for a relevance score. Array.sort
   // is stable, so equal weights preserve the incoming best-first order.
   const ranked = out
-    .map((h, i) => ({ h, i, w: crossProvenanceWeight(h) }))
+    .map((h, i) => ({ h, i, w: crossProvenanceWeight(h) * (h.decayFactor ?? 1) }))
     .sort((a, b) => scoreOf(b.h) * b.w - scoreOf(a.h) * a.w || a.i - b.i)
     .map((r) => r.h);
   return ranked.slice(0, opts.limit);
