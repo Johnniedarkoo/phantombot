@@ -63,15 +63,20 @@
  * what was held, the held episode must be written into the PRINCIPAL'S
  * telegram conversation, the same one the notify went to.
  *
- * So on HOLD, after notifying, we write a turn PAIR per principal telegram
- * conversation: a QUARANTINED user turn carrying the raw untrusted payload
+ * So on HOLD we write a turn PAIR per principal conversation, in order:
+ * first a QUARANTINED user turn carrying the raw untrusted payload
  * (embeddable:false — never indexed/embedded; see memory/store.ts + the
- * turnIndexer), and an embeddable assistant turn carrying the judge-
- * notification text. The pair replays into the principal's next turn so
- * "yes, go ahead" / "no" has a referent. This is done HERE in the screener,
- * correctly scoped to the principal — NOT in notify.ts (which only sends a
- * message and has no business writing memory) and NOT in turn.ts's hold path
- * (which is scoped to the untrusted entry point, the wrong conversation).
+ * turnIndexer), written HERE by the screener (recordHeld); then the
+ * embeddable assistant turn carrying the judge-notification text, persisted
+ * by runNotify as its `[notification] ` row. Ordering matters: the notify
+ * row must land LAST, so the assistant-authored, safely-truncated text — not
+ * the raw untrusted payload — is the closing row before the principal's
+ * reply. Single-writer for the notify text (runNotify only) is what prevents
+ * one held event double-counting in retrieval (#381). The pair replays into
+ * the principal's next turn so "yes, go ahead" / "no" has a referent. The
+ * scoping is done HERE in the screener, correctly targeted at the principal
+ * — NOT in turn.ts's hold path (which is scoped to the untrusted entry
+ * point, the wrong conversation).
  * ─────────────────────────────────────────────────────────────────────────
  *
  * Fail-OPEN on judge/recall error by design: if screening itself errors
@@ -363,7 +368,7 @@ export function makeScreener(
       return { action: "pass", score: v.score, reason: v.reason };
     }
 
-    // 3. HOLD — fail-closed (the turn does nothing) + notify conversationally.
+    // HOLD — fail-closed (the turn does nothing) + notify conversationally.
     const concern =
       v.question && v.question.trim().length > 0
         ? v.question.trim()
@@ -375,21 +380,18 @@ export function makeScreener(
       `What it asked: "${preview}"\n` +
       `${concern}`;
 
-    try {
-      const code = await notify(notifyMessage);
-      if (code !== 0) log.warn(`screen: notify exited ${code} for held request`);
-    } catch (e) {
-      log.warn(`screen: notify failed for held request: ${(e as Error).message}`);
-    }
-
-    // 4. GROUNDING WRITE (concern D+E) — AFTER notifying. Write the held
-    //    episode into each principal telegram conversation so the principal's
+    // 3. GROUNDING WRITE (concern D+E) — BEFORE notifying. Write the held
+    //    episode into each principal conversation so the principal's
     //    approve/deny reply (which lands in telegram:<userId>, NOT this
-    //    untrusted entry point) replays the payload and is grounded. The
-    //    judge text itself was already persisted by runNotify in step 3 —
-    //    writing it here too would double-count one event in retrieval (#381). Best-effort: a failure logs but must NEVER downgrade the
-    //    hold to a pass and must never throw out of the screener. No-op when
-    //    telegram isn't configured or the allowlist is empty.
+    //    untrusted entry point) replays the payload and is grounded. Ordering
+    //    matters: this raw, unframed payload row must land FIRST, so the
+    //    notify call in step 4 closes the episode with the assistant-authored,
+    //    safely-truncated notification text as the last row before the
+    //    principal's reply — the same shape the principal's history had before
+    //    the single-writer refactor (#381). Best-effort: a failure logs but
+    //    must NEVER downgrade the hold to a pass and must never throw out of
+    //    the screener. No-op when telegram isn't configured or the allowlist
+    //    is empty.
     try {
       const payload = content.replace(/\s+/g, " ").trim().slice(0, HELD_PAYLOAD_CAP);
       for (const conversation of principalConversations(config, persona)) {
@@ -405,6 +407,19 @@ export function makeScreener(
       // Defensive belt-and-suspenders: resolving the principal list must never
       // bring down the screener or weaken the hold.
       log.warn(`screen: held-episode grounding skipped: ${(e as Error).message}`);
+    }
+
+    // 4. NOTIFY — closes the episode. runNotify persists the `[notification] `
+    //    row into the same conversation, so it lands AFTER the payload row and
+    //    is the last thing the principal's history shows before their reply.
+    //    The judge text is persisted ONLY here (single writer) — recordHeld
+    //    must not duplicate it, or one held event would double-count in
+    //    retrieval (#381).
+    try {
+      const code = await notify(notifyMessage);
+      if (code !== 0) log.warn(`screen: notify exited ${code} for held request`);
+    } catch (e) {
+      log.warn(`screen: notify failed for held request: ${(e as Error).message}`);
     }
 
     return {
