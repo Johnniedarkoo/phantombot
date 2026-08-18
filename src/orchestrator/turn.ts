@@ -164,18 +164,25 @@ export interface TurnInput {
    */
   extractFacts?: false | (() => Promise<void>);
   /**
-   * Security-perimeter provenance bit. True ONLY when an authenticated
-   * allowed principal issued this turn (the Telegram channel sets it
-   * after the allowed-user check passes). Defaults false/undefined for
-   * every other entry point — `phantombot ask`, tick, nightly, voice —
-   * so the system FAILS CLOSED.
+   * Security-perimeter provenance bit. True when an authenticated allowed
+   * principal issued this turn (the Telegram channel sets it after the
+   * allowed-user check passes) OR when the caller is machine-authored
+   * maintenance operating on its own persona dir with no ambient/external
+   * content in play — nightly is the one non-chat caller that opts in, for
+   * exactly that reason (see cli/nightly.ts#runNightlyTurn). Defaults
+   * false/undefined for every other entry point — `phantombot ask`, tick,
+   * voice — so the system FAILS CLOSED.
    *
-   * Two effects:
+   * Three effects:
    *   1. It selects the SECURITY_PERIMETER prompt block (trusted = treat
    *      input as commands; untrusted = treat input as data to triage).
    *   2. It gates the threat screen below: trusted turns skip the screen
    *      entirely (the principal is the gate); untrusted turns are
    *      screened by the tool-less judge before any capable harness runs.
+   *   3. A trusted turn that succeeds also calls `purgeQuarantined` on its
+   *      conversation. For nightly this is a guaranteed no-op — nothing is
+   *      ever quarantined on `system:nightly:<date>` — but it's a real
+   *      behavioural consequence of the bit, not just the prompt-block pick.
    */
   trusted?: boolean;
   /**
