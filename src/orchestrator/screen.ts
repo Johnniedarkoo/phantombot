@@ -152,13 +152,13 @@ const DRAWERS_CAP_BYTES = 16 * 1024;
 const HELD_PAYLOAD_CAP = 2000;
 
 /**
- * A held-episode write into one principal conversation: a quarantined user
- * turn (the raw payload) + an embeddable assistant turn (the judge text).
+ * A held-episode write into one principal conversation: the quarantined raw
+ * payload. The judge's notify text is deliberately NOT part of this write —
+ * runNotify persists it (#381: single writer, no double-counted retrieval).
  */
 export interface HeldEpisode {
   conversation: string;
   payload: string;
-  notifyText: string;
 }
 
 export interface ScreenerDeps {
@@ -178,8 +178,8 @@ export interface ScreenerDeps {
   /** Override the notify side-effect (tests). Returns 0 on success. */
   notify?: (message: string) => Promise<number>;
   /**
-   * Override the held-episode grounding write (tests). Production writes a
-   * turn pair into each principal telegram conversation via the MemoryStore;
+   * Override the held-episode grounding write (tests). Production writes the
+   * quarantined payload into each principal conversation via the MemoryStore;
    * tests inject a stub to assert what would be written without a real store.
    */
   recordHeld?: (episode: HeldEpisode) => Promise<void>;
@@ -306,53 +306,29 @@ export function makeScreener(
     deps.notify ??
     ((message: string) => runNotify({ config, message, persona }));
 
-  // The grounding write. Default: write a turn pair into the principal's
-  // conversation via the store (quarantined payload + embeddable judge text).
+  // The grounding write. Default: write ONLY the quarantined payload into
+  // the principal's conversation. The judge's notification text is NOT
+  // written here — runNotify already persists it into the same conversation
+  // (prefixed `[notification] `, origin `notification`), so writing it again
+  // lands two embeddable, indexed copies of one event and double-counts it
+  // in retrieval (#381). runNotify is the single writer of the notify text.
+  //
+  // Trade-off accepted: if notify delivery fails outright, no assistant
+  // grounding row lands — but then the principal never saw the notification
+  // either, and the quarantined payload row below still anchors the episode.
   const recordHeld =
     deps.recordHeld ??
     (async (episode: HeldEpisode): Promise<void> => {
-      await memory.appendTurnPair(
-        {
-          persona,
-          conversation: episode.conversation,
-          role: "user",
-          // QUARANTINED: raw untrusted payload — replays in history to ground
-          // the principal's reply, but never indexed/embedded (embeddable
-          // false) and purged once a trusted turn rules. See store.ts.
-          text: episode.payload,
-          embeddable: false,
-        },
-        {
-          persona,
-          conversation: episode.conversation,
-          role: "assistant",
-          // The judge's notification text is safe to index (it's our own
-          // reasoning, not attacker text), so it stays embeddable.
-          text: episode.notifyText,
-          embeddable: true,
-          // ...but it is machine-generated, so without an explicit origin it
-          // defaults to `channel` and retrieval later weights/labels the
-          // judge's own reasoning like a real chat turn. The migration cannot
-          // retro-tag it either: this row is written into the PRINCIPAL's
-          // conversation (usually `telegram:<id>`), which matches none of the
-          // origin markers.
-          //
-          // `notification`, NOT `internal`: this exact string was just sent
-          // through runNotify (see the `notify` call in the HOLD branch), and
-          // runNotify persists it to `telegram:<chatId>` — the same key
-          // principalConversations() grounds into — stamped `notification`.
-          // So the same text lands twice in one conversation. Tagging this
-          // copy `internal` would give identical content two weights (0.6 vs
-          // 0.8) and two contradictory labels, one of which ("my own
-          // maintenance pass") is simply untrue: this is a notification the
-          // persona sent, not a nightly/heartbeat write.
-          //
-          // The quarantined user row above is left at the default — it is
-          // never indexed (embeddable: false) and is purged once a trusted
-          // turn rules.
-          origin: "notification",
-        },
-      );
+      await memory.appendTurn({
+        persona,
+        conversation: episode.conversation,
+        role: "user",
+        // QUARANTINED: raw untrusted payload — replays in history to ground
+        // the principal's reply, but never indexed/embedded (embeddable
+        // false) and purged once a trusted turn rules. See store.ts.
+        text: episode.payload,
+        embeddable: false,
+      });
     });
 
   return async (content: string, signal?: AbortSignal): Promise<ScreenVerdict> => {
@@ -409,15 +385,16 @@ export function makeScreener(
     // 4. GROUNDING WRITE (concern D+E) — AFTER notifying. Write the held
     //    episode into each principal telegram conversation so the principal's
     //    approve/deny reply (which lands in telegram:<userId>, NOT this
-    //    untrusted entry point) replays the payload + judge text and is
-    //    grounded. Best-effort: a failure logs but must NEVER downgrade the
+    //    untrusted entry point) replays the payload and is grounded. The
+    //    judge text itself was already persisted by runNotify in step 3 —
+    //    writing it here too would double-count one event in retrieval (#381). Best-effort: a failure logs but must NEVER downgrade the
     //    hold to a pass and must never throw out of the screener. No-op when
     //    telegram isn't configured or the allowlist is empty.
     try {
       const payload = content.replace(/\s+/g, " ").trim().slice(0, HELD_PAYLOAD_CAP);
       for (const conversation of principalConversations(config, persona)) {
         try {
-          await recordHeld({ conversation, payload, notifyText: notifyMessage });
+          await recordHeld({ conversation, payload });
         } catch (e) {
           log.warn(
             `screen: held-episode write failed for ${conversation} (hold still stands): ${(e as Error).message}`,
