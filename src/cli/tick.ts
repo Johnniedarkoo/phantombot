@@ -50,6 +50,7 @@ import {
 } from "../lib/runLock.ts";
 import { openTaskStore, type Task, type TaskStore } from "../lib/tasks.ts";
 import { recordTickFired } from "../lib/timerHealth.ts";
+import { shouldDeferWake } from "../lib/turnRegistry.ts";
 import { openMemoryStore, type MemoryStore } from "../memory/store.ts";
 import { runTurn } from "../orchestrator/turn.ts";
 import { makeRetriever } from "../orchestrator/retrieval.ts";
@@ -127,6 +128,45 @@ export async function runTick(input: RunTickInput = {}): Promise<number> {
       const conversation = isReview
         ? `tick:${task.id}:review`
         : `tick:${task.id}`;
+
+      // #391 — DEFER while the principal is mid-conversation.
+      //
+      // A task wake spawns its own `claude --print` from THIS oneshot process,
+      // completely invisible to the daemon's live interactive turn. Twice now
+      // the two have worked the same PR and the same unlocked checkout, and a
+      // contributor got duplicate review comments. The gap between the
+      // interactive turn and the wake was 63 seconds, which is why this is
+      // checked HERE, at fire time, and not when the task was scheduled.
+      //
+      // Deliberately no write-back to the row: leaving `next_run_at` untouched
+      // means the next tick (60s away) re-evaluates for free, and "how long
+      // have we been deferring" is just "how overdue is this task" — so the
+      // MAX_DEFERRAL_MS starvation ceiling needs no extra state and no
+      // migration. The task is not marked run, so run_count, one-off
+      // deactivation and maxRuns all stay honest.
+      //
+      // Command tasks are NOT exempt, despite running no harness themselves.
+      // The shipped contract tells a poller to call `phantombot ask` when it
+      // finds work (`persona/builder.ts`, and the Jira example in the README),
+      // and `ask` starts a full `runTurn` in yet another process. Exempting
+      // command tasks would leave that documented path as an unguarded back
+      // door into the exact collision this defers against — the poller fires
+      // mid-conversation, decides there is work, and wakes an agent anyway.
+      // Deferring the poller is cheap and safe: it is idempotent by
+      // construction, the next tick re-evaluates 60s later, and MAX_DEFERRAL_MS
+      // still guarantees it runs.
+      const verdict = shouldDeferWake(task.persona, task.nextRunAt, { now });
+      if (verdict.defer) {
+        log.info("tick: deferring task wake", {
+          id: task.id,
+          description: task.description,
+          persona: task.persona,
+          isCommandTask,
+          reason: verdict.reason,
+          overdueMs: now.getTime() - task.nextRunAt.getTime(),
+        });
+        continue;
+      }
 
       log.info("tick: firing task", {
         id: task.id,
