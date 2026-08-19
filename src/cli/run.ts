@@ -9,6 +9,8 @@
 import { defineCommand } from "citty";
 import { existsSync } from "node:fs";
 
+import { hostname } from "node:os";
+
 import {
   HttpTelegramTransport,
   runTelegramServer,
@@ -53,6 +55,8 @@ import {
 } from "../lib/harnessAvailability.ts";
 import type { WriteSink } from "../lib/io.ts";
 import { log } from "../lib/logger.ts";
+import { harnessAlerter } from "../lib/harnessAlert.ts";
+import { runNotify } from "./notify.ts";
 import { healDefaultPersonaIfBroken } from "../lib/personaDefault.ts";
 import { isPhantombotBinary } from "../lib/binaryIdentity.ts";
 import { currentPlatform, logsCommand, statusCommand } from "../lib/platform.ts";
@@ -418,6 +422,35 @@ export async function runRun(input: RunInput = {}): Promise<number> {
     }
   }
 
+  // Harness health alerts (#284 follow-up). Failover is silent by design, so
+  // a primary harness whose credential has died degrades to a paid fallback
+  // with no signal anywhere but the provider's billing page — that is exactly
+  // how Robbie spent 3.5 days on pi. Install a sender here, at the daemon,
+  // where an owner channel actually exists; every other entry point (`ask`,
+  // tick, tests) leaves the alerter unconfigured and therefore silent.
+  //
+  // Send through `runNotify` rather than a transport of our own: it is the
+  // single writer that broadcasts across the persona bot, the default bot and
+  // phantomchat (deduped), honours reply-mode, and — the part that matters
+  // here — PERSISTS the alert into the conversation. Without that an owner
+  // who replies "why did that fire?" is asking about a message no turn can
+  // see.
+  //
+  // Persona resolution uses the same ladder as the startup doctor below: a
+  // phantomchat-only install has no Telegram listener at all, and that is
+  // precisely the kind of headless box where a dead credential goes unnoticed
+  // for days. `runNotify` reaches phantomchat perfectly well, so gating on a
+  // Telegram listener would switch the whole feature off exactly where it is
+  // needed most.
+  const alertPersona =
+    adminListener?.persona ?? phantomchatPersonas[0]?.persona ?? defaultPersona;
+  harnessAlerter.configure({
+    host: hostname(),
+    send: async (message: string) => {
+      await runNotify({ config, message, persona: alertPersona });
+    },
+  });
+
   out.write(
     `phantombot — ${plan.listeners.length} telegram listener(s), ${phantomchatPersonas.length} phantomchat persona(s), harnesses ${config.harnesses.chain.join(" → ")}\n`,
   );
@@ -460,9 +493,7 @@ export async function runRun(input: RunInput = {}): Promise<number> {
   // Startup health check — read-only for the nightly (it repairs itself by
   // sweeping); still repairs drifted units/timers/connectors. Don't await.
   // Runs against the admin persona for the same reason as notify above.
-  const doctorPersona =
-    adminListener?.persona ?? phantomchatPersonas[0]?.persona ?? defaultPersona;
-  runDoctor({ config, persona: doctorPersona, out, err }).then(
+  runDoctor({ config, persona: alertPersona, out, err }).then(
     (code) => {
       if (code !== 0) log.info("run: startup doctor flagged an issue", { code });
     },
@@ -480,7 +511,7 @@ export async function runRun(input: RunInput = {}): Promise<number> {
   // Detached, so a long backlog sweep outlives neither this promise nor the
   // daemon's own lifecycle concerns, and a crash there can never take the
   // channel loop with it.
-  spawnStartupNightly(doctorPersona);
+  spawnStartupNightly(alertPersona);
 
   // Self-provision the managed Pi capability-routing extension: when a routable
   // capability (image and/or coding model) is configured, stamp the embedded
