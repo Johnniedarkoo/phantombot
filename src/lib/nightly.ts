@@ -30,7 +30,8 @@
  * bleed into Telegram chats, and both stages for a date share context.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -107,6 +108,12 @@ export interface NightlyCurrent {
   /** Refreshed as each date starts — drives stale-run detection. */
   updated_at: string;
   pid?: number;
+  /**
+   * OS-supplied start time of `pid`, used to spot pid REUSE (issue #402
+   * follow-up). Absent on markers written by an older build, and on
+   * platforms with no cheap probe — liveness degrades to the pid check.
+   */
+  pid_start?: string;
 }
 
 export interface NightlyState {
@@ -120,6 +127,122 @@ export interface NightlyState {
   processed?: Record<string, NightlyDateRecord>;
   /** Set while a sweep is in flight; cleared when it finishes. */
   current?: NightlyCurrent | null;
+}
+
+/**
+ * What a sweep marker actually means right now.
+ *
+ * - `running` — the owner is alive and beating; a new sweep must stand down.
+ * - `dead`    — the owner process is GONE; the marker is a corpse, take over.
+ * - `stalled` — the owner may still exist but hasn't beaten in STALE_RUN_MS;
+ *               take over (the pre-existing, time-only rule).
+ */
+export type SweepLiveness = "running" | "dead" | "stalled";
+
+/** Probe seam so tests don't have to conjure real pids. */
+export type ProcessAliveProbe = (pid: number) => boolean;
+
+/**
+ * Does this pid name a process that exists on this box?
+ *
+ * `kill(pid, 0)` sends no signal — it only runs the kernel's permission and
+ * existence checks. ESRCH means gone; EPERM means it exists but belongs to
+ * another user, which still counts as alive.
+ */
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Probe seam for the start-time half of the identity check. */
+export type ProcessStartProbe = (pid: number) => string | null;
+
+/**
+ * An opaque token that identifies WHICH process currently holds `pid`.
+ *
+ * `kill(pid, 0)` alone can be fooled: pids wrap, so between the sweep dying
+ * and the next start an unrelated process can inherit the number and be
+ * reported alive. The kernel's own start time for the pid disambiguates —
+ * the reused pid is necessarily a different process with a different start.
+ *
+ * Returns `null` when the platform has no cheap probe or the read fails; the
+ * caller then falls back to the pid check alone, which is what shipped in
+ * #403 and is still strictly better than the time-only rule it replaced.
+ * Only ever compared for equality with a token produced the same way, so the
+ * format is deliberately unspecified.
+ */
+export function processStartToken(pid: number): string | null {
+  try {
+    if (process.platform === "linux") {
+      // /proc/<pid>/stat field 22 (starttime, in clock ticks since boot).
+      // comm (field 2) is parenthesised and may itself contain spaces and
+      // parens, so split AFTER the last ')' — field 3 lands at index 0.
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const tail = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      return tail[19] ?? null;
+    }
+    if (process.platform === "darwin") {
+      const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+        encoding: "utf8",
+        timeout: 5_000,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      return out.trim() || null;
+    }
+  } catch {
+    // Process gone, permission denied, no procfs, ps missing — all mean
+    // "can't tell", and "can't tell" must never masquerade as a match.
+  }
+  return null;
+}
+
+/** Our own token never changes, and on darwin it costs a fork. Compute once. */
+let ownStartToken: string | null | undefined;
+export function selfStartToken(): string | null {
+  if (ownStartToken === undefined) ownStartToken = processStartToken(process.pid);
+  return ownStartToken;
+}
+
+/**
+ * Classify an in-flight marker (issue #402).
+ *
+ * THE BUG: liveness used to be time-only — a marker younger than
+ * STALE_RUN_MS was assumed to be a running sweep. When the daemon is killed
+ * mid-sweep (a crash, a restart, systemd taking down the cgroup) the child
+ * dies with it and leaves a marker seconds old. The very next start spawns a
+ * sweep, sees that fresh-looking marker, and stands down — DEFERRING TO A
+ * CORPSE. Nothing else fires until the next UTC day rollover, so the backlog
+ * sits untouched for up to a day, reported as `sweep stalled` only after the
+ * 45 minutes have elapsed. Observed on three separate boxes.
+ *
+ * THE FIX: the marker already records `pid`. A dead owner is dead the instant
+ * we look, whatever the clock says, so check the process first and fall back
+ * to the clock only for markers written by an older build (no `pid`) or an
+ * owner that is alive but wedged.
+ */
+export function sweepLiveness(
+  current: NightlyCurrent,
+  now: Date,
+  isAlive: ProcessAliveProbe = isProcessAlive,
+  startToken: ProcessStartProbe = processStartToken,
+): SweepLiveness {
+  if (typeof current.pid === "number") {
+    if (!isAlive(current.pid)) return "dead";
+    // Alive, but is it the SAME process? A pid that has wrapped around to an
+    // unrelated process would otherwise hold the lock until the 45-minute
+    // stall timer expires. A null token means "can't tell" — trust the pid.
+    if (current.pid_start) {
+      const seen = startToken(current.pid);
+      if (seen !== null && seen !== current.pid_start) return "dead";
+    }
+  }
+  const beat = Date.parse(current.updated_at ?? current.started_at);
+  const fresh = !Number.isNaN(beat) && now.getTime() - beat <= STALE_RUN_MS;
+  return fresh ? "running" : "stalled";
 }
 
 export function nightlyConversationKey(date: string): string {
@@ -360,7 +483,12 @@ export interface NightlyHealth {
  */
 export async function nightlyHealth(
   personaDir: string,
-  opts: { now?: Date; state?: NightlyState } = {},
+  opts: {
+    now?: Date;
+    state?: NightlyState;
+    /** Test seam — override the process-liveness probe. */
+    isAlive?: ProcessAliveProbe;
+  } = {},
 ): Promise<NightlyHealth> {
   const now = opts.now ?? new Date();
   const state = opts.state ?? (await loadNightlyState(personaDir));
@@ -379,19 +507,22 @@ export async function nightlyHealth(
 
   const cur = state.current;
   if (cur) {
-    const beat = Date.parse(cur.updated_at ?? cur.started_at);
-    const stalled = Number.isNaN(beat) || now.getTime() - beat > STALE_RUN_MS;
-    if (!stalled) {
+    const liveness = sweepLiveness(cur, now, opts.isAlive);
+    if (liveness === "running") {
       return {
         ...base,
         status: "running",
         detail: `${cur.index}/${cur.total} dates, on ${cur.date}`,
       };
     }
+    const since = cur.updated_at ?? cur.started_at;
     return {
       ...base,
       status: "error",
-      detail: `sweep stalled on ${cur.date} since ${cur.updated_at ?? cur.started_at}`,
+      detail:
+        liveness === "dead"
+          ? `sweep died on ${cur.date} — owner pid ${cur.pid} is gone (last beat ${since})`
+          : `sweep stalled on ${cur.date} since ${since}`,
     };
   }
 
