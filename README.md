@@ -1812,11 +1812,51 @@ processed, or whose last pass didn't finish:
 
 ```text
 sweep (code) -> per date: distill ‖ kb -> index refresh (code) -> ledger (code)
+                                                            \-> compact (once)
 ```
 
 * `distill` files the day's captures into the drawers (people / decisions /
   lessons / commitments / norms) and maintains MEMORY.md's `## Recent`.
 * `kb` extracts durable knowledge into `kb/` — reconcile, create, sweep inbox.
+* `compact` runs **once per sweep**, after every date is distilled, and is the
+  only stage that removes anything. See below.
+
+#### Compaction
+
+`distill` and `kb` only ever append, so the always-in-context files grow without
+bound — a 663KB drawer set costs tokens on every turn and buries live facts
+under dead ones. The compaction stage is the other half of the loop, and it is
+built to be safe rather than thorough:
+
+* Only files **over budget** are touched (MEMORY.md 16KB, a fully-distilled
+  daily file 8KB). A healthy persona pays one `stat` per file.
+* Every candidate is copied verbatim into `memory/archive/<YYYY-MM-DD>/`
+  **before** the stage runs. Nothing is ever deleted, and the nightly is the
+  only code path that moves a memory file.
+* Afterwards each file is re-stat-ed and judged. A pass that removes more than
+  its allowance (40%, or 90% for a closed daily file), empties a file or loses
+  one is **rolled back from that copy** and recorded as `reverted`.
+* Byte accounting per file lands in the ledger under `compaction`, so "is memory
+  still growing?" is answerable without grepping the log.
+* A daily file is only trimmed once the ledger shows both stages `ok` for it and
+  it is at least 30 days old. Because compaction rewrites that file, its ledger
+  entry is re-fingerprinted afterwards — otherwise the next sweep would see the
+  date as *changed* and pay for both LLM stages again, every night.
+* `memory/archive/` is **never indexed**. A rollback copy is a recovery artefact
+  for a human with `cp`; indexing it would feed the stale text compaction just
+  removed straight back into search as a live document.
+* The stage runs even when **no date is pending** — its inputs are whole-file
+  sizes, not a day's events, so the steady-state night with a drained backlog is
+  exactly the night it matters.
+
+Drawers are measured and reported but **never candidates**: their dedupe and
+lifecycle work moves to the database, where it is a uniqueness constraint rather
+than an LLM pass over prose. Selecting them would buy a turn whose own prompt
+tells it to change nothing. `--no-compact` skips the stage; a `--date` backfill
+never runs it; and a sweep in which **any date stage failed** skips it too — a
+failed distill can leave MEMORY.md half-rewritten, so the archive would preserve
+the damage instead of the clean pre-sweep file. Over-budget files simply wait
+for the next clean sweep.
 
 The two stages run **concurrently**: they read the same daily file and write
 disjoint targets. Neither writes back to the daily file, which is what keeps
@@ -1834,7 +1874,8 @@ fire redundantly: re-running with nothing pending costs nothing, and a machine
 that was off for a week sweeps the backlog when it comes back. There is no
 `--resume` and no catch-up mode. Useful flags:
 `--date <YYYY-MM-DD>` to reprocess one day, `--max-dates N` to bound a manual
-run, `--force` to take over a stuck in-flight marker.
+run, `--force` to take over a stuck in-flight marker, `--no-compact` to leave
+over-budget files untouched.
 
 A stage runs **scoped to the persona directory**. Its working directory is the
 persona dir (not your home dir), it runs with no MCP servers, and it is granted
