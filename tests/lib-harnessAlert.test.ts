@@ -13,6 +13,19 @@ import {
   HarnessAlerter,
   REALERT_MS,
 } from "../src/lib/harnessAlert.ts";
+import { killCauseToErrorChunk } from "../src/lib/harnessRunner.ts";
+
+/**
+ * The exact text the runner stamps for a kill cause. Derived from
+ * killCauseToErrorChunk() rather than copied, so a reworded kill string
+ * fails these tests instead of silently de-classifying every wedged
+ * harness back to "other".
+ */
+function killText(cause: "timeout" | "idle" | "startup"): string {
+  const chunk = killCauseToErrorChunk(cause, "pi", 300_000, 300_000, 60_000);
+  if (!chunk) throw new Error(`no error chunk for kill cause '${cause}'`);
+  return chunk.error;
+}
 
 function newAlerter(now: () => number = () => 0) {
   const sent: string[] = [];
@@ -57,10 +70,21 @@ describe("classifyFailure", () => {
     expect(classifyFailure("something vague", 401)).toBe("auth");
   });
 
-  test("anything else is 'other' — a timeout must not page the owner", () => {
+  // Inputs come from the runner itself, not from copies of its wording: the
+  // classifier matches on that text, so a rewording there must fail here.
+  test("recognises every wedged-harness kill the runner emits", () => {
+    for (const cause of ["timeout", "idle", "startup"] as const) {
+      expect(classifyFailure(killText(cause))).toBe("timeout");
+    }
+  });
+
+  test("a real auth failure still wins over the word 'timed out'", () => {
     expect(
-      classifyFailure("claude timed out after 300000ms (hard wall-clock cap)"),
-    ).toBe("other");
+      classifyFailure("claude timed out after 5ms: authentication_failed"),
+    ).toBe("auth");
+  });
+
+  test("anything else is 'other'", () => {
     expect(classifyFailure("claude exited with code 1")).toBe("other");
   });
 });
@@ -129,6 +153,17 @@ describe("degraded alert", () => {
     clock += 2;
     await failNTimes(alerter, 1, err);
     expect(sent.length).toBe(2);
+  });
+
+  test("a wedged harness a fallback absorbed stays silent", async () => {
+    const { alerter, sent } = newAlerter();
+    for (let i = 0; i < DEGRADE_AFTER_FAILURES + 2; i++) {
+      alerter.noteFailure("claude", killText("idle"));
+    }
+    await alerter.noteDegraded({ harnessId: "claude", servedBy: "pi" });
+    // Only `auth` pages: a timeout the chain routed around is #284's
+    // deliberate silence, and splitting it out of `other` must not change that.
+    expect(sent).toEqual([]);
   });
 });
 
@@ -215,9 +250,8 @@ describe("exhausted alert", () => {
     // One line: siren, harness, cause, and that nothing answered.
     expect(sent[0]).not.toContain("\n");
     expect(sent[0]).toContain("\ud83d\udea8 claude rate limited 429");
-    expect(sent[0]).toContain("no fallback left");
-    // The chain answers "out of what?" — one harness means "add a fallback".
-    expect(sent[0]).toContain("[claude]");
+    // One harness: nothing was ever configured to fall back to.
+    expect(sent[0]).toContain("no usable fallback configured [claude]");
   });
 
   test("fires for a non-rate-limit outage too — no reply was delivered", async () => {
@@ -233,6 +267,33 @@ describe("exhausted alert", () => {
     expect(sent[0]).toContain("harness error");
     expect(sent[0]).not.toContain("rate limited");
     expect(sent[0]).toContain("[claude \u2192 pi]");
+  });
+
+  test("names a wedged harness instead of the generic 'harness error'", async () => {
+    const { alerter, sent } = newAlerter();
+    await alerter.noteExhausted({
+      harnessId: "pi",
+      error:
+        killText("idle"),
+      chain: ["pi"],
+    });
+    expect(sent.length).toBe(1);
+    expect(sent[0]).toContain("\ud83d\udea8 pi timed out");
+    expect(sent[0]).not.toContain("harness error");
+    // A one-harness chain never had a fallback to lose.
+    expect(sent[0]).toContain("no usable fallback configured [pi]");
+    expect(sent[0]).not.toContain("no fallback left");
+  });
+
+  test("says 'no fallback left' only when the chain actually had one", async () => {
+    const { alerter, sent } = newAlerter();
+    await alerter.noteExhausted({
+      harnessId: "pi",
+      error: "pi exited with code 1",
+      chain: ["claude", "pi"],
+    });
+    expect(sent[0]).toContain("no fallback left [claude \u2192 pi]");
+    expect(sent[0]).not.toContain("no usable fallback configured");
   });
 
   test("is silent with no sender configured", async () => {
