@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildDailyRecall,
-  DAILY_RECALL_MAX_BYTES,
+  DAILY_RECALL_CEILING_BYTES,
 } from "../src/lib/dailyRecall.ts";
 import {
   NIGHTLY_STAGES,
@@ -244,14 +244,57 @@ describe("containment — a journal line cannot forge a prompt section", () => {
 });
 
 describe("size cap", () => {
-  test("a file at or under the cap lands whole", async () => {
-    await writeDaily(TODAY, "x".repeat(DAILY_RECALL_MAX_BYTES - 10));
+  test("a heavy but realistic day lands WHOLE — the cap is a ceiling, not a budget", async () => {
+    // ~40KB: far over the 8KB compaction budget the cap used to be pinned to,
+    // and still under the sanity ceiling. This is the shape of a busy day.
+    const body =
+      "## first entry\nthe oldest thing that happened\n" +
+      "filler\n".repeat(5_000) +
+      "## last entry\nthe newest thing that happened\n";
+    await writeDaily(TODAY, body);
+    expect(Buffer.byteLength(body, "utf8")).toBeGreaterThan(32 * 1024);
+    expect(Buffer.byteLength(body, "utf8")).toBeLessThan(
+      DAILY_RECALL_CEILING_BYTES,
+    );
     const out = await buildDailyRecall(dir, NOW);
     expect(out.today?.truncated).toBe(false);
+    expect(out.block).toContain("the oldest thing that happened");
+    expect(out.block).toContain("the newest thing that happened");
     expect(out.block).not.toContain("trimmed");
   });
 
-  test("an over-cap file keeps the TAIL and says so", async () => {
+  test("a runaway day is still cut at the 256KB sanity ceiling", async () => {
+    expect(DAILY_RECALL_CEILING_BYTES).toBe(256 * 1024);
+    const body =
+      "## first entry\nthe oldest thing that happened\n" +
+      "filler\n".repeat(45_000) +
+      "## last entry\nthe newest thing that happened\n";
+    expect(Buffer.byteLength(body, "utf8")).toBeGreaterThan(
+      DAILY_RECALL_CEILING_BYTES,
+    );
+    await writeDaily(TODAY, body);
+    const out = await buildDailyRecall(dir, NOW);
+    expect(out.today?.truncated).toBe(true);
+    expect(out.block).toContain("the newest thing that happened");
+    expect(out.block).not.toContain("the oldest thing that happened");
+    expect(out.block).toContain("trimmed");
+  });
+
+  test("the daily COMPACTION budget no longer clips the prompt", async () => {
+    const body = "## first entry\n" + "old\n".repeat(200) + "## last entry\n";
+    await writeDaily(TODAY, body);
+    await writeFile(
+      join(dir, "memory", ".compaction-budgets.json"),
+      JSON.stringify({ "memory/*.md": 128 }),
+      "utf8",
+    );
+    const out = await buildDailyRecall(dir, NOW);
+    expect(out.today?.truncated).toBe(false);
+    expect(out.block).toContain("first entry");
+    expect(out.block).not.toContain("trimmed");
+  });
+
+  test("an explicit cap still keeps the TAIL and says so", async () => {
     const body =
       "## first entry\n" +
       "old\n".repeat(400) +
@@ -273,26 +316,6 @@ describe("size cap", () => {
     expect(out.block).not.toContain("phantombot memory today");
     expect(out.block).toContain(`phantombot memory get memory/${TODAY}.md`);
     expect(out.block).toContain(`phantombot memory get memory/${YESTERDAY}.md`);
-  });
-
-  test("the cap follows the persona's daily compaction budget override", async () => {
-    const body = "## first entry\n" + "old\n".repeat(200) + "## last entry\n";
-    await writeDaily(TODAY, body);
-    await writeFile(
-      join(dir, "memory", ".compaction-budgets.json"),
-      JSON.stringify({ "memory/*.md": 128 }),
-      "utf8",
-    );
-    const out = await buildDailyRecall(dir, NOW);
-    expect(out.today?.truncated).toBe(true);
-    expect(out.block).toContain("most recent 128 bytes");
-  });
-
-  test("with no override the cap is the default daily budget", async () => {
-    await writeDaily(TODAY, "x".repeat(DAILY_RECALL_MAX_BYTES + 100));
-    const out = await buildDailyRecall(dir, NOW);
-    expect(out.today?.truncated).toBe(true);
-    expect(out.block).toContain(`most recent ${DAILY_RECALL_MAX_BYTES} bytes`);
   });
 });
 

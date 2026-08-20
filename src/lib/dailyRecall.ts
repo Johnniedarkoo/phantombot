@@ -31,7 +31,8 @@
  *
  *   - No config switch. A persona cannot turn this off, because a persona
  *     that turns it off loses a day of memory the first time a sweep fails
- *     and has no way to notice. The only tuning is the byte cap.
+ *     and has no way to notice. The only tuning is the byte cap, and it is
+ *     a sanity ceiling well above any real day, not a budget.
  *   - No older days. Two days back with a failed sweep is a nightly bug to
  *     fix (the sweep retries unprocessed dates on its own), not something to
  *     paper over by growing every prompt.
@@ -54,25 +55,36 @@ import {
   recordDistilled,
   type NightlyDateRecord,
 } from "./nightly.js";
-import {
-  DAILY_BUDGET_BYTES,
-  resolveDailyBudgetBytes,
-} from "./nightlyCompact.js";
 import { inertBlock } from "./promptSafeText.js";
 
 /**
- * Per-file byte cap, defaulting to the persona's DAILY COMPACTION BUDGET (see
- * `resolveDailyBudgetBytes`) so the two numbers cannot drift and raising the
- * budget raises this too.
+ * Sanity ceiling on a single injected journal — 256KB, roughly 64k tokens.
  *
- * It is a real cap, not a backstop: the sweep only ever compacts a daily file
- * that is fully distilled AND at least `DAILY_MIN_AGE_DAYS` old, so neither of
- * the two files this module reads is ever shrunk by it. A persona that writes
- * more than the budget in a day loses the START of that day from the prompt —
- * hence the `log.warn` on every truncation, so the loss is visible rather than
- * silent, and the recovery command inside the block itself.
+ * This used to be pinned to the persona's daily COMPACTION budget (8KB).
+ * Those two numbers were never measuring the same thing: the compaction
+ * budget is how large a CLOSED, fully distilled day may stay on disk, while
+ * this is how much of an ACTIVE day a turn is allowed to see. At 8KB a heavy
+ * day silently lost its morning — 26KB of 34KB clipped off the front in one
+ * observed case — and what fell out was the tagged captures on their way to
+ * the drawers, i.e. the load-bearing part.
+ *
+ * Recovering a clipped entry costs a search plus a file read, and only when
+ * the turn RECOGNISES something is missing; it usually does not. So the cap
+ * is set above the real ceiling rather than at the typical size: the largest
+ * daily ever written across this fleet is ~62KB, and the file resets every
+ * midnight UTC. 256KB therefore never fires on a normal day — it exists so
+ * that a runaway writer (`memory capture` is unbounded) cannot oversize every
+ * subsequent prompt with no recovery path.
+ *
+ * Deliberately a plain constant, NOT derived from the compaction budget:
+ * raising how much a closed day may keep on disk must not change how much of
+ * an open day reaches the prompt. The one production caller
+ * (`orchestrator/turn.ts`) passes no `maxBytes` and so gets this ceiling;
+ * `maxBytes` exists for tests and for any future caller that wants a tighter
+ * one. Tail-keeping, the `log.warn` with `droppedBytes` and the
+ * `memory get memory/<date>.md` recovery line are unchanged.
  */
-export const DAILY_RECALL_MAX_BYTES = DAILY_BUDGET_BYTES;
+export const DAILY_RECALL_CEILING_BYTES = 256 * 1024;
 
 /** Why yesterday's file was or was not included. Surfaced for tests + logs. */
 export type YesterdayReason =
@@ -164,7 +176,7 @@ export async function buildDailyRecall(
 ): Promise<DailyRecallDecision> {
   const todayKey = dateKey(now, 0);
   const yKey = dateKey(now, 1);
-  const cap = maxBytes ?? (await resolveDailyBudgetBytes(personaDir));
+  const cap = maxBytes ?? DAILY_RECALL_CEILING_BYTES;
 
   let ledger: Record<string, NightlyDateRecord> = {};
   try {
