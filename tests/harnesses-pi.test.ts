@@ -8,7 +8,9 @@
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { resolve, join } from "node:path";
 import {
   PiHarness,
   parsePiEvent,
@@ -719,5 +721,195 @@ describe("PiHarness.available", () => {
 
   test("returns false for a non-existent absolute path", async () => {
     expect(await new PiHarness({ bin: "/no/such/pi" }).available()).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Coder-swap retry ladder. A swapped turn rides a different provider model
+// than the primary; when that model hangs or errors the turn used to be lost
+// (pi is usually the last harness in the chain — no fallback). Now: up to
+// CODER_SWAP_MAX_ATTEMPTS attempts on the coding model, then one attempt on
+// the primary. Uses fake-pi.sh's `modelgate` mode, which fails on
+// `--model $FAKE_PI_FAIL_MODEL` and behaves normally otherwise, logging every
+// invocation's argv to $FAKE_PI_ARGV_LOG so tests can count attempts.
+// ---------------------------------------------------------------------------
+
+describe("PiHarness coder-swap retry ladder", () => {
+  const PR_MSG = "review this pull request https://github.com/x/y/pull/1";
+  let logDir: string;
+  let argvLog: string;
+
+  beforeEach(async () => {
+    logDir = await mkdtemp(join(tmpdir(), "fake-pi-argv-"));
+    argvLog = join(logDir, "argv.log");
+    process.env.FAKE_PI_ARGV_LOG = argvLog;
+  });
+
+  afterEach(async () => {
+    delete process.env.FAKE_PI_ARGV_LOG;
+    delete process.env.FAKE_PI_FAIL_MODEL;
+    await rm(logDir, { recursive: true, force: true });
+  });
+
+  const loggedArgv = async (): Promise<string[]> => {
+    try {
+      return (await readFile(argvLog, "utf8")).trim().split("\n").filter(Boolean);
+    } catch {
+      return [];
+    }
+  };
+
+  test("swapped model fails 3x → falls back to the primary and answers", async () => {
+    process.env.FAKE_PI_MODE = "modelgate";
+    process.env.FAKE_PI_FAIL_MODEL = "z-ai/glm-5.2";
+    const chunks = await collect(
+      new PiHarness({
+        bin: FAKE_PI,
+        routing: { primaryModel: "mimo-v2.5", codingModel: "z-ai/glm-5.2" },
+      }).invoke(newRequest({ userMessage: PR_MSG })),
+    );
+    // The turn is ANSWERED — by the primary, after 3 coder attempts.
+    const done = chunks.find((c) => c.type === "done") as
+      | { type: "done"; finalText: string }
+      | undefined;
+    expect(done?.finalText).toBe("hello world");
+    expect(chunks.some((c) => c.type === "error")).toBe(false);
+    const argvs = await loggedArgv();
+    expect(argvs).toHaveLength(4);
+    expect(argvs.slice(0, 3).every((a) => a.includes("--model z-ai/glm-5.2"))).toBe(true);
+    expect(argvs[3]).toContain("--model mimo-v2.5");
+  });
+
+  test("primary fallback failing too → error surfaces (orchestrator chain applies)", async () => {
+    process.env.FAKE_PI_MODE = "modelgate";
+    process.env.FAKE_PI_FAIL_MODEL = "*"; // every model fails
+    const chunks = await collect(
+      new PiHarness({
+        bin: FAKE_PI,
+        routing: { primaryModel: "mimo-v2.5", codingModel: "z-ai/glm-5.2" },
+      }).invoke(newRequest({ userMessage: PR_MSG })),
+    );
+    const error = chunks.find((c) => c.type === "error") as
+      | { type: "error"; error: string; recoverable?: boolean }
+      | undefined;
+    expect(error?.recoverable).toBe(true);
+    // 3 coder attempts + 1 primary attempt, then the error is yielded.
+    expect(await loggedArgv()).toHaveLength(4);
+  });
+
+  test("coding model EQUAL to primary → swap subsystem skipped: single attempt, no ladder", async () => {
+    process.env.FAKE_PI_MODE = "modelgate";
+    process.env.FAKE_PI_FAIL_MODEL = "z-ai/glm-5.2"; // == primary → the only attempt fails
+    const chunks = await collect(
+      new PiHarness({
+        bin: FAKE_PI,
+        routing: { primaryModel: "z-ai/glm-5.2", codingModel: "z-ai/glm-5.2" },
+      }).invoke(newRequest({ userMessage: PR_MSG })),
+    );
+    // No retries, no primary re-run: exactly one invocation, error yielded.
+    expect(await loggedArgv()).toHaveLength(1);
+    expect(chunks.some((c) => c.type === "error")).toBe(true);
+  });
+
+  test("no retry after user-visible text streamed (no doubled reply)", async () => {
+    // `nofinish` streams narration text, then exits 0 WITHOUT turn_end — a
+    // recoverable error AFTER text. Retrying would duplicate the bubbles.
+    process.env.FAKE_PI_MODE = "nofinish";
+    const chunks = await collect(
+      new PiHarness({
+        bin: FAKE_PI,
+        routing: { primaryModel: "mimo-v2.5", codingModel: "z-ai/glm-5.2" },
+      }).invoke(newRequest({ userMessage: PR_MSG })),
+    );
+    expect(chunks.some((c) => c.type === "text")).toBe(true);
+    expect(chunks.some((c) => c.type === "error")).toBe(true);
+    // The swapped model was attempted exactly once — no retry, no fallback.
+    expect(await loggedArgv()).toHaveLength(1);
+    const error = chunks.find((c) => c.type === "error") as
+      | { type: "error"; recoverable?: boolean }
+      | undefined;
+    expect(error?.recoverable).toBe(true);
+  });
+
+  test("no retry after a TOOL ran, even with zero text (tools aren't idempotent)", async () => {
+    // `toolthenfail` runs one tool (progress chunk, NOT text) and then dies
+    // exit-1 (recoverable). The old gate keyed on streamed TEXT only, so this
+    // read as "nothing happened yet" and re-ran the attempt — replaying
+    // side-effecting tools (bash, notify, vault) up to four times.
+    process.env.FAKE_PI_MODE = "toolthenfail";
+    const chunks = await collect(
+      new PiHarness({
+        bin: FAKE_PI,
+        routing: { primaryModel: "mimo-v2.5", codingModel: "z-ai/glm-5.2" },
+      }).invoke(newRequest({ userMessage: PR_MSG })),
+    );
+    // The tool run surfaced as a progress chunk before the error.
+    expect(chunks.some((c) => c.type === "progress")).toBe(true);
+    const error = chunks.find((c) => c.type === "error") as
+      | { type: "error"; error: string; recoverable?: boolean }
+      | undefined;
+    expect(error?.recoverable).toBe(true);
+    // Exactly ONE invocation — no retry on the coder model, no primary
+    // fallback. The tool's side effects must never be replayed.
+    expect(await loggedArgv()).toHaveLength(1);
+  });
+
+  test("terminal error (exit 127) → exactly one attempt, no ladder (locks the non-retryable rule)", async () => {
+    // notfound exits 127 → recoverable: false. A /stop, a missing binary, or
+    // a policy tripwire must never be re-run on a second brain — this test
+    // locks in the discipline the whole ladder rests on.
+    process.env.FAKE_PI_MODE = "notfound";
+    const chunks = await collect(
+      new PiHarness({
+        bin: FAKE_PI,
+        routing: { primaryModel: "mimo-v2.5", codingModel: "z-ai/glm-5.2" },
+      }).invoke(newRequest({ userMessage: PR_MSG })),
+    );
+    const error = chunks.find((c) => c.type === "error") as
+      | { type: "error"; error: string; recoverable?: boolean }
+      | undefined;
+    expect(error?.recoverable).toBe(false);
+    expect(await loggedArgv()).toHaveLength(1);
+  });
+
+  test("hard wall-clock cap kill is FINAL — no ladder, no primary fallback", async () => {
+    // `hang` with a hard cap far SHORTER than the idle window kills via the
+    // hard timer: "timed out after Nms (hard wall-clock cap)". The cap is the
+    // one timer that is supposed to be final — retrying it 3x would turn one
+    // 60-min cap into four hours. The error is still recoverable (the
+    // orchestrator's harness chain applies) but the ladder must not touch it.
+    process.env.FAKE_PI_MODE = "hang";
+    const chunks = await collect(
+      new PiHarness({
+        bin: FAKE_PI,
+        routing: { primaryModel: "mimo-v2.5", codingModel: "z-ai/glm-5.2" },
+      }).invoke(
+        newRequest({ userMessage: PR_MSG, idleTimeoutMs: 10_000, hardTimeoutMs: 300 }),
+      ),
+    );
+    const error = chunks.find((c) => c.type === "error") as
+      | { type: "error"; error: string; recoverable?: boolean }
+      | undefined;
+    expect(error?.error).toContain("hard wall-clock cap");
+    expect(error?.recoverable).toBe(true);
+    // Exactly ONE invocation — no retries, no primary fallback.
+    expect(await loggedArgv()).toHaveLength(1);
+  });
+
+  test("successful swapped turn → single attempt, no ladder", async () => {
+    process.env.FAKE_PI_MODE = "modelgate";
+    const chunks = await collect(
+      new PiHarness({
+        bin: FAKE_PI,
+        routing: { primaryModel: "mimo-v2.5", codingModel: "z-ai/glm-5.2" },
+      }).invoke(newRequest({ userMessage: PR_MSG })),
+    );
+    const done = chunks.find((c) => c.type === "done") as
+      | { type: "done"; finalText: string }
+      | undefined;
+    expect(done?.finalText).toBe("hello world");
+    const argvs = await loggedArgv();
+    expect(argvs).toHaveLength(1);
+    expect(argvs[0]).toContain("--model z-ai/glm-5.2");
   });
 });
