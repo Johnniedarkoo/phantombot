@@ -9,7 +9,7 @@ Run a chat agent ("Phantom") as a **CLI tool** on the operator's own machine. Al
 1. **Hosts persona files.** Reads `BOOT.md` / `SOUL.md` / `IDENTITY.md`, optional `MEMORY.md`, optional `tools.md` / `AGENTS.md` from `$XDG_DATA_HOME/phantombot/personas/<name>/`.
 2. **Receives one user message** via `phantombot ask "msg"` or via the REPL line loop in `phantombot chat`.
 3. **Builds a turn context** for the configured agent: persona + recent memory + retrieved knowledge + the new user message. Retrieval runs over an [Open Knowledge Format](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing/) store: **OKF field-weighted BM25 with link-graph expansion** by default, upgrading to **hybrid BM25 + Gemini-embedding vector search** (reciprocal-rank fusion) when an embeddings provider is configured.
-4. **Hands the turn to a harness.** Spawns `claude --print --output-format stream-json` (or `pi --print --mode json`) as a subprocess. Persona goes via `--system-prompt`. The user-side payload (history + new message) goes via stdin (claude) or argv (pi).
+4. **Hands the turn to a harness.** Spawns `claude --print --output-format stream-json` (or `pi --print --mode json`) as a subprocess. Persona goes via `--system-prompt`. The user-side payload (history + new message) goes via stdin (claude) or argv (pi). Anything that would outgrow Linux's 131,071-byte per-argv-string limit is spilled to a temp file under `<personaDir>/tmp` and passed by path (`lib/harnessArgvFiles.ts`); if that write fails the payload goes inline anyway with a warning, since a broken tmp must not cost a turn.
 5. **Streams the harness's stdout** back to the user. Text chunks land on stdout as they arrive; the trailing newline marks end-of-reply.
 6. **Falls back** to the next harness in the chain on recoverable error (rate limit, transient network, oversize payload pre-skip).
 7. **Persists the turn** (user message + assistant reply) to SQLite for future memory retrieval. **On success only** — failed turns leave no trace, so the user can retry without orphan half-turns in history.
@@ -180,10 +180,12 @@ Three properties worth knowing when touching this code:
    nightly bug to fix, not a reason to grow every prompt). It is pure disk +
    JSON, never throws, and is skipped only for the nightly sweep's own turns
    (`skipDailyRecall`), which are handed the date they are distilling. Both
-   files are byte-capped at `DAILY_RECALL_CEILING_BYTES` (256 KB) — a sanity
-   ceiling far above any real day, deliberately NOT the persona's daily
-   compaction budget, which measures how large a closed day may stay on disk —
-   keeping the tail and warning when they trim. Journal text is run through `inertBlock`
+   files are byte-capped at `DAILY_RECALL_CEILING_BYTES` (32 KB each) and at
+   `DAILY_RECALL_COMBINED_CEILING_BYTES` (48 KB together) — derived from
+   Linux's 131,071-byte per-argv-string limit on the assembled system prompt,
+   not from taste, and deliberately NOT the persona's daily compaction budget,
+   which measures how large a closed day may stay on disk — keeping the tail
+   and warning when they trim. Journal text is run through `inertBlock`
    first: leading `#` escaped, control/bidi/zero-width stripped, so a journal
    line cannot forge a section of the system prompt (invariant 20).
 

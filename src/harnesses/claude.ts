@@ -114,19 +114,56 @@ export class ClaudeHarness implements Harness {
   }
 
   async *invoke(req: HarnessRequest): AsyncGenerator<HarnessChunk> {
-    // Windows argv-length workaround. Claude's conversation payload already
-    // travels on stdin, but the persona/memory system prompt still rides on
-    // argv via `--system-prompt <text>` - and megan's BOOT.md alone can blow
-    // Windows' ~8,191-char command-line limit, so the child fails to spawn
-    // with "The command line is too long." Spill the system prompt to a temp
-    // file and pass `--system-prompt-file <file>` instead. POSIX keeps the
-    // inline `--system-prompt <text>` path unchanged. See harnessArgvFiles.
-    const useTempFiles = argvNeedsTempFiles(this.platform);
+    // Argv-length workaround. Claude's conversation payload already travels on
+    // stdin, but the persona/memory system prompt still rides on argv via
+    // `--system-prompt <text>`, and that one string can outgrow what execve
+    // will take:
+    //
+    //   - Windows: megan's BOOT.md alone blows the ~8,191-char command-line
+    //     limit and the child fails with "The command line is too long."
+    //   - Linux: a single argv string is capped at 131,071 bytes
+    //     (MAX_ARG_STRLEN), so a persona with a large journal dies at spawn
+    //     with `E2BIG: argument list too long` (#426).
+    //
+    // Either way the answer is the same: spill the system prompt to a temp
+    // file and pass `--system-prompt-file <file>` instead. Sizing on the
+    // system prompt specifically is right because it IS the single argv
+    // element at risk - every other arg here is a short flag or a bounded
+    // JSON blob. See harnessArgvFiles.
+    const systemPromptBytes = Buffer.byteLength(req.systemPrompt, "utf8");
+    const useTempFiles = argvNeedsTempFiles(this.platform, systemPromptBytes);
     let temp: HarnessTempDir | undefined;
     let systemPromptFile: string | undefined;
     if (useTempFiles) {
-      temp = await createHarnessTempDir(req.tmpBaseDir);
-      systemPromptFile = await temp.file("system-prompt.md", req.systemPrompt);
+      // The spill is a best-effort OPTIMISATION, never a precondition. It
+      // touches the filesystem (mkdir + write under the persona's own tmp), and
+      // a filesystem can say no: disk full, read-only mount, a persona dir
+      // whose perms drifted. None of those are a reason to refuse the turn, and
+      // on a headless box nobody is watching to fix it, so a throw here must
+      // degrade to the inline argument rather than propagate.
+      //
+      // What the degraded path costs is honest and bounded: on Linux the inline
+      // `--system-prompt` still spawns fine for anything under MAX_ARG_STRLEN,
+      // so a prompt in the 96 KB-128 KB spill band simply works. Above it (or on
+      // Windows, where the whole command line is the budget) the spawn fails
+      // with E2BIG / "command line is too long" - which runWithFallback now
+      // catches and rolls to the next harness. Worst case is a slower turn on a
+      // fallback harness; never a dead daemon.
+      try {
+        temp = await createHarnessTempDir(req.tmpBaseDir);
+        systemPromptFile = await temp.file("system-prompt.md", req.systemPrompt);
+      } catch (err) {
+        log.warn("claude.invoke could not spill the system prompt to a file; passing it inline", {
+          tmpBaseDir: req.tmpBaseDir,
+          systemPromptBytes,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        // mkdtemp may have succeeded and only the write failed - drop the dir
+        // rather than leak it. cleanup() never throws.
+        await temp?.cleanup();
+        temp = undefined;
+        systemPromptFile = undefined;
+      }
     }
     try {
 
@@ -149,6 +186,7 @@ export class ClaudeHarness implements Harness {
       bin: this.config.bin,
       argCount: args.length,
       tempFiles: useTempFiles,
+      systemPromptBytes,
     });
 
     // Re-source the legacy/runtime env files so file-backed model, routing,
@@ -218,9 +256,9 @@ export class ClaudeHarness implements Harness {
   private buildArgs(
     systemPrompt: string,
     toolsMode?: "none" | { allow: string[] },
-    // When set (Windows), the persona system prompt is passed by FILE
-    // (`--system-prompt-file`) instead of inline (`--system-prompt <text>`)
-    // to stay under the command-line length limit.
+    // When set (Windows, or an oversized prompt on any platform), the persona
+    // system prompt is passed by FILE (`--system-prompt-file`) instead of
+    // inline (`--system-prompt <text>`) to stay under the argv length limit.
     systemPromptFile?: string,
     // `"none"` runs this turn with ZERO MCP servers — see the block below.
     mcpMode?: "none",
@@ -322,7 +360,7 @@ export class ClaudeHarness implements Harness {
     // unaffected. See PHANTOMBOT_INJECTED_CLAUDE_SETTINGS for the policy.
     args.push("--settings", JSON.stringify(PHANTOMBOT_INJECTED_CLAUDE_SETTINGS));
     if (systemPromptFile) {
-      // Windows: read the persona system prompt from a file to keep it off the
+      // Read the persona system prompt from a file to keep it off the
       // length-limited command line. Verified against Claude Code.
       args.push("--system-prompt-file", systemPromptFile);
     } else {

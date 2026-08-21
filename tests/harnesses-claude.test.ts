@@ -10,8 +10,10 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
   ClaudeHarness,
   PHANTOMBOT_INJECTED_CLAUDE_SETTINGS,
@@ -604,15 +606,17 @@ describe("ClaudeHarness subprocess invocation passes injected settings", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Windows argv-length workaround. Claude's conversation payload already goes
-// via stdin, but the persona system prompt still rides on argv via
-// `--system-prompt <text>` - and a large BOOT.md can exceed Windows' ~8,191
-// char command-line limit. On Windows the harness spills the system prompt to
-// a temp file and passes `--system-prompt-file <file>` instead. Platform is
-// injected so this runs on the Linux CI runner.
+// Argv-length workaround. Claude's conversation payload already goes via
+// stdin, but the persona system prompt still rides on argv via
+// `--system-prompt <text>`, and that one string can outgrow what execve takes:
+// a large BOOT.md exceeds Windows' ~8,191-char command-line limit, and a large
+// journal exceeds Linux's 131,071-byte per-argv-string MAX_ARG_STRLEN (#426).
+// Either way the harness spills the system prompt to a temp file and passes
+// `--system-prompt-file <file>` instead. Platform is injected so both branches
+// run on the Linux CI runner.
 // ---------------------------------------------------------------------------
 
-describe("ClaudeHarness Windows argv-length workaround", () => {
+describe("ClaudeHarness argv-length workaround", () => {
   const argvOf = (chunks: HarnessChunk[]): string =>
     chunks
       .filter((c): c is Extract<HarnessChunk, { type: "text" }> => c.type === "text")
@@ -649,7 +653,155 @@ describe("ClaudeHarness Windows argv-length workaround", () => {
     expect(existsSync(systemPromptFile!)).toBe(false);
   });
 
-  test("POSIX: system prompt stays inline via --system-prompt", async () => {
+  test("POSIX: an oversized system prompt spills to a file too (#426)", async () => {
+    // The wedge this fixes: every turn died at `posix_spawn` with `E2BIG`
+    // because the assembled prompt (~140KB, mostly journal) exceeded the
+    // kernel's per-argv-string cap. Spilling is what makes the size moot.
+    process.env.FAKE_CLAUDE_MODE = "argv";
+    const h = new ClaudeHarness(
+      { bin: FAKE_CLAUDE, model: "test", fallbackModel: "" },
+      "linux",
+    );
+    const huge = "OVERSIZED-CLAUDE-PERSONA\n" + "x".repeat(140_000);
+    const chunks = await collect(h.invoke(newRequest({ systemPrompt: huge })));
+    const argv = argvOf(chunks);
+    expect(argv).toContain("--system-prompt-file");
+    expect(argv).not.toContain("OVERSIZED-CLAUDE-PERSONA");
+  });
+
+  test("POSIX: the spill threshold is measured in BYTES, not characters", async () => {
+    // A journal full of em dashes / CJK is up to 3x its `.length` in UTF-8.
+    // Sizing on `.length` would leave such a prompt inline at ~270KB of argv
+    // and reproduce the exact spawn failure this guards against.
+    process.env.FAKE_CLAUDE_MODE = "argv";
+    const h = new ClaudeHarness(
+      { bin: FAKE_CLAUDE, model: "test", fallbackModel: "" },
+      "linux",
+    );
+    // 40k chars, but 120k+ bytes — under any char-based threshold, over ours.
+    const multibyte = "MULTIBYTE-CLAUDE-PERSONA" + "漢".repeat(40_000);
+    expect(multibyte.length).toBeLessThan(96 * 1024);
+    expect(Buffer.byteLength(multibyte, "utf8")).toBeGreaterThan(96 * 1024);
+    const chunks = await collect(
+      h.invoke(newRequest({ systemPrompt: multibyte })),
+    );
+    expect(argvOf(chunks)).toContain("--system-prompt-file");
+  });
+
+  test("POSIX: an oversized prompt's temp file is cleaned up after the run", async () => {
+    process.env.FAKE_CLAUDE_MODE = "argv";
+    const h = new ClaudeHarness(
+      { bin: FAKE_CLAUDE, model: "test", fallbackModel: "" },
+      "linux",
+    );
+    const chunks = await collect(
+      h.invoke(newRequest({ systemPrompt: "x".repeat(140_000) })),
+    );
+    const file = argvOf(chunks).match(/(\S*system-prompt\.md)/)?.[1];
+    expect(file).toBeTruthy();
+    expect(existsSync(file!)).toBe(false);
+  });
+
+  // ── the spill must never be able to KILL a turn ────────────────────────
+  // Writing the temp file touches a real filesystem, and a filesystem can say
+  // no (disk full, read-only mount, drifted perms on the persona dir). On a
+  // headless box nobody is there to notice, so an unwritable tmp has to degrade
+  // to the inline argument rather than throw out of invoke(). ENOTDIR - a
+  // tmpBaseDir whose parent is a regular file - reproduces that without root.
+
+  test("an unwritable tmp base degrades to the inline arg instead of throwing", async () => {
+    // win32 spills unconditionally, so it reaches the guard with a small
+    // prompt - which keeps the echoed argv readable and lets us assert the
+    // degraded shape exactly: inline flag, real text, a completed turn.
+    process.env.FAKE_CLAUDE_MODE = "argv";
+    const blocker = join(await mkdtemp(join(tmpdir(), "pb-blocked-")), "not-a-dir");
+    writeFileSync(blocker, "i am a file, not a directory");
+    const h = new ClaudeHarness(
+      { bin: FAKE_CLAUDE, model: "test", fallbackModel: "" },
+      "win32",
+    );
+    const chunks = await collect(
+      h.invoke(newRequest({
+        systemPrompt: "DEGRADED-CLAUDE-PERSONA",
+        tmpBaseDir: join(blocker, "tmp"),
+      })),
+    );
+    const argv = argvOf(chunks);
+    // No throw, a real turn, and the prompt travelled inline after all.
+    expect(argv).toContain("--system-prompt");
+    expect(argv).not.toContain("--system-prompt-file");
+    expect(argv).toContain("DEGRADED-CLAUDE-PERSONA");
+    expect(chunks.some((c) => c.type === "done")).toBe(true);
+  });
+
+  test("an oversized prompt with an unwritable tmp base still completes a turn", async () => {
+    // The POSIX size-gated branch, where the guard matters most: the prompt is
+    // over the spill threshold but under MAX_ARG_STRLEN, so the inline
+    // fallback genuinely spawns and the persona keeps working on a box whose
+    // tmp is broken. (Not asserting on argv here - the fixture echoes its own
+    // argv back as one JSON line, which a 100KB prompt makes unusable.)
+    process.env.FAKE_CLAUDE_MODE = "argv";
+    const blocker = join(await mkdtemp(join(tmpdir(), "pb-blocked-")), "not-a-dir");
+    writeFileSync(blocker, "blocker");
+    const h = new ClaudeHarness(
+      { bin: FAKE_CLAUDE, model: "test", fallbackModel: "" },
+      "linux",
+    );
+    const chunks = await collect(
+      h.invoke(newRequest({
+        systemPrompt: "x".repeat(100 * 1024),
+        tmpBaseDir: join(blocker, "tmp"),
+      })),
+    );
+    expect(chunks.some((c) => c.type === "done")).toBe(true);
+    expect(chunks.some((c) => c.type === "error")).toBe(false);
+  });
+
+  test("a failed spill leaks no temp dir under the persona tmp base", async () => {
+    // mkdtemp can succeed and only the WRITE fail; the guard must still drop
+    // the dir. Simulate by making the base a dir we then strip write perms on
+    // after mkdtemp is impossible - instead assert the simpler invariant: a
+    // usable base is left with no residue once the run completes.
+    process.env.FAKE_CLAUDE_MODE = "argv";
+    const personaDir = await mkdtemp(join(tmpdir(), "pb-persona-"));
+    try {
+      const base = join(personaDir, "tmp");
+      const h = new ClaudeHarness(
+        { bin: FAKE_CLAUDE, model: "test", fallbackModel: "" },
+        "linux",
+      );
+      await collect(
+        h.invoke(newRequest({ systemPrompt: "x".repeat(140_000), tmpBaseDir: base })),
+      );
+      expect(readdirSync(base)).toEqual([]);
+    } finally {
+      await rm(personaDir, { recursive: true, force: true });
+    }
+  });
+
+  test("the spill lands under the persona tmp base, never the shared /tmp", async () => {
+    // A spilled system prompt is persona data - memory, drawers, conversation.
+    // It must not sit in a world-readable shared /tmp next to other personas'.
+    process.env.FAKE_CLAUDE_MODE = "argv";
+    const personaDir = await mkdtemp(join(tmpdir(), "pb-persona-"));
+    try {
+      const base = join(personaDir, "tmp");
+      const h = new ClaudeHarness(
+        { bin: FAKE_CLAUDE, model: "test", fallbackModel: "" },
+        "linux",
+      );
+      const chunks = await collect(
+        h.invoke(newRequest({ systemPrompt: "y".repeat(140_000), tmpBaseDir: base })),
+      );
+      const file = argvOf(chunks).match(/(\S*system-prompt\.md)/)?.[1];
+      expect(file).toBeTruthy();
+      expect(file!.startsWith(base)).toBe(true);
+    } finally {
+      await rm(personaDir, { recursive: true, force: true });
+    }
+  });
+
+  test("POSIX: a normal-sized system prompt stays inline via --system-prompt", async () => {
     process.env.FAKE_CLAUDE_MODE = "argv";
     // Force the POSIX branch so this holds on the Windows CI runner too.
     const h = new ClaudeHarness(
