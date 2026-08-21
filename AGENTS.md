@@ -157,7 +157,7 @@ phantombot/
 - **Harness chain** (`src/orchestrator/fallback.ts` + `lib/harnessRunner.ts`) tries primary; if it returns a recoverable error, falls through to the next (with per-harness cooldown for fast fallback). Failover is invisible to the user by design, so `lib/harnessAlert.ts` notifies the owner when that silence would hide something real: a primary failing **authentication** for several turns in a row (still served, but by a fallback that may be billed per token), or the **whole chain exhausted** with no reply delivered. A harness killed by an external SIGTERM/SIGINT (systemd stopping the cgroup during a restart) is classified as shutdown, NOT as a recoverable harness error — otherwise every restart with a turn in flight spawns a paid fallback for a reply nobody receives.
 - **Security perimeter** (`lib/threatJudge.ts` + `orchestrator/screen.ts`) — trusted principals act directly; untrusted input is judged in code before any capable harness sees it. See "Security perimeter".
 - **Channels** are a channel-agnostic core + thin per-channel adapters (`src/channels/core/` + `src/channels/telegram/`); `phantombot run` is the long-running process. See "Channel layer".
-- **Env bootstrap** (`lib/envBootstrap.ts`) self-sources the `.env` files at startup (required on macOS, no-op on Linux) and re-sources before each harness spawn so `phantombot env set` takes effect mid-session.
+- **Env bootstrap** (`lib/envBootstrap.ts`) self-sources the legacy/runtime `.env` files at startup (required on macOS, no-op on Linux) and re-sources them before each harness spawn; each harness then reloads the active persona's encrypted vault so `phantombot vault set` takes effect mid-session.
 - **Tick fires scheduled tasks** (`src/cli/tick.ts`); 1-minute systemd timer; lockfile prevents overlap; missed runs are skipped, not piled up.
 - **Heartbeat is mechanical** (no LLM); **nightly is cognitive** (LLM-driven distillation).
 - **`workingDir` is REQUIRED on every `runTurn` call** (#387) — the harness subprocess cwd, deliberately with no default. Interactive surfaces (telegram, phantomchat, ask, tick, reactions) pass `homedir()`, because the owner asks for work on repos all over their home dir. Machine-driven background turns (nightly) pass the **persona dir**. This used to silently default to `homedir()` and every background caller took the default, so nightly stages woke up in `$HOME` unable to see their own `memory/` from cwd — and went hunting for it. On macOS those recursive walks cross `~/Library/Containers`, tripping the TCC `kTCCServiceSystemPolicyAppData` prompt ("phantombot would like to access data from other apps") once per spawned date. If you add a `runTurn` caller, decide which tree it may treat as home and say so explicitly.
@@ -226,7 +226,7 @@ EnvironmentFile=-%h/.env                        # user's general credentials
 
 Leading `-` makes both optional (no error if either file is absent). The merged `process.env` is what spawned harnesses inherit, so the agent finds credentials without re-reading either file.
 
-**macOS has no `EnvironmentFile=` equivalent.** launchd plists can't source a file, so on macOS `lib/envBootstrap.ts` self-loads both `.env` files into `process.env` at startup (existing values win, so nothing already set is clobbered). On Linux this is a cheap no-op because systemd already sourced them. Either way, harnesses also call `reloadEnvFiles()` before each spawn so a freshly-written `phantombot env set` secret is visible mid-session without a restart.
+**macOS has no `EnvironmentFile=` equivalent.** launchd plists can't source a file, so on macOS `lib/envBootstrap.ts` self-loads both legacy/runtime `.env` files into `process.env` at startup (existing values win, so nothing already set is clobbered). On Linux this is a cheap no-op because systemd already sourced them. Before each spawn, harnesses reload those files and then reconcile the active persona's encrypted vault, so a freshly-written `phantombot vault set` secret is visible mid-session without a restart.
 
 Service units also set a deterministic `PATH` that includes `~/.local/bin` plus stable user harness shim locations such as `~/.local/share/pi-node/bin` and `~/.local/share/pi-node/current/bin`. Do not rely on interactive shell startup files for service harness discovery. When Phantombot finds a harness in PATH or common npm/pi-node versioned locations, it saves the absolute path in `state.json` and executes that path directly on later starts. `phantombot run` must never fail startup just because a harness binary is missing; log loudly, keep the headless service alive, and let `phantombot doctor` report/repair the configured chain. Windows keep-alive tasks invoke `phantombot run --if-not-running`, which treats an existing run lock as a silent success; foreground invocations retain the diagnostic error.
 
@@ -234,12 +234,16 @@ If you change a unit body (any `generate*` function in `src/lib/systemd.ts`), `e
 
 ## Credentials
 
-Two .env files, two roles:
-
-- **`~/.config/phantombot/.env`** — phantombot-managed (TTS keys, written by `phantombot voice`).
-- **`~/.env`** — user-managed (`GITHUB_TOKEN` etc., written by `phantombot env set`).
-
-The agent NEVER `echo … >> ~/.env`. It uses `phantombot env set NAME "value"` (atomic write, mode 0o600). The full credential discovery + hygiene rules are baked into every persona's system prompt via `CREDENTIALS_SECTION` in `src/persona/builder.ts` — the agent inherits them automatically. If you change those rules, update both `CREDENTIALS_SECTION` and the README's [Credentials](README.md#credentials-phantombot-env) section.
+Credentials live in the per-persona encrypted vault. The agent NEVER appends
+secrets to `.env` or puts literal secret values in command arguments. It uses
+`printf '%s' "$VALUE" | phantombot vault set NAME`; the positional
+`phantombot vault set NAME "value"` form also remains available for backward
+compatibility. Empty stdin is rejected unless `--allow-empty` is explicit, so a
+failed pipe cannot silently erase an existing credential. The full credential
+discovery + hygiene rules are baked into every persona's system prompt via
+`CREDENTIALS_SECTION` in `src/persona/builder.ts`. If you change those rules, update both
+`CREDENTIALS_SECTION` and the README's [Credentials](README.md#credentials)
+section.
 
 ## Release pipeline
 
