@@ -67,7 +67,9 @@ import {
   personasRoot,
   personaRoot,
   personaRunDir,
+  rootRedirectFilePath,
   setGlobalConfigValue,
+  setRootRedirect,
 } from "./personaPaths.ts";
 
 /** Top-level keys that stay global and must NOT be copied into a persona. */
@@ -249,12 +251,26 @@ function runMigration(journal: MigrationJournal): MigrationReport {
   // an empty box. PHANTOMBOT_PERSONAS_DIR still wins when it is already set.
   const legacyRoot = readTopLevelString(hostToml, "personas_dir");
   if (legacyRoot && !process.env.PHANTOMBOT_PERSONAS_DIR) {
+    // Durable FIRST, process env second. The env var only fixes THIS process;
+    // the archived host config was the sole persistent declaration of the
+    // root, so without writing the redirect the next fresh process (a service
+    // restart, a cron `phantombot tick`) resolves the default root, finds no
+    // persona, and boots a different config with a different harness — an
+    // unattended upgrade that silently changes behaviour. Restoring the
+    // redirect file is journalled like every other mutation.
+    const redirectPath = rootRedirectFilePath();
+    const before = existsSync(redirectPath) ? readFileSync(redirectPath, "utf8") : undefined;
+    journal.record(() => {
+      if (before === undefined) rmSync(redirectPath, { force: true });
+      else writeFileSync(redirectPath, before, "utf8");
+    });
+    setRootRedirect(legacyRoot);
     process.env.PHANTOMBOT_PERSONAS_DIR = legacyRoot;
     journal.record(() => {
       delete process.env.PHANTOMBOT_PERSONAS_DIR;
     });
     report.notes.push(
-      `personas root taken from the old config's personas_dir (${legacyRoot}) — set PHANTOMBOT_PERSONAS_DIR in the environment (the service unit bakes it) or phantombot will look under ${join(dataHome(), "phantombot", "personas")} next boot`,
+      `personas root kept at the old config's personas_dir (${legacyRoot}); recorded as personas_dir in ${redirectPath} so every later process resolves the same root`,
     );
   }
   const root = personasRoot();

@@ -286,8 +286,85 @@ describe("migrateHostLayout: personas_dir as a bootstrap input (#436)", () => {
     expect(existsSync(join(customRoot, "lena", ".env"))).toBe(true);
     // The default root was never touched.
     expect(existsSync(join(personasDir, "lena", "config.toml"))).toBe(false);
-    // And the operator is told the root only survives via the env var.
-    expect(report.notes.join(" ")).toContain("PHANTOMBOT_PERSONAS_DIR");
+    // And the root is recorded durably, not just announced.
+    expect(report.notes.join(" ")).toContain("personas_dir");
+    expect(
+      await readFile(join(personasDir, "config.toml"), "utf8"),
+    ).toContain(`personas_dir = "${customRoot}"`);
+  });
+
+  /**
+   * The unattended-upgrade property, proved across a REAL process boundary.
+   *
+   * Process A migrates a box whose old host config set a custom `personas_dir`
+   * and then archives that config — the only persistent declaration of the
+   * root. Process B is the service coming back up afterwards: same environment
+   * the unit always had (XDG_* only, no PHANTOMBOT_PERSONAS_DIR), fresh module
+   * state, nothing inherited. It must resolve the SAME root, and therefore the
+   * same config, state, database and vault (.env) — otherwise the restart
+   * silently boots a different persona directory with a different harness,
+   * which is precisely what a migration must never do.
+   *
+   * A separate `bun` process rather than deleting the env var in-process: an
+   * in-process check cannot distinguish "read back from disk" from "still
+   * cached in a module-level variable".
+   */
+  test("a fresh process after migration resolves the same custom root", async () => {
+    const customRoot = join(workdir, "elsewhere", "personas");
+    await mkdir(join(customRoot, "lena"), { recursive: true });
+    await mkdir(oldConfigDir, { recursive: true });
+    await writeFile(
+      join(oldConfigDir, "config.toml"),
+      `default_persona = "lena"\npersonas_dir = "${customRoot}"\n\n[harnesses]\nchain = ["pi"]\n`,
+      "utf8",
+    );
+    await writeFile(join(oldConfigDir, ".env"), "TTS_KEY=secret\n", "utf8");
+
+    migrateHostLayout();
+    // Process A's declaration is gone: the host config it came from is archived.
+    expect(existsSync(join(oldConfigDir, "config.toml"))).toBe(false);
+
+    const probe = join(workdir, "probe.ts");
+    const paths = join(import.meta.dir, "..", "src", "lib", "personaPaths.ts");
+    const config = join(import.meta.dir, "..", "src", "config.ts");
+    await writeFile(
+      probe,
+      `import { personasRoot, personaConfigPath, personaStatePath, personaDbPath, personaEnvPath } from ${JSON.stringify(paths)};\n` +
+        `import { loadConfig } from ${JSON.stringify(config)};\n` +
+        `const cfg = await loadConfig("lena");\n` +
+        `console.log(JSON.stringify({\n` +
+        `  root: personasRoot(),\n` +
+        `  config: personaConfigPath("lena"),\n` +
+        `  state: personaStatePath("lena"),\n` +
+        `  db: personaDbPath("lena"),\n` +
+        `  env: personaEnvPath("lena"),\n` +
+        `  chain: cfg.harnesses.chain,\n` +
+        `}));\n`,
+      "utf8",
+    );
+
+    // Exactly the environment the service unit always had — note the absence
+    // of PHANTOMBOT_PERSONAS_DIR, which only ever existed inside process A.
+    const child = Bun.spawnSync([process.execPath, "run", probe], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: process.env.HOME ?? workdir,
+        XDG_CONFIG_HOME: join(workdir, "config"),
+        XDG_DATA_HOME: join(workdir, "data"),
+        XDG_STATE_HOME: join(workdir, "state"),
+      },
+    });
+    expect(child.stderr.toString()).not.toContain("error:");
+    expect(child.exitCode).toBe(0);
+    const seen = JSON.parse(child.stdout.toString().trim()) as Record<string, unknown>;
+
+    expect(seen.root).toBe(customRoot);
+    expect(seen.config).toBe(join(customRoot, "lena", "config.toml"));
+    expect(seen.state).toBe(join(customRoot, "lena", "state.json"));
+    expect(seen.db).toBe(join(customRoot, "lena", "memory.sqlite"));
+    expect(seen.env).toBe(join(customRoot, "lena", ".env"));
+    // Behaviour, not just paths: the migrated harness chain is what loads.
+    expect(seen.chain).toEqual(["pi"]);
   });
 
   test("an explicit PHANTOMBOT_PERSONAS_DIR still wins over the old config key", async () => {

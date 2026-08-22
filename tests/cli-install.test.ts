@@ -11,9 +11,10 @@ import { join } from "node:path";
 import { rmrf } from "./fixtures/rmrf.ts";
 import { runInstall } from "../src/cli/install.ts";
 import { runUninstall } from "../src/cli/uninstall.ts";
-import type {
-  LaunchctlResult,
-  LaunchctlRunner,
+import {
+  RETIRED_PLIST_LABELS,
+  type LaunchctlResult,
+  type LaunchctlRunner,
 } from "../src/lib/launchd.ts";
 import type {
   SchtasksResult,
@@ -244,8 +245,11 @@ describe("runInstall (darwin/launchd)", () => {
     });
     expect(code).toBe(0);
     // bootouts of nothing × 3, then bootstrap each plist × 3 (the retired
-    // nightly agent is neither written nor bootstrapped). We check the verb
-    // sequence rather than full strings so the test stays readable.
+    // nightly agent is neither written nor bootstrapped), then one bootout per
+    // retired identity — the #436 upgrade sweep, which runs unconditionally
+    // because a legacy agent can be loaded with its plist already deleted. We
+    // check the verb sequence rather than full strings so the test stays
+    // readable.
     const verbs = lc.calls.map((c) => c[0]);
     expect(verbs).toEqual([
       "bootout",
@@ -254,6 +258,7 @@ describe("runInstall (darwin/launchd)", () => {
       "bootstrap",
       "bootstrap",
       "bootstrap",
+      ...RETIRED_PLIST_LABELS.map(() => "bootout"),
     ]);
     // bootstraps target the correct domain.
     for (const c of lc.calls.filter((c) => c[0] === "bootstrap")) {
@@ -509,7 +514,8 @@ describe("runUninstall (darwin/launchd)", () => {
     });
     expect(code).toBe(0);
     expect(sys.calls).toEqual([]);
-    expect(lc.calls.length).toBe(4);
+    // three live labels + every retired identity (#436).
+    expect(lc.calls.length).toBe(3 + RETIRED_PLIST_LABELS.length);
     expect(lc.calls.every((c) => c[0] === "bootout")).toBe(true);
     expect(out.text).toContain("uninstall complete");
   });

@@ -71,6 +71,60 @@ export const LEGACY_TICK_PLIST_LABEL = "dev.phantombot.tick";
  */
 export const NIGHTLY_PLIST_LABEL = "dev.phantombot.nightly";
 
+/**
+ * Every label an install must bootout and delete: the retired nightly, plus
+ * the three pre-#435 host-global agents.
+ *
+ * The launchd analogue of systemd's RETIRED_UNIT_NAMES, and it exists for the
+ * same reason (#436): leaving `dev.phantombot.phantombot` loaded after an
+ * upgrade means two daemons — the old shared one and the new persona-scoped
+ * one — racing for the same run lock and the same database, which is the exact
+ * bug the persona boundary exists to end.
+ */
+export const RETIRED_PLIST_LABELS = [
+  NIGHTLY_PLIST_LABEL,
+  LEGACY_TICK_PLIST_LABEL,
+  LEGACY_HEARTBEAT_PLIST_LABEL,
+  LEGACY_PHANTOMBOT_PLIST_LABEL,
+] as const;
+
+/** Plist paths of {@link RETIRED_PLIST_LABELS} in the user's LaunchAgents dir. */
+export function retiredPlistPaths(dir: string = launchAgentsDir()): string[] {
+  return RETIRED_PLIST_LABELS.map((label) => join(dir, `${label}.plist`));
+}
+
+/**
+ * Bootout and delete every retired agent. Best-effort per label: a bootout of
+ * something that was never loaded returns non-zero and that is fine — the goal
+ * is only that nothing pre-#435 is left active or on disk afterwards.
+ *
+ * `nightlyPlistPath` is an override so existing tests can keep pointing the
+ * nightly at a tmpdir; the rest resolve under the same directory as that one
+ * when it is given, so a test never touches the real ~/Library/LaunchAgents.
+ */
+export async function removeRetiredPlists(opts: {
+  domain: string;
+  launchctl: LaunchctlRunner;
+  out: WriteSink;
+  dir?: string;
+}): Promise<string[]> {
+  const removed: string[] = [];
+  for (const label of RETIRED_PLIST_LABELS) {
+    const path = join(opts.dir ?? launchAgentsDir(), `${label}.plist`);
+    const onDisk = existsSync(path);
+    // Bootout even when the plist is gone: launchd keeps a loaded job in the
+    // domain until it is booted out, so a hand-deleted plist can still leave a
+    // live agent behind.
+    await opts.launchctl.run(["bootout", `${opts.domain}/${label}`]);
+    if (onDisk) {
+      await unlink(path);
+      opts.out.write(`removed retired plist: ${path}\n`);
+      removed.push(path);
+    }
+  }
+  return removed;
+}
+
 
 function launchAgentsDir(): string {
   return join(homedir(), "Library", "LaunchAgents");
@@ -408,15 +462,15 @@ export async function installPhantombotPlists(
     }
   }
 
-  // Upgrade cleanup: an install from before the nightly timer was retired
-  // still has the 02:00 agent loaded. Bootout + delete it so it can't fire a
-  // duplicate sweep. Guarded on the plist existing, so a fresh Mac issues no
-  // extra launchctl call at all.
-  if (existsSync(ngPath)) {
-    await opts.launchctl.run(["bootout", `${domain}/${NIGHTLY_PLIST_LABEL}`]);
-    await unlink(ngPath);
-    opts.out.write(`removed retired plist: ${ngPath}\n`);
-  }
+  // Upgrade cleanup: bootout + delete the retired nightly agent AND every
+  // pre-#435 host-global agent, so an upgraded Mac cannot end up with the old
+  // shared daemon still loaded alongside the persona-scoped one.
+  await removeRetiredPlists({
+    domain,
+    launchctl: opts.launchctl,
+    out: opts.out,
+    dir: dirname(ngPath),
+  });
   opts.out.write(
     `bootstrapped ${phantombotPlistLabel()} + heartbeat + tick into ${domain}\n`,
   );
@@ -446,9 +500,11 @@ export async function uninstallPhantombotPlists(
 
   const labels = [
     tickPlistLabel(),
-    NIGHTLY_PLIST_LABEL,
     heartbeatPlistLabel(),
     phantombotPlistLabel(),
+    // Retired/pre-#435 identities too: uninstall means nothing phantombot ever
+    // installed is left loaded, not just what THIS version installs.
+    ...RETIRED_PLIST_LABELS,
   ];
   // bootout each label (best-effort). A missing target returns non-zero
   // — that's fine, we just want it gone from the domain.
@@ -469,7 +525,7 @@ export async function uninstallPhantombotPlists(
   } else {
     opts.out.write(`(no plist at ${mainPath})\n`);
   }
-  for (const p of [hbPath, ngPath, tkPath]) {
+  for (const p of new Set([hbPath, ngPath, tkPath, ...retiredPlistPaths(dirname(ngPath))])) {
     if (existsSync(p)) {
       await unlink(p);
       opts.out.write(`removed ${p}\n`);

@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   generateHeartbeatPlist,
@@ -21,6 +21,7 @@ import {
   phantombotPlistLabel,
   heartbeatPlistLabel,
   NIGHTLY_PLIST_LABEL,
+  RETIRED_PLIST_LABELS,
   tickPlistLabel,
   launchdLogPaths,
 } from "../src/lib/launchd.ts";
@@ -191,8 +192,10 @@ describe("installPhantombotPlists", () => {
     }
 
     // The launchctl call sequence is: bootout(label) × 3 (idempotent
-    // pre-cleanup), then bootstrap(plist) × 3. Nothing for the retired
-    // nightly agent, because its plist isn't on disk.
+    // pre-cleanup), bootstrap(plist) × 3, then a bootout of every retired
+    // identity. The retired ones are booted out even with no plist on disk:
+    // launchd keeps a loaded job in the domain until it is booted out, so a
+    // hand-deleted plist can still leave a live pre-#435 agent running.
     const sequence = lc.calls.map((c) => c.join(" "));
     expect(sequence).toEqual([
       `bootout gui/501/${phantombotPlistLabel()}`,
@@ -201,6 +204,7 @@ describe("installPhantombotPlists", () => {
       `bootstrap gui/501 ${mainPath}`,
       `bootstrap gui/501 ${hbPath}`,
       `bootstrap gui/501 ${tkPath}`,
+      ...RETIRED_PLIST_LABELS.map((l) => `bootout gui/501/${l}`),
     ]);
     expect(out.text).toContain("bootstrapped");
   });
@@ -230,6 +234,40 @@ describe("installPhantombotPlists", () => {
       `bootout gui/501/${NIGHTLY_PLIST_LABEL}`,
     );
     expect(out.text).toContain("removed retired plist");
+  });
+
+  test("boots out and deletes every pre-#435 host-global agent on upgrade", async () => {
+    // The real upgrade shape: a Mac that ran the shared layout has all three
+    // legacy agents loaded and on disk. Leaving even one means the old daemon
+    // keeps running beside the persona-scoped one, both holding the same
+    // database — the exact collision the persona boundary exists to end.
+    const dir = dirname(ngPath);
+    const legacy = RETIRED_PLIST_LABELS.map((l) => join(dir, `${l}.plist`));
+    for (const p of legacy) await Bun.write(p, "<plist>old</plist>");
+
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const lc = new FakeLaunchctl();
+    const result = await installPhantombotPlists({
+      binPath: "/Users/andrew/.local/bin/phantombot",
+      plistPath: mainPath,
+      heartbeatPlistPath: hbPath,
+      nightlyPlistPath: ngPath,
+      tickPlistPath: tkPath,
+      domain: "gui/501",
+      launchctl: lc,
+      out,
+      err,
+    });
+    expect(result.installed).toBe(true);
+
+    const calls = lc.calls.map((c) => c.join(" "));
+    for (const label of RETIRED_PLIST_LABELS) {
+      expect(calls).toContain(`bootout gui/501/${label}`);
+    }
+    for (const p of legacy) expect(existsSync(p)).toBe(false);
+    // The persona-scoped agents are the ones left standing.
+    for (const p of [mainPath, hbPath, tkPath]) expect(existsSync(p)).toBe(true);
   });
 
   test("fails install (and reports) when bootstrap returns non-zero", async () => {
@@ -285,9 +323,9 @@ describe("uninstallPhantombotPlists", () => {
 
     expect(lc.calls.map((c) => c.join(" "))).toEqual([
       `bootout gui/501/${tickPlistLabel()}`,
-      `bootout gui/501/${NIGHTLY_PLIST_LABEL}`,
       `bootout gui/501/${heartbeatPlistLabel()}`,
       `bootout gui/501/${phantombotPlistLabel()}`,
+      ...RETIRED_PLIST_LABELS.map((l) => `bootout gui/501/${l}`),
     ]);
     // All plists removed.
     expect(existsSync(mainPath)).toBe(false);

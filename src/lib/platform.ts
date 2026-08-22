@@ -28,11 +28,14 @@
 
 import {
   defaultLaunchdServiceControl,
+  defaultPlistPath,
   launchdLogPaths,
   launchdLogsDir,
+  phantombotPlistLabel,
 } from "./launchd.ts";
 import {
   defaultSystemdServiceControl,
+  phantombotUnitName,
   type ServiceControl,
 } from "./systemd.ts";
 import {
@@ -194,18 +197,36 @@ async function windowsMainTaskName(over?: HintOverrides): Promise<string> {
   return taskNames(persona).main;
 }
 
+/**
+ * Same rule on POSIX (#436). Install writes `phantombot-<persona>.service` and
+ * `dev.phantombot.<persona>.phantombot`; a hint that still says
+ * `systemctl --user restart phantombot` hands the operator a command that
+ * fails on every upgraded box — and, worse, on a box where a retired
+ * host-global unit lingers, addresses the WRONG daemon.
+ *
+ * `persona` here is the hint override only. When it is absent these resolve
+ * through activePersona(), which is what PHANTOMBOT_PERSONA / --persona set.
+ */
+function linuxUnit(over?: HintOverrides): string {
+  return phantombotUnitName(over?.persona);
+}
+
+function darwinLabel(over?: HintOverrides): string {
+  return phantombotPlistLabel(over?.persona);
+}
+
 /** Copy-pasteable command string the user can run to restart phantombot. */
 export async function restartCommand(over?: HintOverrides): Promise<string> {
   switch (over?.platform ?? currentPlatform()) {
     case "darwin":
-      return `launchctl kickstart -k gui/$(id -u)/dev.phantombot.phantombot`;
+      return `launchctl kickstart -k gui/$(id -u)/${darwinLabel(over)}`;
     case "windows": {
       const task = await windowsMainTaskName(over);
       return `schtasks /End /TN "${task}" & schtasks /Run /TN "${task}"`;
     }
     case "linux":
     default:
-      return "systemctl --user restart phantombot";
+      return `systemctl --user restart ${linuxUnit(over)}`;
   }
 }
 
@@ -213,14 +234,14 @@ export async function restartCommand(over?: HintOverrides): Promise<string> {
 export async function startCommand(over?: HintOverrides): Promise<string> {
   switch (over?.platform ?? currentPlatform()) {
     case "darwin":
-      return `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.phantombot.phantombot.plist`;
+      return `launchctl bootstrap gui/$(id -u) ${defaultPlistPath(over?.persona)}`;
     case "windows": {
       const task = await windowsMainTaskName(over);
       return `schtasks /Change /TN "${task}" /ENABLE & schtasks /Run /TN "${task}"`;
     }
     case "linux":
     default:
-      return "systemctl --user start phantombot";
+      return `systemctl --user start ${linuxUnit(over)}`;
   }
 }
 
@@ -228,14 +249,14 @@ export async function startCommand(over?: HintOverrides): Promise<string> {
 export async function stopCommand(over?: HintOverrides): Promise<string> {
   switch (over?.platform ?? currentPlatform()) {
     case "darwin":
-      return `launchctl bootout gui/$(id -u)/dev.phantombot.phantombot`;
+      return `launchctl bootout gui/$(id -u)/${darwinLabel(over)}`;
     case "windows": {
       const task = await windowsMainTaskName(over);
       return `schtasks /Change /TN "${task}" /DISABLE & schtasks /End /TN "${task}"`;
     }
     case "linux":
     default:
-      return "systemctl --user stop phantombot";
+      return `systemctl --user stop ${linuxUnit(over)}`;
   }
 }
 
@@ -243,12 +264,12 @@ export async function stopCommand(over?: HintOverrides): Promise<string> {
 export async function statusCommand(over?: HintOverrides): Promise<string> {
   switch (over?.platform ?? currentPlatform()) {
     case "darwin":
-      return `launchctl print gui/$(id -u)/dev.phantombot.phantombot`;
+      return `launchctl print gui/$(id -u)/${darwinLabel(over)}`;
     case "windows":
       return `schtasks /Query /TN "${await windowsMainTaskName(over)}" /V /FO LIST`;
     case "linux":
     default:
-      return "systemctl --user status phantombot";
+      return `systemctl --user status ${linuxUnit(over)}`;
   }
 }
 
@@ -268,7 +289,7 @@ export function logsCommand(): string {
     }
     case "linux":
     default:
-      return "journalctl --user -u phantombot -f";
+      return `journalctl --user -u ${linuxUnit()} -f`;
   }
 }
 
@@ -304,7 +325,7 @@ export interface LogsSpecOpts {
  * Argv for a child process that tails phantombot's service logs, resolved for
  * the host platform. `phantombot logs` spawns this with inherited stdio.
  *
- *   - linux:   journalctl --user -u phantombot [-n N] [-f]  (one merged stream)
+ *   - linux:   journalctl --user -u phantombot-<persona> [-n N] [-f]
  *   - darwin:  tail [-n N] [-f] <out.log> <err.log>         (two files)
  *   - windows: powershell Get-Content -Tail N [-Wait] <out.log>
  *
@@ -318,7 +339,7 @@ export function logsSpec(
   const lines = opts.lines ?? 50;
   switch (currentPlatform()) {
     case "linux": {
-      const args = ["--user", "-u", "phantombot", "-n", String(lines)];
+      const args = ["--user", "-u", phantombotUnitName(), "-n", String(lines)];
       if (follow) args.push("-f");
       return { cmd: "journalctl", args };
     }

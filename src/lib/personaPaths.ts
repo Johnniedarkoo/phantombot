@@ -55,10 +55,62 @@ export function dataHome(): string {
  * the root is.
  */
 export function personasRoot(): string {
-  return (
-    process.env.PHANTOMBOT_PERSONAS_DIR ??
-    join(dataHome(), "phantombot", "personas")
-  );
+  const fromEnv = process.env.PHANTOMBOT_PERSONAS_DIR?.trim();
+  if (fromEnv) return fromEnv;
+  return readRootRedirect() ?? defaultPersonasRoot();
+}
+
+/** Where the personas root lives when nothing redirects it. */
+export function defaultPersonasRoot(): string {
+  return join(dataHome(), "phantombot", "personas");
+}
+
+/**
+ * The file that may carry the durable `personas_dir` redirect.
+ *
+ * It has to sit at a path that is computable WITHOUT knowing the root — that
+ * is the whole bootstrap problem — so it is the config file at the DEFAULT
+ * root (or PHANTOMBOT_GLOBAL_CONFIG when the operator pinned one explicitly).
+ */
+function rootRedirectPath(): string {
+  return process.env.PHANTOMBOT_GLOBAL_CONFIG ?? join(defaultPersonasRoot(), "config.toml");
+}
+
+/**
+ * Durable pointer to a non-default personas root (#436).
+ *
+ * Pre-#435 boxes could set `personas_dir` in the host config. That file is
+ * archived by the migration, so without a durable replacement the NEXT fresh
+ * process — a service restart, a cron `phantombot tick` — silently resolves
+ * the default root, finds no persona there, and boots a different config with
+ * a different harness. An in-process `PHANTOMBOT_PERSONAS_DIR` does not
+ * survive that, and neither does a log line asking the operator to fix it.
+ *
+ * So the migration writes `personas_dir` into the config file at the DEFAULT
+ * root, and every process reads it back here before falling back. A redirect
+ * pointing at the default root itself is ignored — that is a no-op, and
+ * honouring it as a "redirect" would be a loop waiting to happen.
+ */
+export function readRootRedirect(): string | undefined {
+  try {
+    const parsed = parseToml(readFileSync(rootRedirectPath(), "utf8")) as Record<string, unknown>;
+    const value = parsed.personas_dir;
+    if (typeof value !== "string") return undefined;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === defaultPersonasRoot()) return undefined;
+    return trimmed;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Persist the personas-root redirect so a fresh process resolves the same
+ * root. Returns the path written, so a caller running under an undo journal
+ * can restore it.
+ */
+export function rootRedirectFilePath(): string {
+  return rootRedirectPath();
 }
 
 /** The one global config file: `<personas-root>/config.toml`. */
@@ -72,6 +124,12 @@ export interface GlobalConfig {
   default_persona?: string;
   /** Release ring for the shared binary: "stable" | "preview". */
   update_channel?: string;
+  /**
+   * Durable redirect to a non-default personas root, honoured only in the file
+   * at the DEFAULT root (see {@link readRootRedirect}). Written by the #435
+   * migration for boxes whose old host config set `personas_dir`.
+   */
+  personas_dir?: string;
 }
 
 /**
@@ -89,6 +147,9 @@ export function loadGlobalConfig(): GlobalConfig {
     }
     if (typeof parsed.update_channel === "string") {
       out.update_channel = parsed.update_channel;
+    }
+    if (typeof parsed.personas_dir === "string") {
+      out.personas_dir = parsed.personas_dir;
     }
     return out;
   } catch {
@@ -211,7 +272,20 @@ export function personaExists(persona: string): boolean {
  * byte-identical.
  */
 export function setGlobalConfigValue(key: keyof GlobalConfig, value: string): void {
-  const path = globalConfigPath();
+  setConfigValueAt(globalConfigPath(), key, value);
+}
+
+/**
+ * Write the durable personas-root redirect (`personas_dir`) into the file at
+ * the DEFAULT root. Separate from {@link setGlobalConfigValue} on purpose:
+ * that one targets `<personas-root>/config.toml`, which is exactly the file a
+ * redirect cannot live in — you would have to know the root to find it.
+ */
+export function setRootRedirect(root: string): void {
+  setConfigValueAt(rootRedirectPath(), "personas_dir", root);
+}
+
+function setConfigValueAt(path: string, key: keyof GlobalConfig, value: string): void {
   let text = "";
   try {
     text = readFileSync(path, "utf8");
