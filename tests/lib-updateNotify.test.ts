@@ -88,6 +88,21 @@ function baseConfig(): Config {
   };
 }
 
+/**
+ * Exact hostname match — `URL.hostname` is the parsed host, so
+ * `https://api.github.com.evil.example/...` and
+ * `https://evil.example/?u=api.github.com` are both correctly rejected.
+ * A substring `u.includes("api.github.com")` tripped CodeQL "incomplete
+ * URL substring sanitization". Invalid URLs are non-matches, not throws.
+ */
+function isGitHubApiUrl(u: string): boolean {
+  try {
+    return new URL(u).hostname === "api.github.com";
+  } catch {
+    return false;
+  }
+}
+
 const ASSET = "phantombot-v1.0.99-linux-x64";
 const NEW_BYTES = Buffer.from("NEW_BINARY_VERIFIED");
 const NEW_SHA = createHash("sha256").update(NEW_BYTES).digest("hex");
@@ -1296,5 +1311,103 @@ describe("notifyPhantomchatPostRestart", () => {
     });
     expect(r.status).toBe("no_marker");
     expect(transport.sent.length).toBe(0);
+  });
+});
+
+describe("release rings (#432) — the heartbeat follows the host's channel", () => {
+  /** Answers either endpoint shape and records which one was asked for. */
+  function ringFetch(): { fetchImpl: typeof fetch; apiUrls: string[] } {
+    const apiUrls: string[] = [];
+    const release = {
+      tag_name: "v1.0.99",
+      published_at: "2026-05-01T00:00:00Z",
+      body: "test release",
+      prerelease: true,
+      assets: [
+        {
+          name: ASSET,
+          browser_download_url: "https://example/" + ASSET,
+          size: NEW_BYTES.byteLength,
+        },
+        {
+          name: "SHA256SUMS",
+          browser_download_url: "https://example/SHA256SUMS",
+          size: 256,
+        },
+      ],
+    };
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (isGitHubApiUrl(u)) {
+        apiUrls.push(u);
+        const body = u.includes("/releases/latest") ? release : [release];
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("", { status: 404 });
+    }) as unknown as typeof fetch;
+    return { fetchImpl, apiUrls };
+  }
+
+  test("a stable host's heartbeat resolves /releases/latest", async () => {
+    const { fetchImpl, apiUrls } = ringFetch();
+    await checkAndNotifyOnce({
+      config: baseConfig(),
+      currentVersion: "1.0.42",
+      now: new Date("2026-05-05T00:00:00Z"),
+      fetchImpl,
+      transport: new FakeTransport(),
+      lastNotifiedPath: lastNotifiedPathLocal,
+      procPlatform: "linux",
+      procArch: "x64",
+    });
+    expect(apiUrls[0]).toContain("/releases/latest");
+  });
+
+  test("a preview host's heartbeat resolves the releases list", async () => {
+    // Otherwise a preview box would be notified about — and offered —
+    // whatever the STABLE ring is on, which is the build it deliberately
+    // opted out of tracking.
+    const { fetchImpl, apiUrls } = ringFetch();
+    await checkAndNotifyOnce({
+      config: { ...baseConfig(), updateChannel: "preview" },
+      currentVersion: "1.0.42",
+      now: new Date("2026-05-05T00:00:00Z"),
+      fetchImpl,
+      transport: new FakeTransport(),
+      lastNotifiedPath: lastNotifiedPathLocal,
+      procPlatform: "linux",
+      procArch: "x64",
+    });
+    expect(apiUrls[0]).toContain("/releases?per_page=");
+  });
+
+  test("/update hands its resolved ring to the swap, not a re-read config", async () => {
+    // The marker is written for the release THIS ring resolved; if the swap
+    // re-derived the channel it could install a different build than the one
+    // the user was just told about.
+    let seenChannel: unknown;
+    const { fetchImpl } = ringFetch();
+    await runUpdateFlow({
+      config: { ...baseConfig(), updateChannel: "preview" },
+      currentVersion: "1.0.42",
+      chatId: 42,
+      fetchImpl,
+      pendingPath: pendingPath,
+      procPlatform: "linux",
+      procArch: "x64",
+      runUpdateImpl: (async (input: { channel?: string }) => {
+        seenChannel = input.channel;
+        return 0;
+      }) as never,
+      serviceControl: {
+        isActive: async () => true,
+        restart: async () => ({ ok: true }),
+        rerenderUnitIfStale: async () => ({ rerendered: false }),
+      } as never,
+    });
+    expect(seenChannel).toBe("preview");
   });
 });
