@@ -382,6 +382,16 @@ async function defaultHealLaunchd(persona?: string): Promise<void> {
     domain,
     launchctl: new BunLaunchctlRunner(),
   });
+  if (r.failures.length > 0) {
+    // Surface, don't swallow: the reconcile did not converge, the retired
+    // sweep was skipped, and the box is running on whatever agents it had.
+    log.warn("heartbeat: launchd agents did not converge", {
+      failures: r.failures,
+      rolledBack: r.rolledBack,
+      reloaded: r.reloaded,
+    });
+    return;
+  }
   if (
     r.rewrote.length > 0 ||
     r.reloaded.length > 0 ||

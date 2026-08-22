@@ -730,6 +730,8 @@ describe("runUpdate post-swap systemd heal", () => {
           backups: [],
           reloaded: ["dev.phantombot.phantom.phantombot"],
           removedRetired: ["/Users/a/Library/LaunchAgents/dev.phantombot.phantombot.plist"],
+          failures: [],
+          rolledBack: [],
         };
       },
     });

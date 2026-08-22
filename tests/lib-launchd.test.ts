@@ -400,8 +400,17 @@ describe("persona-scoped agents (#435)", () => {
 class DomainLaunchctl implements LaunchctlRunner {
   calls: string[][] = [];
   loaded: Set<string>;
-  constructor(loaded: string[] = []) {
+  /**
+   * Labels whose `bootstrap` should fail, modelling the real launchd failure
+   * modes the reconcile has to survive: a malformed plist body, a label
+   * already claimed in another domain, or a transient launchd error. A fake
+   * that always exits 0 cannot express this, which is exactly why the missing
+   * guard went unnoticed.
+   */
+  failBootstrapFor: Set<string>;
+  constructor(loaded: string[] = [], failBootstrapFor: string[] = []) {
     this.loaded = new Set(loaded);
+    this.failBootstrapFor = new Set(failBootstrapFor);
   }
   async run(args: readonly string[]): Promise<LaunchctlResult> {
     this.calls.push([...args]);
@@ -419,6 +428,13 @@ class DomainLaunchctl implements LaunchctlRunner {
     if (verb === "bootstrap") {
       // b is a plist path; its basename minus .plist is the label.
       const label = (b ?? "").split("/").pop()?.replace(/\.plist$/, "") ?? "";
+      if (this.failBootstrapFor.has(label)) {
+        return {
+          exitCode: 5,
+          stdout: "",
+          stderr: "Load failed: 5: Input/output error",
+        };
+      }
       this.loaded.add(label);
       return ok;
     }
@@ -562,5 +578,127 @@ describe("ensureLaunchdAgentsCurrent (unattended macOS reconcile)", () => {
     );
     expect(lastBootstrap).toBeGreaterThan(-1);
     expect(firstLegacyBootout).toBeGreaterThan(lastBootstrap);
+  });
+
+  test("every scoped bootstrap failing leaves the retired agents LOADED and on disk", async () => {
+    // The failure this guards: an upgraded Mac where the new plists cannot be
+    // loaded at all. Sweeping anyway would boot out and DELETE the only agents
+    // still running, so the box would have no daemon, no heartbeat and no tick
+    // — and no plist to recover from. Leaving the old ones is recoverable.
+    const dir = dirname(ngPath);
+    const legacy = RETIRED_PLIST_LABELS.map((l) => join(dir, `${l}.plist`));
+    for (const p of legacy) await Bun.write(p, "<plist>old</plist>");
+    const scoped = [
+      phantombotPlistLabel(),
+      heartbeatPlistLabel(),
+      tickPlistLabel(),
+    ];
+    const lc = new DomainLaunchctl([...RETIRED_PLIST_LABELS], scoped);
+
+    const r = await ensureLaunchdAgentsCurrent({
+      binPath: BIN,
+      domain: "gui/501",
+      launchctl: lc,
+      ...overrides(),
+    });
+
+    // The failure is SURFACED, with launchctl's own error, not swallowed.
+    expect(r.failures.map((f) => f.label).sort()).toEqual([...scoped].sort());
+    for (const f of r.failures) expect(f.error).toContain("Input/output error");
+    expect(r.reloaded).toEqual([]);
+
+    // Nothing was swept: retired agents still loaded AND still on disk.
+    expect(r.removedRetired).toEqual([]);
+    for (const label of RETIRED_PLIST_LABELS) {
+      expect(lc.loaded.has(label)).toBe(true);
+      expect(lc.callLines).not.toContain(`bootout gui/501/${label}`);
+    }
+    for (const p of legacy) expect(existsSync(p)).toBe(true);
+  });
+
+  test("a partial failure also blocks the sweep", async () => {
+    // Two of three agents load. The box is still not converged, so the retired
+    // identities stay — a half-migrated Mac must not lose its old daemon.
+    const dir = dirname(ngPath);
+    const legacy = RETIRED_PLIST_LABELS.map((l) => join(dir, `${l}.plist`));
+    for (const p of legacy) await Bun.write(p, "<plist>old</plist>");
+    const lc = new DomainLaunchctl([...RETIRED_PLIST_LABELS], [tickPlistLabel()]);
+
+    const r = await ensureLaunchdAgentsCurrent({
+      binPath: BIN,
+      domain: "gui/501",
+      launchctl: lc,
+      ...overrides(),
+    });
+
+    expect(r.failures.map((f) => f.label)).toEqual([tickPlistLabel()]);
+    expect(r.reloaded).toEqual([phantombotPlistLabel(), heartbeatPlistLabel()]);
+    expect(r.removedRetired).toEqual([]);
+    for (const p of legacy) expect(existsSync(p)).toBe(true);
+  });
+
+  test("a drifted-but-healthy agent that fails to reload is restored and re-bootstrapped", async () => {
+    // The nastiest sub-case: the agent was RUNNING fine, we booted it out to
+    // apply a new body, and the new body will not load. Doing nothing leaves a
+    // working agent permanently down. Put the old plist back and reload it.
+    const oldBody = generatePhantombotPlist({ binPath: "/old/phantombot", args: ["run"] });
+    await Bun.write(mainPath, oldBody);
+    await Bun.write(hbPath, generateHeartbeatPlist(BIN));
+    await Bun.write(tkPath, generateTickPlist(BIN));
+    const lc = new DomainLaunchctl(
+      [phantombotPlistLabel(), heartbeatPlistLabel(), tickPlistLabel()],
+      [],
+    );
+    // Fail only the FIRST bootstrap of the main label; the restore attempt
+    // (second bootstrap of the same label) must succeed.
+    let mainBootstraps = 0;
+    const inner = lc.run.bind(lc);
+    lc.run = async (args: readonly string[]) => {
+      if (args[0] === "bootstrap" && (args[2] ?? "").endsWith(`${phantombotPlistLabel()}.plist`)) {
+        mainBootstraps += 1;
+        if (mainBootstraps === 1) {
+          lc.calls.push([...args]);
+          return { exitCode: 5, stdout: "", stderr: "Load failed: 5: Input/output error" };
+        }
+      }
+      return inner(args);
+    };
+
+    const r = await ensureLaunchdAgentsCurrent({
+      binPath: BIN,
+      domain: "gui/501",
+      launchctl: lc,
+      ...overrides(),
+    });
+
+    // The agent is back UP, running the previous body.
+    expect(lc.loaded.has(phantombotPlistLabel())).toBe(true);
+    expect(await readFile(mainPath, "utf8")).toBe(oldBody);
+    expect(r.rolledBack).toEqual([phantombotPlistLabel()]);
+    // And we do not claim to have rewritten a plist we put back.
+    expect(r.rewrote).toEqual([]);
+    // Still a failure, so the sweep is still skipped.
+    expect(r.failures.map((f) => f.label)).toEqual([phantombotPlistLabel()]);
+    expect(r.removedRetired).toEqual([]);
+  });
+
+  test("a fully healthy reconcile still sweeps — the guard does not block the happy path", async () => {
+    // Guards that skip too much are as bad as guards that skip too little.
+    const dir = dirname(ngPath);
+    const legacy = RETIRED_PLIST_LABELS.map((l) => join(dir, `${l}.plist`));
+    for (const p of legacy) await Bun.write(p, "<plist>old</plist>");
+    const lc = new DomainLaunchctl([...RETIRED_PLIST_LABELS]);
+
+    const r = await ensureLaunchdAgentsCurrent({
+      binPath: BIN,
+      domain: "gui/501",
+      launchctl: lc,
+      ...overrides(),
+    });
+
+    expect(r.failures).toEqual([]);
+    expect(r.rolledBack).toEqual([]);
+    expect(r.removedRetired.length).toBe(RETIRED_PLIST_LABELS.length);
+    for (const p of legacy) expect(existsSync(p)).toBe(false);
   });
 });

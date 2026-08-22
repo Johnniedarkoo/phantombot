@@ -320,7 +320,17 @@ export async function runUpdate(input: RunUpdateInput = {}): Promise<number> {
             `removed retired launchd agents: ${heal.removedRetired.join(", ")}\n`,
           );
         }
-        if (
+        if (heal.failures.length > 0) {
+          // Loud on stderr: the operator's box is running on whatever agents
+          // survived, and the retired ones were deliberately left in place.
+          for (const f of heal.failures) {
+            err.write(`warning: launchd agent ${f.label} failed to load: ${f.error}\n`);
+          }
+          err.write(
+            "retired launchd agents were left in place so the box keeps a running " +
+              "daemon — run 'phantombot install' to finish the migration.\n",
+          );
+        } else if (
           heal.rewrote.length === 0 &&
           heal.reloaded.length === 0 &&
           heal.removedRetired.length === 0

@@ -633,6 +633,18 @@ export interface EnsureLaunchdAgentsResult {
   reloaded: string[];
   /** Retired plist paths deleted. */
   removedRetired: string[];
+  /**
+   * Scoped agents whose bootstrap failed, with the launchctl error. Non-empty
+   * means the reconcile did NOT converge: the retired sweep is skipped, so the
+   * box keeps whatever pre-#435 agents it had rather than ending up with none.
+   */
+  failures: { label: string; error: string }[];
+  /**
+   * Labels whose drifted plist we rewrote, failed to reload, and then restored
+   * from the `.bak` and re-bootstrapped. These are back on the OLD body — stale
+   * but running, which beats down.
+   */
+  rolledBack: string[];
 }
 
 /**
@@ -648,8 +660,11 @@ export interface EnsureLaunchdAgentsResult {
  * unattended heal path (the heartbeat) means an upgrade needs no action, which
  * is what README promises.
  *
- * Best-effort per agent: a bootout of something that was never loaded exits
- * non-zero and that is fine.
+ * Best-effort per agent for BOOTOUT: booting out something that was never
+ * loaded exits non-zero and that is fine. BOOTSTRAP is not best-effort — a
+ * failure is recorded in `failures`, the drifted plist is rolled back to its
+ * previous body where we have one, and the retired sweep is skipped entirely
+ * so the box never ends up with neither the old agents nor the new ones.
  */
 export async function ensureLaunchdAgentsCurrent(
   opts: EnsureLaunchdAgentsOptions,
@@ -659,6 +674,8 @@ export async function ensureLaunchdAgentsCurrent(
   const rewrote: string[] = [];
   const backups: string[] = [];
   const reloaded: string[] = [];
+  const failures: { label: string; error: string }[] = [];
+  const rolledBack: string[] = [];
 
   // launchd refuses to start an agent whose StandardOutPath directory does not
   // exist, so create it before anything is bootstrapped.
@@ -668,12 +685,13 @@ export async function ensureLaunchdAgentsCurrent(
     let current: string | undefined;
     if (existsSync(t.path)) current = await readFile(t.path, "utf8");
     const drifted = current !== t.body;
+    let backupPath: string | undefined;
     if (drifted) {
       await mkdir(dirname(t.path), { recursive: true });
       if (current !== undefined) {
-        const bak = `${t.path}.bak`;
-        await writeFile(bak, current, "utf8");
-        backups.push(bak);
+        backupPath = `${t.path}.bak`;
+        await writeFile(backupPath, current, "utf8");
+        backups.push(backupPath);
       }
       await writeFile(t.path, t.body, "utf8");
       rewrote.push(basename(t.path));
@@ -685,22 +703,53 @@ export async function ensureLaunchdAgentsCurrent(
       "print",
       `${opts.domain}/${t.label}`,
     ]);
-    if (!drifted && loaded.exitCode === 0) continue;
+    const wasLoaded = loaded.exitCode === 0;
+    if (!drifted && wasLoaded) continue;
     await opts.launchctl.run(["bootout", `${opts.domain}/${t.label}`]);
     const r = await opts.launchctl.run(["bootstrap", opts.domain, t.path]);
-    if (r.exitCode === 0) reloaded.push(t.label);
+    if (r.exitCode === 0) {
+      reloaded.push(t.label);
+      continue;
+    }
+    // The reload failed. We have just booted the agent OUT, so doing nothing
+    // here leaves a previously-healthy agent permanently down. If the only
+    // thing we changed was the body, put the old one back and reload that:
+    // stale-but-running beats a correct plist nothing is running.
+    const error = r.stderr.trim() || `exit ${r.exitCode}`;
+    if (drifted && backupPath !== undefined && current !== undefined) {
+      await writeFile(t.path, current, "utf8");
+      const back = await opts.launchctl.run(["bootstrap", opts.domain, t.path]);
+      const idx = rewrote.indexOf(basename(t.path));
+      if (idx >= 0) rewrote.splice(idx, 1);
+      if (back.exitCode === 0) {
+        rolledBack.push(t.label);
+        failures.push({
+          label: t.label,
+          error: `${error} (rolled back to the previous plist)`,
+        });
+        continue;
+      }
+    }
+    failures.push({ label: t.label, error });
   }
 
-  // Only now sweep the old identities: the scoped agents are live first, so a
-  // failure midway can never leave the box with no daemon at all.
-  const removedRetired = await removeRetiredPlists({
-    domain: opts.domain,
-    launchctl: opts.launchctl,
-    out: { write: () => {} },
-    dir: dirname(opts.nightlyPlistPath ?? nightlyPlistPath()),
-  });
+  // Only sweep the old identities once EVERY scoped agent is confirmed live.
+  // The ordering alone is not enough: bootstrap can fail (malformed plist,
+  // transient launchd error), and sweeping anyway would boot out and DELETE
+  // the only agents left running, leaving an upgraded Mac with no daemon, no
+  // heartbeat and no tick — and no plist to recover from. Leaving the retired
+  // agents in place is the recoverable failure: the next heartbeat retries.
+  const removedRetired =
+    failures.length === 0
+      ? await removeRetiredPlists({
+          domain: opts.domain,
+          launchctl: opts.launchctl,
+          out: { write: () => {} },
+          dir: dirname(opts.nightlyPlistPath ?? nightlyPlistPath()),
+        })
+      : [];
 
-  return { rewrote, backups, reloaded, removedRetired };
+  return { rewrote, backups, reloaded, removedRetired, failures, rolledBack };
 }
 
 /**
