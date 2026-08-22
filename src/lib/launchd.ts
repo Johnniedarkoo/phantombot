@@ -32,9 +32,37 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { isPhantombotBinary } from "./binaryIdentity.ts";
 import type { WriteSink } from "./io.ts";
+import { activePersona, FALLBACK_PERSONA } from "./personaPaths.ts";
 
-export const PHANTOMBOT_PLIST_LABEL = "dev.phantombot.phantombot";
-export const HEARTBEAT_PLIST_LABEL = "dev.phantombot.heartbeat";
+/**
+ * Labels are PERSONA-SCOPED since #435 — `dev.phantombot.<persona>.phantombot`
+ * rather than one shared `dev.phantombot.phantombot`. A single label meant
+ * installing persona B booted B's agent over A's and left one daemon serving
+ * the wrong persona; launchd keys everything (bootstrap, bootout, logs) off the
+ * label, so the label IS the isolation boundary on macOS.
+ *
+ * Sanitized because a label with a `/` in it would escape the LaunchAgents
+ * directory when turned into a plist filename.
+ */
+function labelSlug(persona?: string): string {
+  const name = (persona ?? activePersona()).trim() || FALLBACK_PERSONA;
+  return name.replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
+export function phantombotPlistLabel(persona?: string): string {
+  return `dev.phantombot.${labelSlug(persona)}.phantombot`;
+}
+export function heartbeatPlistLabel(persona?: string): string {
+  return `dev.phantombot.${labelSlug(persona)}.heartbeat`;
+}
+export function tickPlistLabel(persona?: string): string {
+  return `dev.phantombot.${labelSlug(persona)}.tick`;
+}
+
+/** Pre-#435 shared labels. Kept only so an upgrade can bootout and delete them. */
+export const LEGACY_PHANTOMBOT_PLIST_LABEL = "dev.phantombot.phantombot";
+export const LEGACY_HEARTBEAT_PLIST_LABEL = "dev.phantombot.heartbeat";
+export const LEGACY_TICK_PLIST_LABEL = "dev.phantombot.tick";
 /**
  * RETIRED label. The nightly no longer runs on a clock (startup + the
  * heartbeat's day-rollover check trigger it now — see nightlyTrigger.ts), so
@@ -42,7 +70,7 @@ export const HEARTBEAT_PLIST_LABEL = "dev.phantombot.heartbeat";
  * bootout and delete what an older install left in the gui domain.
  */
 export const NIGHTLY_PLIST_LABEL = "dev.phantombot.nightly";
-export const TICK_PLIST_LABEL = "dev.phantombot.tick";
+
 
 function launchAgentsDir(): string {
   return join(homedir(), "Library", "LaunchAgents");
@@ -60,8 +88,8 @@ function logsDir(): string {
   return launchdLogsDir();
 }
 
-export function defaultPlistPath(): string {
-  return join(launchAgentsDir(), `${PHANTOMBOT_PLIST_LABEL}.plist`);
+export function defaultPlistPath(persona?: string): string {
+  return join(launchAgentsDir(), `${phantombotPlistLabel(persona)}.plist`);
 }
 
 /**
@@ -70,13 +98,13 @@ export function defaultPlistPath(): string {
  * baked into the plist's StandardOutPath/StandardErrorPath, so `phantombot
  * logs` tails the same files launchd writes.
  */
-export function launchdLogPaths(): { out: string; err: string } {
-  const base = join(logsDir(), PHANTOMBOT_PLIST_LABEL);
+export function launchdLogPaths(persona?: string): { out: string; err: string } {
+  const base = join(logsDir(), phantombotPlistLabel(persona));
   return { out: `${base}.out.log`, err: `${base}.err.log` };
 }
 
-export function heartbeatPlistPath(): string {
-  return join(launchAgentsDir(), `${HEARTBEAT_PLIST_LABEL}.plist`);
+export function heartbeatPlistPath(persona?: string): string {
+  return join(launchAgentsDir(), `${heartbeatPlistLabel(persona)}.plist`);
 }
 
 /** Path of the retired nightly plist (kept for cleanup only). */
@@ -84,8 +112,8 @@ export function nightlyPlistPath(): string {
   return join(launchAgentsDir(), `${NIGHTLY_PLIST_LABEL}.plist`);
 }
 
-export function tickPlistPath(): string {
-  return join(launchAgentsDir(), `${TICK_PLIST_LABEL}.plist`);
+export function tickPlistPath(persona?: string): string {
+  return join(launchAgentsDir(), `${tickPlistLabel(persona)}.plist`);
 }
 
 /**
@@ -118,6 +146,12 @@ interface BasePlistOptions {
   startCalendar?: { Hour?: number; Minute?: number; Weekday?: number };
   /** When true, sets RunAtLoad=true so the unit fires once on load (and again per StartInterval). */
   runAtLoad?: boolean;
+  /**
+   * Persona this agent serves, exported as PHANTOMBOT_PERSONA so the process
+   * resolves its config, state, database and tmp dir from `<persona>/` with no
+   * ambient default to get wrong.
+   */
+  persona: string;
 }
 
 function generatePlist(opts: BasePlistOptions): string {
@@ -173,6 +207,8 @@ function generatePlist(opts: BasePlistOptions): string {
   lines.push(`  <dict>`);
   lines.push(`    <key>PATH</key>`);
   lines.push(`    <string>${xmlEscape(pathValue)}</string>`);
+  lines.push(`    <key>PHANTOMBOT_PERSONA</key>`);
+  lines.push(`    <string>${xmlEscape(opts.persona)}</string>`);
   lines.push(`  </dict>`);
 
   // Logs: ~/Library/Logs/phantombot/<label>.{out,err}.log. Created on demand
@@ -204,12 +240,16 @@ export { quoteArg as _quoteArg };
 export interface LaunchdUnitParams {
   binPath: string;
   args: readonly string[];
+  /** Persona this agent serves. Defaults to the active persona. */
+  persona?: string;
 }
 
-/** Generate the always-on phantombot agent plist (Label dev.phantombot.phantombot). */
+/** Generate the always-on phantombot agent plist for one persona. */
 export function generatePhantombotPlist(params: LaunchdUnitParams): string {
+  const persona = params.persona ?? activePersona();
   return generatePlist({
-    label: PHANTOMBOT_PLIST_LABEL,
+    label: phantombotPlistLabel(persona),
+    persona,
     binPath: params.binPath,
     args: params.args,
     keepAlive: true,
@@ -218,9 +258,11 @@ export function generatePhantombotPlist(params: LaunchdUnitParams): string {
 }
 
 /** Generate the heartbeat plist — fires every 30 minutes. */
-export function generateHeartbeatPlist(binPath: string): string {
+export function generateHeartbeatPlist(binPath: string, personaName?: string): string {
+  const persona = personaName ?? activePersona();
   return generatePlist({
-    label: HEARTBEAT_PLIST_LABEL,
+    label: heartbeatPlistLabel(persona),
+    persona,
     binPath,
     args: ["heartbeat"],
     startIntervalSec: 30 * 60,
@@ -234,9 +276,11 @@ export function generateHeartbeatPlist(binPath: string): string {
  * the systemd timer cadence exactly so cron-style schedules behave the
  * same on both platforms.
  */
-export function generateTickPlist(binPath: string): string {
+export function generateTickPlist(binPath: string, personaName?: string): string {
+  const persona = personaName ?? activePersona();
   return generatePlist({
-    label: TICK_PLIST_LABEL,
+    label: tickPlistLabel(persona),
+    persona,
     binPath,
     args: ["tick"],
     startIntervalSec: 60,
@@ -317,17 +361,17 @@ export async function installPhantombotPlists(
   const plists: Array<{ path: string; label: string; body: string }> = [
     {
       path: mainPath,
-      label: PHANTOMBOT_PLIST_LABEL,
+      label: phantombotPlistLabel(),
       body: generatePhantombotPlist({ binPath: opts.binPath, args: ["run"] }),
     },
     {
       path: hbPath,
-      label: HEARTBEAT_PLIST_LABEL,
+      label: heartbeatPlistLabel(),
       body: generateHeartbeatPlist(opts.binPath),
     },
     {
       path: tkPath,
-      label: TICK_PLIST_LABEL,
+      label: tickPlistLabel(),
       body: generateTickPlist(opts.binPath),
     },
   ];
@@ -369,7 +413,7 @@ export async function installPhantombotPlists(
     opts.out.write(`removed retired plist: ${ngPath}\n`);
   }
   opts.out.write(
-    `bootstrapped ${PHANTOMBOT_PLIST_LABEL} + heartbeat + tick into ${domain}\n`,
+    `bootstrapped ${phantombotPlistLabel()} + heartbeat + tick into ${domain}\n`,
   );
   return { installed: true };
 }
@@ -396,10 +440,10 @@ export async function uninstallPhantombotPlists(
   const tkPath = opts.tickPlistPath ?? tickPlistPath();
 
   const labels = [
-    TICK_PLIST_LABEL,
+    tickPlistLabel(),
     NIGHTLY_PLIST_LABEL,
-    HEARTBEAT_PLIST_LABEL,
-    PHANTOMBOT_PLIST_LABEL,
+    heartbeatPlistLabel(),
+    phantombotPlistLabel(),
   ];
   // bootout each label (best-effort). A missing target returns non-zero
   // — that's fine, we just want it gone from the domain.
@@ -469,7 +513,7 @@ export async function ensurePlistCurrent(opts: {
   // Reload so launchd picks up the new plist body.
   await opts.launchctl.run([
     "bootout",
-    `${opts.domain}/${PHANTOMBOT_PLIST_LABEL}`,
+    `${opts.domain}/${phantombotPlistLabel()}`,
   ]);
   await opts.launchctl.run(["bootstrap", opts.domain, opts.plistPath]);
   return { rerendered: true, backupPath };
@@ -495,7 +539,7 @@ export function defaultLaunchdServiceControl(): LaunchdServiceControl {
       }
       const r = await runner.run([
         "print",
-        `${domain}/${PHANTOMBOT_PLIST_LABEL}`,
+        `${domain}/${phantombotPlistLabel()}`,
       ]);
       return r.exitCode === 0;
     },
@@ -506,7 +550,7 @@ export function defaultLaunchdServiceControl(): LaunchdServiceControl {
       } catch (e) {
         return { ok: false, stderr: (e as Error).message };
       }
-      const target = `${domain}/${PHANTOMBOT_PLIST_LABEL}`;
+      const target = `${domain}/${phantombotPlistLabel()}`;
       // Our main agent is KeepAlive=true, so `stop()` fully unloads it with
       // `bootout` (a mere SIGTERM would be relaunched). `start` is therefore
       // the inverse: if the agent is already loaded, `kickstart` (re)starts it;
@@ -538,7 +582,7 @@ export function defaultLaunchdServiceControl(): LaunchdServiceControl {
       } catch (e) {
         return { ok: false, stderr: (e as Error).message };
       }
-      const target = `${domain}/${PHANTOMBOT_PLIST_LABEL}`;
+      const target = `${domain}/${phantombotPlistLabel()}`;
       // KeepAlive=true means a plain `kill` would be relaunched immediately.
       // `bootout` unloads the agent from the domain so it stays stopped until
       // the next `start()`.
@@ -562,7 +606,7 @@ export function defaultLaunchdServiceControl(): LaunchdServiceControl {
       const r = await runner.run([
         "kickstart",
         "-k",
-        `${domain}/${PHANTOMBOT_PLIST_LABEL}`,
+        `${domain}/${phantombotPlistLabel()}`,
       ]);
       return r.exitCode === 0
         ? { ok: true }

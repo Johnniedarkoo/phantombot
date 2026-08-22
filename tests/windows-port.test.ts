@@ -10,12 +10,13 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { xdgConfigHome, xdgDataHome, xdgStateHome } from "../src/config.ts";
 import { currentPlatform } from "../src/lib/platform.ts";
 import { defaultLockPath } from "../src/lib/runLock.ts";
+import { ensurePersonaTmpDir } from "../src/lib/personaPaths.ts";
 import { isReadOnlyInvocation } from "../src/lib/cliInvocation.ts";
 
 /** Temporarily override process.platform for one synchronous assertion. */
@@ -99,10 +100,15 @@ describe("xdg* path resolvers on Windows", () => {
 });
 
 describe("defaultLockPath on Windows", () => {
-  test("falls back to per-user %TEMP% when XDG_RUNTIME_DIR is unset", () => {
+  test("falls back to the persona's own tmp dir when XDG_RUNTIME_DIR is unset", () => {
+    // Per persona since #435: a single %TEMP%\phantombot.run.lock let two
+    // personas in one Windows account fight over one daemon token, so persona
+    // B silently refused to start while A held it.
     withEnv({ XDG_RUNTIME_DIR: undefined }, () => {
       withPlatform("win32", () => {
-        expect(defaultLockPath()).toBe(join(tmpdir(), "phantombot.run.lock"));
+        expect(defaultLockPath()).toBe(
+          join(ensurePersonaTmpDir(), "phantombot.run.lock"),
+        );
       });
     });
   });

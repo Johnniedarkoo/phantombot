@@ -18,10 +18,10 @@ import {
   type LaunchctlResult,
   type LaunchctlRunner,
   uninstallPhantombotPlists,
-  PHANTOMBOT_PLIST_LABEL,
-  HEARTBEAT_PLIST_LABEL,
+  phantombotPlistLabel,
+  heartbeatPlistLabel,
   NIGHTLY_PLIST_LABEL,
-  TICK_PLIST_LABEL,
+  tickPlistLabel,
 } from "../src/lib/launchd.ts";
 
 class FakeLaunchctl implements LaunchctlRunner {
@@ -54,10 +54,10 @@ let tkPath: string;
 
 beforeEach(async () => {
   workdir = await mkdtemp(join(tmpdir(), "phantombot-launchd-"));
-  mainPath = join(workdir, `${PHANTOMBOT_PLIST_LABEL}.plist`);
-  hbPath = join(workdir, `${HEARTBEAT_PLIST_LABEL}.plist`);
+  mainPath = join(workdir, `${phantombotPlistLabel()}.plist`);
+  hbPath = join(workdir, `${heartbeatPlistLabel()}.plist`);
   ngPath = join(workdir, `${NIGHTLY_PLIST_LABEL}.plist`);
-  tkPath = join(workdir, `${TICK_PLIST_LABEL}.plist`);
+  tkPath = join(workdir, `${tickPlistLabel()}.plist`);
 });
 
 afterEach(async () => {
@@ -70,7 +70,7 @@ describe("generatePhantombotPlist", () => {
       binPath: "/Users/andrew/.local/bin/phantombot",
       args: ["run"],
     });
-    expect(plist).toContain(`<string>${PHANTOMBOT_PLIST_LABEL}</string>`);
+    expect(plist).toContain(`<string>${phantombotPlistLabel()}</string>`);
     expect(plist).toContain(
       "<string>/Users/andrew/.local/bin/phantombot</string>",
     );
@@ -111,10 +111,10 @@ describe("generatePhantombotPlist", () => {
       args: ["run"],
     });
     expect(plist).toContain(
-      `${PHANTOMBOT_PLIST_LABEL}.out.log`,
+      `${phantombotPlistLabel()}.out.log`,
     );
     expect(plist).toContain(
-      `${PHANTOMBOT_PLIST_LABEL}.err.log`,
+      `${phantombotPlistLabel()}.err.log`,
     );
   });
 });
@@ -122,7 +122,7 @@ describe("generatePhantombotPlist", () => {
 describe("companion plists carry the right schedule", () => {
   test("heartbeat fires every 30 minutes", () => {
     const plist = generateHeartbeatPlist("/usr/local/bin/phantombot");
-    expect(plist).toContain(`<string>${HEARTBEAT_PLIST_LABEL}</string>`);
+    expect(plist).toContain(`<string>${heartbeatPlistLabel()}</string>`);
     expect(plist).toContain("<string>heartbeat</string>");
     expect(plist).toContain("<key>StartInterval</key>");
     expect(plist).toContain("<integer>1800</integer>");
@@ -132,7 +132,7 @@ describe("companion plists carry the right schedule", () => {
 
   test("tick fires every 60 seconds", () => {
     const plist = generateTickPlist("/usr/local/bin/phantombot");
-    expect(plist).toContain(`<string>${TICK_PLIST_LABEL}</string>`);
+    expect(plist).toContain(`<string>${tickPlistLabel()}</string>`);
     expect(plist).toContain("<string>tick</string>");
     expect(plist).toContain("<key>StartInterval</key>");
     expect(plist).toContain("<integer>60</integer>");
@@ -171,9 +171,9 @@ describe("installPhantombotPlists", () => {
     // nightly agent, because its plist isn't on disk.
     const sequence = lc.calls.map((c) => c.join(" "));
     expect(sequence).toEqual([
-      `bootout gui/501/${PHANTOMBOT_PLIST_LABEL}`,
-      `bootout gui/501/${HEARTBEAT_PLIST_LABEL}`,
-      `bootout gui/501/${TICK_PLIST_LABEL}`,
+      `bootout gui/501/${phantombotPlistLabel()}`,
+      `bootout gui/501/${heartbeatPlistLabel()}`,
+      `bootout gui/501/${tickPlistLabel()}`,
       `bootstrap gui/501 ${mainPath}`,
       `bootstrap gui/501 ${hbPath}`,
       `bootstrap gui/501 ${tkPath}`,
@@ -260,10 +260,10 @@ describe("uninstallPhantombotPlists", () => {
     expect(result.removed).toBe(true);
 
     expect(lc.calls.map((c) => c.join(" "))).toEqual([
-      `bootout gui/501/${TICK_PLIST_LABEL}`,
+      `bootout gui/501/${tickPlistLabel()}`,
       `bootout gui/501/${NIGHTLY_PLIST_LABEL}`,
-      `bootout gui/501/${HEARTBEAT_PLIST_LABEL}`,
-      `bootout gui/501/${PHANTOMBOT_PLIST_LABEL}`,
+      `bootout gui/501/${heartbeatPlistLabel()}`,
+      `bootout gui/501/${phantombotPlistLabel()}`,
     ]);
     // All plists removed.
     expect(existsSync(mainPath)).toBe(false);
@@ -298,5 +298,30 @@ describe("uninstallPhantombotPlists", () => {
     expect(out.text).toContain("(no plist at");
     // bootout failures are logged but don't fail the uninstall.
     expect(out.text).toContain("returned 1 (continuing)");
+  });
+});
+
+describe("persona-scoped agents (#435)", () => {
+  test("two personas get different labels, so bootstrap/bootout cannot collide", () => {
+    // launchd keys everything — bootstrap, bootout, log paths — off the label,
+    // so the label IS the isolation boundary on macOS.
+    expect(phantombotPlistLabel("lena")).toBe("dev.phantombot.lena.phantombot");
+    expect(phantombotPlistLabel("kai")).not.toBe(phantombotPlistLabel("lena"));
+    expect(heartbeatPlistLabel("lena")).toBe("dev.phantombot.lena.heartbeat");
+    expect(tickPlistLabel("lena")).toBe("dev.phantombot.lena.tick");
+  });
+
+  test("a label with a path separator cannot escape the LaunchAgents directory", () => {
+    expect(phantombotPlistLabel("../evil")).toBe("dev.phantombot.___evil.phantombot");
+  });
+
+  test("the plist exports PHANTOMBOT_PERSONA so the agent resolves its own store", () => {
+    const plist = generatePhantombotPlist({
+      binPath: "/usr/local/bin/phantombot",
+      args: ["run"],
+      persona: "lena",
+    });
+    expect(plist).toContain("<key>PHANTOMBOT_PERSONA</key>");
+    expect(plist).toContain("<string>lena</string>");
   });
 });

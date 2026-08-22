@@ -60,8 +60,9 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { ensurePersonaTmpDir } from "./personaPaths.ts";
 
 export interface LockHandle {
   /** Path to the lock file. */
@@ -84,7 +85,11 @@ export function defaultLockPath(): string {
   // per-user %TEMP% (…\AppData\Local\Temp), which is already user-scoped, so a
   // single filename there won't collide across accounts the way /tmp would.
   if (process.platform === "win32") {
-    return join(tmpdir(), "phantombot.run.lock");
+    // Per persona (#435): a single %TEMP% filename let two personas in one
+    // Windows account fight over one daemon token, so persona B silently
+    // refused to start while persona A held it.
+    const dir = ensurePersonaTmpDir();
+    return join(dir, "phantombot.run.lock");
   }
   // No XDG_RUNTIME_DIR (e.g. a non-systemd login): fall back to a user-scoped
   // dir under $HOME, NOT /tmp (issue #365) — a full/quota'd tmpfs must never be

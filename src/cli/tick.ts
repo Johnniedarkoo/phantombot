@@ -37,7 +37,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 
-import { type Config, loadConfig, personaDir, xdgStateHome } from "../config.ts";
+import { type Config, loadConfig, personaDir } from "../config.ts";
 import { buildHarnessChain } from "../harnesses/buildChain.ts";
 import { resolveHarnessBinsForConfig } from "../lib/harnessAvailability.ts";
 import type { Harness, HarnessChunk } from "../harnesses/types.ts";
@@ -59,12 +59,15 @@ import {
   makeDurableFactPuller,
   makeFactExtractor,
 } from "../orchestrator/durableFacts.ts";
+import { personaRunDir } from "../lib/personaPaths.ts";
 
 const WAKE_STREAM_PREVIEW_CHARS = 2000;
 const BACKGROUND_WAKE_HARD_TIMEOUT_MS = 30 * 60 * 1000;
 
 export function defaultTickLockPath(): string {
-  return join(xdgStateHome(), "phantombot", "tick.lock");
+  // Per persona (#435). A host-wide tick lock meant persona B's scheduler
+  // silently skipped its run because persona A happened to be ticking.
+  return join(personaRunDir(), "tick.lock");
 }
 
 export interface RunTickInput {

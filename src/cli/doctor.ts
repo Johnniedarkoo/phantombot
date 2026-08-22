@@ -66,13 +66,13 @@ import {
   driftedUnitNames,
   ensureSystemdUnitsCurrent,
   ensureUserSystemdEnv,
-  HEARTBEAT_TIMER_NAME,
+  heartbeatTimerName,
   heartbeatServicePath,
   heartbeatTimerPath,
   phantombotUnitTargets,
   PHANTOMBOT_SERVICE_PATH,
   type SystemctlRunner,
-  TICK_TIMER_NAME,
+  tickTimerName,
   tickServicePath,
   tickTimerPath,
 } from "../lib/systemd.ts";
@@ -428,13 +428,13 @@ export async function runDoctor(input: RunDoctorInput = {}): Promise<number> {
       timersReport.heartbeat.stale &&
       timersReport.heartbeat.last_fired !== undefined
     ) {
-      staleTimerUnits.push(HEARTBEAT_TIMER_NAME);
+      staleTimerUnits.push(heartbeatTimerName());
     }
     if (
       timersReport.tick.stale &&
       timersReport.tick.last_fired !== undefined
     ) {
-      staleTimerUnits.push(TICK_TIMER_NAME);
+      staleTimerUnits.push(tickTimerName());
     }
   }
 
@@ -1080,7 +1080,7 @@ async function listInactiveTimers(
   // Two timers, not three: the nightly timer is retired (the sweep runs on
   // startup and on the heartbeat's day-rollover check), so an absent one is
   // correct rather than a fault to repair.
-  for (const t of [HEARTBEAT_TIMER_NAME, TICK_TIMER_NAME]) {
+  for (const t of [heartbeatTimerName(), tickTimerName()]) {
     const r = await systemctl.run(["--user", "is-active", t]);
     if (r.exitCode !== 0 || r.stdout.trim() !== "active") {
       out.push(t);
