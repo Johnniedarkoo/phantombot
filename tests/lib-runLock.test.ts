@@ -13,6 +13,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { ensurePersonaTmpDir } from "../src/lib/personaPaths.ts";
 import {
   acquireRunLock,
   defaultLockPath,
@@ -197,8 +198,13 @@ describe("defaultLockPath", () => {
     delete process.env.XDG_RUNTIME_DIR;
     try {
       if (process.platform === "win32") {
-        // Windows has no uid and no /tmp — the lock lives in per-user %TEMP%.
-        expect(defaultLockPath()).toBe(join(tmpdir(), "phantombot.run.lock"));
+        // Windows has no uid and no /tmp. Since #435 the lock lives in the
+        // PERSONA's own tmp dir, not per-user %TEMP%: a single shared filename
+        // there let two personas in one Windows account fight over one daemon
+        // token, so persona B silently refused to start while A held it.
+        expect(defaultLockPath()).toBe(
+          join(ensurePersonaTmpDir(), "phantombot.run.lock"),
+        );
       } else {
         // POSIX fallback is now under $HOME/.cache (never /tmp) so a full tmpfs
         // can't block the lock. Still per-user (keyed on uid).
