@@ -206,3 +206,104 @@ describe("migrateHostLayout", () => {
     expect(await readFile(join(personasDir, "kai", "config.toml"), "utf8")).toBe("# kai's own\n");
   });
 });
+
+describe("migrateHostLayout: the rollback boundary (#436)", () => {
+  /**
+   * The module promises a failure "leaves the old layout in place". Before #436
+   * that was only true for a failure on the FIRST step: the moves are sequential
+   * renames, so a throw partway through left `.env`, `state.json` and
+   * `memory.sqlite` already relocated while the startup wrapper logged a warning
+   * and carried on booting a half-migrated box.
+   *
+   * We force a failure late in the sequence by making the run-state directory
+   * unreadable, which throws inside step 4 — after the secrets and the database
+   * have already moved.
+   */
+  test("a failure after the first move puts EVERY moved file back", async () => {
+    await writeOldLayout();
+    const { chmodSync } = await import("node:fs");
+    // Step 4 reads this directory; 0o000 makes readdirSync throw for a non-root
+    // user, which is what a real mid-migration failure looks like.
+    chmodSync(oldStateDir, 0o000);
+    try {
+      expect(() => migrateHostLayout()).toThrow();
+    } finally {
+      chmodSync(oldStateDir, 0o700);
+    }
+
+    // Everything the migration had already moved is back where it started.
+    expect(existsSync(join(oldConfigDir, ".env"))).toBe(true);
+    expect(existsSync(join(oldDataDir, "state.json"))).toBe(true);
+    expect(existsSync(join(oldDataDir, "memory.sqlite"))).toBe(true);
+    expect(existsSync(join(personasDir, "lena", ".env"))).toBe(false);
+    expect(existsSync(join(personasDir, "lena", "state.json"))).toBe(false);
+    expect(existsSync(join(personasDir, "lena", "memory.sqlite"))).toBe(false);
+    // …including the per-persona config copies written in step 2.
+    expect(existsSync(join(personasDir, "lena", "config.toml"))).toBe(false);
+    expect(existsSync(join(personasDir, "kai", "config.toml"))).toBe(false);
+    // …and the migration is still pending rather than silently "done".
+    expect(needsMigration()).toBe(true);
+  });
+
+  test("the startup wrapper still never throws, and reports nothing migrated", async () => {
+    const { migrateHostLayoutAtStartup } = await import(
+      "../src/lib/hostLayoutMigrate.ts"
+    );
+    await writeOldLayout();
+    const { chmodSync } = await import("node:fs");
+    chmodSync(oldStateDir, 0o000);
+    try {
+      expect(migrateHostLayoutAtStartup()).toBeUndefined();
+    } finally {
+      chmodSync(oldStateDir, 0o700);
+    }
+    expect(existsSync(join(oldDataDir, "memory.sqlite"))).toBe(true);
+  });
+});
+
+describe("migrateHostLayout: personas_dir as a bootstrap input (#436)", () => {
+  /**
+   * `personas_dir` is stripped from the per-persona copies because it is global
+   * — but it also has to be READ, or a box with a custom root migrates nothing:
+   * we would list personas under the default root, find none, and report a
+   * successful no-op while the real personas keep the old layout.
+   */
+  test("a custom personas_dir in the old config is where personas are found", async () => {
+    const customRoot = join(workdir, "elsewhere", "personas");
+    await mkdir(join(customRoot, "lena"), { recursive: true });
+    await mkdir(oldConfigDir, { recursive: true });
+    await writeFile(
+      join(oldConfigDir, "config.toml"),
+      `default_persona = "lena"\npersonas_dir = "${customRoot}"\n\n[channels.telegram]\ntoken = "shared-token"\n`,
+      "utf8",
+    );
+    await writeFile(join(oldConfigDir, ".env"), "TTS_KEY=secret\n", "utf8");
+
+    const report = migrateHostLayout();
+
+    expect(report.personas).toContain("lena");
+    expect(existsSync(join(customRoot, "lena", "config.toml"))).toBe(true);
+    expect(existsSync(join(customRoot, "lena", ".env"))).toBe(true);
+    // The default root was never touched.
+    expect(existsSync(join(personasDir, "lena", "config.toml"))).toBe(false);
+    // And the operator is told the root only survives via the env var.
+    expect(report.notes.join(" ")).toContain("PHANTOMBOT_PERSONAS_DIR");
+  });
+
+  test("an explicit PHANTOMBOT_PERSONAS_DIR still wins over the old config key", async () => {
+    const customRoot = join(workdir, "elsewhere", "personas");
+    await mkdir(join(customRoot, "lena"), { recursive: true });
+    process.env.PHANTOMBOT_PERSONAS_DIR = personasDir;
+    await writeOldLayout();
+    await writeFile(
+      join(oldConfigDir, "config.toml"),
+      `default_persona = "lena"\npersonas_dir = "${customRoot}"\n`,
+      "utf8",
+    );
+
+    migrateHostLayout();
+
+    expect(existsSync(join(personasDir, "lena", "config.toml"))).toBe(true);
+    expect(existsSync(join(customRoot, "lena", "config.toml"))).toBe(false);
+  });
+});

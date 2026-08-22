@@ -12,8 +12,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
-import { ensurePersonaTmpDir } from "../src/lib/personaPaths.ts";
+import { dirname, join } from "node:path";
+import { ensurePersonaTmpDir, FALLBACK_PERSONA } from "../src/lib/personaPaths.ts";
 import {
   acquireRunLock,
   defaultLockPath,
@@ -186,7 +186,9 @@ describe("defaultLockPath", () => {
     try {
       // Build the expectation with the host's path.join so the separator is
       // correct on Windows too (XDG_RUNTIME_DIR still wins if it's set there).
-      expect(defaultLockPath()).toBe(join("/run/user/1003", "phantombot.run.lock"));
+      expect(defaultLockPath("robbie")).toBe(
+        join("/run/user/1003", "phantombot-robbie.run.lock"),
+      );
     } finally {
       if (saved === undefined) delete process.env.XDG_RUNTIME_DIR;
       else process.env.XDG_RUNTIME_DIR = saved;
@@ -202,19 +204,74 @@ describe("defaultLockPath", () => {
         // PERSONA's own tmp dir, not per-user %TEMP%: a single shared filename
         // there let two personas in one Windows account fight over one daemon
         // token, so persona B silently refused to start while A held it.
-        expect(defaultLockPath()).toBe(
-          join(ensurePersonaTmpDir(), "phantombot.run.lock"),
+        expect(defaultLockPath("robbie")).toBe(
+          join(ensurePersonaTmpDir("robbie"), "phantombot.run.lock"),
         );
       } else {
         // POSIX fallback is now under $HOME/.cache (never /tmp) so a full tmpfs
         // can't block the lock. Still per-user (keyed on uid).
         const uid = process.getuid?.() ?? 0;
-        expect(defaultLockPath()).toBe(
-          join(homedir(), ".cache", "phantombot", "run", `phantombot-${uid}.run.lock`),
+        expect(defaultLockPath("robbie")).toBe(
+          join(
+            homedir(),
+            ".cache",
+            "phantombot",
+            "run",
+            `phantombot-${uid}-robbie.run.lock`,
+          ),
         );
       }
     } finally {
       if (saved !== undefined) process.env.XDG_RUNTIME_DIR = saved;
+    }
+  });
+
+  // #436 blocker: the POSIX branches were per-USER while the Windows branch was
+  // per-persona, so two personas sharing one Linux account collided on one lock
+  // file and the second daemon refused to start — for two DIFFERENT bot tokens,
+  // which is the exact case #430's per-persona chains exist to serve. The lock
+  // scope has to be (user, persona) on every platform.
+  test("is per persona, not just per user, on both POSIX branches (#436)", () => {
+    const saved = process.env.XDG_RUNTIME_DIR;
+    try {
+      process.env.XDG_RUNTIME_DIR = "/run/user/1003";
+      expect(defaultLockPath("lena")).not.toBe(defaultLockPath("kai"));
+
+      delete process.env.XDG_RUNTIME_DIR;
+      if (process.platform !== "win32") {
+        expect(defaultLockPath("lena")).not.toBe(defaultLockPath("kai"));
+      }
+    } finally {
+      if (saved === undefined) delete process.env.XDG_RUNTIME_DIR;
+      else process.env.XDG_RUNTIME_DIR = saved;
+    }
+  });
+
+  // A persona name reaches this function straight from --persona/config, so it
+  // must never be able to escape the directory it is joined into.
+  test("sanitises a persona name that would escape the lock directory", () => {
+    const saved = process.env.XDG_RUNTIME_DIR;
+    process.env.XDG_RUNTIME_DIR = "/run/user/1003";
+    try {
+      const p = defaultLockPath("../../etc/evil");
+      expect(dirname(p)).toBe("/run/user/1003");
+      expect(p).not.toContain("..");
+    } finally {
+      if (saved === undefined) delete process.env.XDG_RUNTIME_DIR;
+      else process.env.XDG_RUNTIME_DIR = saved;
+    }
+  });
+
+  test("falls back to the built-in persona when the name sanitises to nothing", () => {
+    const saved = process.env.XDG_RUNTIME_DIR;
+    process.env.XDG_RUNTIME_DIR = "/run/user/1003";
+    try {
+      expect(defaultLockPath("///")).toBe(
+        join("/run/user/1003", `phantombot-${FALLBACK_PERSONA}.run.lock`),
+      );
+    } finally {
+      if (saved === undefined) delete process.env.XDG_RUNTIME_DIR;
+      else process.env.XDG_RUNTIME_DIR = saved;
     }
   });
 });

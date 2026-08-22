@@ -233,8 +233,8 @@ Service units also set a deterministic `PATH` that includes `~/.local/bin` plus 
 **Service log retention (`src/lib/logRotate.ts`, #428).** Only macOS and Windows
 need it: on Linux the units log to journald, which owns retention, so
 `serviceLogDir()` returns `null` there and rotation is a no-op. Everywhere else
-phantombot writes plain files (`~/Library/Logs/phantombot/`,
-`<data>/phantombot/logs/`) that nothing ever capped — one macOS box reached
+phantombot writes plain files (`<personas-root>/<persona>/logs/` on both since
+#436) that nothing ever capped — one macOS box reached
 ~700 MB. The **heartbeat** rotates them (every 30 min), because it is already
 the host maintenance pass that heals units and scheduled tasks, so this needs no
 new timer and inherits the same platform dispatch. Defaults are 16 MiB per file

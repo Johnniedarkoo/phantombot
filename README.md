@@ -422,7 +422,7 @@ phantombot logs --no-follow --lines 200   # dump the last 200 lines and exit
 
 **Log rotation.** On Linux the units log to journald, which applies its own
 retention. On macOS and Windows phantombot writes plain files
-(`~/Library/Logs/phantombot/`, `<data>/phantombot/logs/`), so the heartbeat
+(`<personas-root>/<persona>/logs/` on both since #436), so the heartbeat
 caps them every 30 minutes: any log over 16 MB is copied to `<name>.log.1` and
 truncated in place, keeping 3 generations (~64 MB per log, worst case).
 Override with `PHANTOMBOT_LOG_MAX_BYTES` and `PHANTOMBOT_LOG_KEEP`;

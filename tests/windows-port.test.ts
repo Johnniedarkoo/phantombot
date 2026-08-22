@@ -106,8 +106,8 @@ describe("defaultLockPath on Windows", () => {
     // B silently refused to start while A held it.
     withEnv({ XDG_RUNTIME_DIR: undefined }, () => {
       withPlatform("win32", () => {
-        expect(defaultLockPath()).toBe(
-          join(ensurePersonaTmpDir(), "phantombot.run.lock"),
+        expect(defaultLockPath("robbie")).toBe(
+          join(ensurePersonaTmpDir("robbie"), "phantombot.run.lock"),
         );
       });
     });
@@ -116,7 +116,9 @@ describe("defaultLockPath on Windows", () => {
   test("XDG_RUNTIME_DIR still wins if somehow set", () => {
     withEnv({ XDG_RUNTIME_DIR: "R:\\run" }, () => {
       withPlatform("win32", () => {
-        expect(defaultLockPath()).toBe(join("R:\\run", "phantombot.run.lock"));
+        expect(defaultLockPath("robbie")).toBe(
+          join("R:\\run", "phantombot-robbie.run.lock"),
+        );
       });
     });
   });

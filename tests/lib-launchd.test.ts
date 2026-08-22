@@ -22,7 +22,9 @@ import {
   heartbeatPlistLabel,
   NIGHTLY_PLIST_LABEL,
   tickPlistLabel,
+  launchdLogPaths,
 } from "../src/lib/launchd.ts";
+import { personaLogDir } from "../src/lib/personaPaths.ts";
 
 class FakeLaunchctl implements LaunchctlRunner {
   calls: string[][] = [];
@@ -105,7 +107,29 @@ describe("generatePhantombotPlist", () => {
     expect(plist).toContain("/opt/homebrew/bin");
   });
 
-  test("logs go to ~/Library/Logs/phantombot/<label>.{out,err}.log", () => {
+  /**
+   * #436: logs were the last host-global thing left on macOS
+   * (~/Library/Logs/phantombot), so two personas in one account interleaved
+   * their output in a directory neither owned — and outside the tree an
+   * operator backs up or wipes when retiring a persona. Windows already used
+   * personaLogDir; macOS now matches.
+   */
+  test("logs live inside the PERSONA's dir, not host-global ~/Library/Logs", () => {
+    const plist = generatePhantombotPlist({
+      binPath: "/Users/andrew/.local/bin/phantombot",
+      args: ["run"],
+      persona: "lena",
+    });
+    expect(plist).toContain(join(personaLogDir("lena"), phantombotPlistLabel("lena")));
+    expect(plist).not.toContain(join("Library", "Logs", "phantombot"));
+    expect(launchdLogPaths("lena").out).toBe(
+      join(personaLogDir("lena"), `${phantombotPlistLabel("lena")}.out.log`),
+    );
+    // Two personas never share a log file.
+    expect(launchdLogPaths("lena").out).not.toBe(launchdLogPaths("kai").out);
+  });
+
+  test("logs go to <persona>/logs/<label>.{out,err}.log", () => {
     const plist = generatePhantombotPlist({
       binPath: "/Users/andrew/.local/bin/phantombot",
       args: ["run"],

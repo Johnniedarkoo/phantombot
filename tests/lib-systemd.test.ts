@@ -1015,6 +1015,96 @@ describe("persona-scoped units (#435)", () => {
     expect(unit).not.toContain(".config/phantombot/.env");
   });
 
+  /**
+   * #436: RETIRED_UNIT_NAMES was exported and asserted on, but NOTHING consumed
+   * it — `removeRetiredUnits` only ever swept the two nightly paths. So an
+   * upgraded box kept its pre-#435 host-global `phantombot.service` enabled and
+   * running, racing the new persona-scoped unit for the run lock: precisely the
+   * two-daemons bug #435 exists to end, reintroduced by the migration itself.
+   */
+  test("the sweep actually deletes the pre-#435 host-global units", async () => {
+    const { removeRetiredUnits, retiredUnitPaths } = await import(
+      "../src/lib/systemd.ts"
+    );
+    for (const p of retiredUnitPaths(workdir)) {
+      await writeFile(p, "stale unit\n", "utf8");
+    }
+    const sys = new FakeSystemctl();
+
+    const removed = await removeRetiredUnits(sys, retiredUnitPaths(workdir));
+
+    expect(removed).toContain("phantombot.service");
+    expect(removed).toContain("phantombot-heartbeat.timer");
+    expect(removed).toContain("phantombot-tick.service");
+    for (const p of retiredUnitPaths(workdir)) {
+      expect(existsSync(p)).toBe(false);
+    }
+    // A retired .service can be RUNNING, so it is stopped and disabled before
+    // its file is deleted — not just unlinked out from under a live daemon.
+    const flat = sys.calls.map((c) => c.join(" "));
+    expect(flat).toContain("--user stop phantombot.service");
+    expect(flat).toContain("--user disable phantombot.service");
+  });
+
+  test("the sweep leaves the units we DO install alone", async () => {
+    const { removeRetiredUnits, retiredUnitPaths } = await import(
+      "../src/lib/systemd.ts"
+    );
+    const live = join(workdir, "phantombot-phantom.service");
+    await writeFile(live, "live unit\n", "utf8");
+    await writeFile(join(workdir, "phantombot.service"), "stale\n", "utf8");
+
+    await removeRetiredUnits(new FakeSystemctl(), retiredUnitPaths(workdir));
+
+    expect(existsSync(live)).toBe(true);
+  });
+
+  /**
+   * #436: the unit hard-coded `%h/.local/share/phantombot/personas`, so on a box
+   * with PHANTOMBOT_PERSONAS_DIR set the service sourced a .env that does not
+   * exist AND resolved a different personas root than the operator's shell —
+   * silently running a different (usually empty) persona.
+   */
+  test("a custom PHANTOMBOT_PERSONAS_DIR is baked into the unit", async () => {
+    const saved = process.env.PHANTOMBOT_PERSONAS_DIR;
+    process.env.PHANTOMBOT_PERSONAS_DIR = "/srv/phantom/personas";
+    try {
+      const unit = generateSystemdUnit({
+        binPath: "/usr/local/bin/phantombot",
+        args: ["run"],
+        persona: "lena",
+      });
+      expect(unit).toContain(
+        'Environment="PHANTOMBOT_PERSONAS_DIR=/srv/phantom/personas"',
+      );
+      expect(unit).toContain(
+        "EnvironmentFile=-/srv/phantom/personas/lena/.env",
+      );
+      expect(unit).not.toContain("%h/.local/share/phantombot/personas");
+    } finally {
+      if (saved === undefined) delete process.env.PHANTOMBOT_PERSONAS_DIR;
+      else process.env.PHANTOMBOT_PERSONAS_DIR = saved;
+    }
+  });
+
+  test("the default root still uses systemd's %h escape and no extra Environment line", () => {
+    const saved = process.env.PHANTOMBOT_PERSONAS_DIR;
+    delete process.env.PHANTOMBOT_PERSONAS_DIR;
+    try {
+      const unit = generateSystemdUnit({
+        binPath: "/usr/local/bin/phantombot",
+        args: ["run"],
+        persona: "lena",
+      });
+      expect(unit).toContain(
+        "EnvironmentFile=-%h/.local/share/phantombot/personas/lena/.env",
+      );
+      expect(unit).not.toContain("PHANTOMBOT_PERSONAS_DIR");
+    } finally {
+      if (saved !== undefined) process.env.PHANTOMBOT_PERSONAS_DIR = saved;
+    }
+  });
+
   test("the pre-#435 shared units are on the retired list so an upgrade removes them", () => {
     // Two daemons on one persona — the old unit and the new one — would race
     // for the run lock, which is exactly the bug #435 exists to end.

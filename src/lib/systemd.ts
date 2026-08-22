@@ -10,7 +10,7 @@ import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { isPhantombotBinary } from "./binaryIdentity.ts";
-import { activePersona, FALLBACK_PERSONA } from "./personaPaths.ts";
+import { activePersona, dataHome, FALLBACK_PERSONA, personasRoot } from "./personaPaths.ts";
 import type { WriteSink } from "./io.ts";
 
 /**
@@ -100,13 +100,37 @@ export const RETIRED_UNIT_NAMES = [
  * harnesses inherit, so the agent finds credentials without re-reading
  * the file.
  */
+/** The default personas root, expressed with systemd's `%h` home escape. */
+const DEFAULT_PERSONAS_ROOT_UNIT = "%h/.local/share/phantombot/personas";
+
+/**
+ * Where THIS install keeps its personas, and whether that is the default.
+ *
+ * The unit used to hard-code `%h/.local/share/phantombot/personas` (#436): on a
+ * box with PHANTOMBOT_PERSONAS_DIR set, the service then sourced a `.env` that
+ * does not exist and — worse — the daemon it started resolved a DIFFERENT
+ * personas root from the one the operator's shell uses, so the service ran a
+ * different (usually empty) persona. When the root is custom we bake it into
+ * the unit as an Environment= line so the service and the shell agree.
+ */
+function personasRootForUnit(): { path: string; isDefault: boolean } {
+  const actual = personasRoot();
+  const fallback = join(dataHome(), "phantombot", "personas");
+  if (!process.env.PHANTOMBOT_PERSONAS_DIR && actual === fallback) {
+    return { path: DEFAULT_PERSONAS_ROOT_UNIT, isDefault: true };
+  }
+  return { path: actual, isDefault: false };
+}
+
 function environmentFileLines(persona: string): string {
   // `%h` is systemd's escape for the user's home. The persona .env is written
   // by `phantombot voice` and friends; `~/.env` stays supported as the user's
   // own general-purpose file. Leading `-` makes both optional.
+  const root = personasRootForUnit();
   return (
     `Environment="PHANTOMBOT_PERSONA=${persona}"\n` +
-    `EnvironmentFile=-%h/.local/share/phantombot/personas/${persona}/.env\n` +
+    (root.isDefault ? "" : `Environment="PHANTOMBOT_PERSONAS_DIR=${root.path}"\n`) +
+    `EnvironmentFile=-${root.path}/${persona}/.env\n` +
     "EnvironmentFile=-%h/.env"
   );
 }
@@ -790,9 +814,20 @@ export interface EnsureUnitsCurrentResult {
  * systemctl that fails on an already-absent unit is expected, not an error.
  * Returns the basenames actually deleted, so callers only log on real cleanup.
  */
+/**
+ * Every unit file phantombot no longer installs, in `dir` (defaults to the real
+ * systemd --user directory; tests pass a tmpdir). This is the ONLY consumer of
+ * RETIRED_UNIT_NAMES — the list was inert before #436, which meant a pre-#435
+ * host-global `phantombot.service` stayed enabled and racing the new
+ * persona-scoped unit for the run lock after an upgrade.
+ */
+export function retiredUnitPaths(dir: string = unitDir()): string[] {
+  return RETIRED_UNIT_NAMES.map((name) => join(dir, name));
+}
+
 export async function removeRetiredUnits(
   systemctl: SystemctlRunner,
-  paths: readonly string[] = [nightlyTimerPath(), nightlyServicePath()],
+  paths: readonly string[] = retiredUnitPaths(),
 ): Promise<string[]> {
   const present = paths.filter((p) => existsSync(p));
   // Nothing on disk → nothing systemd can run, so skip the IPC entirely. This
@@ -800,7 +835,13 @@ export async function removeRetiredUnits(
   // because the heal path runs on every heartbeat.
   if (present.length === 0) return [];
 
-  for (const unit of RETIRED_TIMER_NAMES) {
+  // Stop AND disable every retired name — services included, not just timers.
+  // A retired .service can be RUNNING (the pre-#435 `phantombot.service` is a
+  // long-lived daemon); deleting its unit file without stopping it first leaves
+  // the process alive holding the run lock until the next reboot.
+  const presentNames = new Set(present.map((p) => basename(p)));
+  for (const unit of RETIRED_UNIT_NAMES) {
+    if (!presentNames.has(unit)) continue;
     await systemctl.run(["--user", "stop", unit]);
     await systemctl.run(["--user", "disable", unit]);
   }
@@ -825,9 +866,17 @@ export async function ensureSystemdUnitsCurrent(
   // Sweep away units we no longer install (currently the 02:00 nightly timer)
   // before reconciling the ones we do. Cheap, and it means a box heals itself
   // on the next heartbeat instead of needing a reinstall.
+  // Retired names live beside the nightly ones, so deriving the directory from
+  // the (test-overridable) nightly path keeps the whole sweep inside a tmpdir
+  // under test while covering the real unit dir in production.
+  const nightlyTimer = opts.nightlyTimerPath ?? nightlyTimerPath();
+  const nightlyService = opts.nightlyServicePath ?? nightlyServicePath();
   const removedRetired = await removeRetiredUnits(opts.systemctl, [
-    opts.nightlyTimerPath ?? nightlyTimerPath(),
-    opts.nightlyServicePath ?? nightlyServicePath(),
+    ...new Set([
+      nightlyTimer,
+      nightlyService,
+      ...retiredUnitPaths(dirname(nightlyTimer)),
+    ]),
   ]);
 
   const rewrote: string[] = [];
@@ -936,9 +985,17 @@ export async function installPhantombotUnit(
   }
 
   // Reinstalling over an older layout: drop the retired 02:00 nightly timer.
+  // Retired names live beside the nightly ones, so deriving the directory from
+  // the (test-overridable) nightly path keeps the whole sweep inside a tmpdir
+  // under test while covering the real unit dir in production.
+  const nightlyTimer = opts.nightlyTimerPath ?? nightlyTimerPath();
+  const nightlyService = opts.nightlyServicePath ?? nightlyServicePath();
   const removedRetired = await removeRetiredUnits(opts.systemctl, [
-    opts.nightlyTimerPath ?? nightlyTimerPath(),
-    opts.nightlyServicePath ?? nightlyServicePath(),
+    ...new Set([
+      nightlyTimer,
+      nightlyService,
+      ...retiredUnitPaths(dirname(nightlyTimer)),
+    ]),
   ]);
   for (const name of removedRetired) {
     opts.out.write(`removed retired unit: ${name}\n`);

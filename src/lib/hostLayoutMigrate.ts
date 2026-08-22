@@ -30,8 +30,21 @@
  *
  * Nothing is deleted. The old directories are RENAMED to
  * `<name>.pre-435-<timestamp>`, so a bad migration is undone by renaming them
- * back. Everything is best-effort: a failure logs and leaves the old layout in
- * place rather than half-migrating and taking the box down.
+ * back.
+ *
+ * ── The rollback boundary (#436) ──
+ * "Leaves the old layout in place" has to be TRUE, not aspirational. The moves
+ * are sequential renames of `.env`, `state.json`, `memory.sqlite`, logs and
+ * run-state; a failure partway through used to leave the secrets and the
+ * database already moved while the caller logged a warning and carried on
+ * booting against a half-migrated box. So every mutation is recorded in an
+ * UNDO JOURNAL as it succeeds, and any throw rolls the whole migration back in
+ * reverse order before rethrowing. The outcome is all-or-nothing: either the
+ * box is on the new layout, or it is exactly where it started.
+ *
+ * Rollback is itself best-effort — if undoing a rename ALSO fails we cannot do
+ * better than say so loudly, so each failed undo is logged with both paths and
+ * collected into the thrown error, which is the one case a human has to look at.
  */
 
 import {
@@ -40,6 +53,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -124,18 +138,61 @@ function readTopLevelString(toml: string, key: string): string | undefined {
 }
 
 /** Rename a path out of the way. Returns the new name, or undefined if absent. */
-function archive(path: string, stamp: string): string | undefined {
+function archive(path: string, stamp: string, journal?: MigrationJournal): string | undefined {
   if (!existsSync(path)) return undefined;
   const dest = `${path}.pre-435-${stamp}`;
   renameSync(path, dest);
+  journal?.record(() => {
+    if (existsSync(dest) && !existsSync(path)) renameSync(dest, path);
+  });
   return dest;
 }
 
-/** Move a file or directory if the source exists and the destination does not. */
-function moveIfAbsent(from: string, to: string): boolean {
+/**
+ * Undo journal: every mutation the migration makes, in the order it made them,
+ * paired with the inverse operation. `rollback()` replays the inverses in
+ * REVERSE order, which matters — a directory has to be put back before the
+ * file that was moved out of it.
+ */
+export interface MigrationJournal {
+  record: (undo: () => void) => void;
+  rollback: () => string[];
+  size: () => number;
+}
+
+export function createJournal(): MigrationJournal {
+  const undos: Array<() => void> = [];
+  return {
+    record: (undo) => {
+      undos.push(undo);
+    },
+    size: () => undos.length,
+    rollback: () => {
+      const failures: string[] = [];
+      for (let i = undos.length - 1; i >= 0; i--) {
+        try {
+          undos[i]!();
+        } catch (e) {
+          failures.push((e as Error).message);
+        }
+      }
+      undos.length = 0;
+      return failures;
+    },
+  };
+}
+
+/**
+ * Move a file or directory if the source exists and the destination does not.
+ * Records the inverse rename so a later failure can put it back.
+ */
+function moveIfAbsent(from: string, to: string, journal?: MigrationJournal): boolean {
   if (!existsSync(from) || existsSync(to)) return false;
   mkdirSync(join(to, ".."), { recursive: true });
   renameSync(from, to);
+  journal?.record(() => {
+    if (existsSync(to) && !existsSync(from)) renameSync(to, from);
+  });
   return true;
 }
 
@@ -172,7 +229,7 @@ export function needsMigration(): boolean {
   );
 }
 
-export function migrateHostLayout(): MigrationReport {
+function runMigration(journal: MigrationJournal): MigrationReport {
   const report: MigrationReport = {
     migrated: false,
     personas: [],
@@ -182,10 +239,26 @@ export function migrateHostLayout(): MigrationReport {
   if (!needsMigration()) return report;
 
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const root = personasRoot();
-  const personas = listPersonas(root);
   const oldConfigPath = join(legacyConfigDir(), "config.toml");
   const hostToml = existsSync(oldConfigPath) ? readFileSync(oldConfigPath, "utf8") : "";
+
+  // A custom `personas_dir` in the OLD host config is a BOOTSTRAP input, not a
+  // key to throw away: strip it from the per-persona copies (it is global), but
+  // read it first, or a box with a non-default root migrates nothing — we would
+  // look for personas under the default root, find none, and report success on
+  // an empty box. PHANTOMBOT_PERSONAS_DIR still wins when it is already set.
+  const legacyRoot = readTopLevelString(hostToml, "personas_dir");
+  if (legacyRoot && !process.env.PHANTOMBOT_PERSONAS_DIR) {
+    process.env.PHANTOMBOT_PERSONAS_DIR = legacyRoot;
+    journal.record(() => {
+      delete process.env.PHANTOMBOT_PERSONAS_DIR;
+    });
+    report.notes.push(
+      `personas root taken from the old config's personas_dir (${legacyRoot}) — set PHANTOMBOT_PERSONAS_DIR in the environment (the service unit bakes it) or phantombot will look under ${join(dataHome(), "phantombot", "personas")} next boot`,
+    );
+  }
+  const root = personasRoot();
+  const personas = listPersonas(root);
 
   // 1. Global file first, so `activePersona()` resolves correctly for every
   //    path computed below. The old default came from state.json (which wins)
@@ -200,10 +273,19 @@ export function migrateHostLayout(): MigrationReport {
     /* no old state file, or unreadable — fall through to the config */
   }
   defaultPersona ??= readTopLevelString(hostToml, "default_persona");
-  if (defaultPersona) setGlobalConfigValue("default_persona", defaultPersona);
-
   const updateChannel = readTopLevelString(hostToml, "update_channel");
-  if (updateChannel) setGlobalConfigValue("update_channel", updateChannel);
+  if (defaultPersona || updateChannel) {
+    // One restore point for the whole global file: capture it (or its absence)
+    // before the first write, so rollback puts back exactly what was there.
+    const gpath = globalConfigPath();
+    const before = existsSync(gpath) ? readFileSync(gpath, "utf8") : undefined;
+    journal.record(() => {
+      if (before === undefined) rmSync(gpath, { force: true });
+      else writeFileSync(gpath, before, "utf8");
+    });
+    if (defaultPersona) setGlobalConfigValue("default_persona", defaultPersona);
+    if (updateChannel) setGlobalConfigValue("update_channel", updateChannel);
+  }
 
   // 2. The host config, verbatim-minus-global-keys, into every persona that
   //    does not already have one of its own.
@@ -223,6 +305,7 @@ export function migrateHostLayout(): MigrationReport {
       if (existsSync(dest)) continue;
       mkdirSync(personaRoot(persona), { recursive: true });
       writeFileSync(dest, header + body, "utf8");
+      journal.record(() => rmSync(dest, { force: true }));
       report.personas.push(persona);
       report.migrated = true;
     }
@@ -243,7 +326,7 @@ export function migrateHostLayout(): MigrationReport {
       [join(legacyDataDir(), "inbox"), join(personaRunDir(target), "inbox")],
     ];
     for (const [from, to] of moves) {
-      if (moveIfAbsent(from, to)) report.migrated = true;
+      if (moveIfAbsent(from, to, journal)) report.migrated = true;
     }
     // SQLite side files travel with their database or the next open sees a
     // truncated WAL and loses the tail of the journal.
@@ -251,6 +334,7 @@ export function migrateHostLayout(): MigrationReport {
       moveIfAbsent(
         join(legacyDataDir(), `memory.sqlite${suffix}`),
         join(personaRoot(target), `memory.sqlite${suffix}`),
+        journal,
       );
     }
     for (const other of personas) {
@@ -265,7 +349,7 @@ export function migrateHostLayout(): MigrationReport {
     if (existsSync(oldState)) {
       mkdirSync(personaRunDir(target), { recursive: true });
       for (const entry of readdirSync(oldState)) {
-        moveIfAbsent(join(oldState, entry), join(personaRunDir(target), entry));
+        moveIfAbsent(join(oldState, entry), join(personaRunDir(target), entry), journal);
       }
       report.migrated = true;
     }
@@ -286,6 +370,7 @@ export function migrateHostLayout(): MigrationReport {
       moveIfAbsent(
         join(oldIndexDir, file),
         join(personaRoot(persona), `memory-index.sqlite${m[2] ?? ""}`),
+        journal,
       );
     }
     report.migrated = true;
@@ -295,7 +380,7 @@ export function migrateHostLayout(): MigrationReport {
   if (report.migrated) {
     for (const dir of [legacyConfigDir(), legacyStateDir(), oldIndexDir]) {
       try {
-        const dest = archive(dir, stamp);
+        const dest = archive(dir, stamp, journal);
         if (dest) report.archived.push(dest);
       } catch (e) {
         log.warn("host-layout migration: could not archive a legacy directory", {
@@ -307,6 +392,34 @@ export function migrateHostLayout(): MigrationReport {
   }
 
   return report;
+}
+
+/**
+ * Run the migration as ONE transaction. Any throw rolls back every mutation
+ * made so far — config copies, the global file, and every rename — and then
+ * rethrows, so the caller's "leave the old layout in place" promise is real.
+ */
+export function migrateHostLayout(): MigrationReport {
+  const journal = createJournal();
+  try {
+    return runMigration(journal);
+  } catch (e) {
+    const failures = journal.rollback();
+    if (failures.length > 0) {
+      log.error("host-layout migration rollback INCOMPLETE — inspect by hand", {
+        error: (e as Error).message,
+        rollbackFailures: failures,
+      });
+      throw new Error(
+        `host-layout migration failed (${(e as Error).message}) and rollback did not fully complete: ` +
+          failures.join("; "),
+      );
+    }
+    log.warn("host-layout migration rolled back; the box is on the old layout", {
+      error: (e as Error).message,
+    });
+    throw e;
+  }
 }
 
 /**

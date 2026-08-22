@@ -32,7 +32,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { isPhantombotBinary } from "./binaryIdentity.ts";
 import type { WriteSink } from "./io.ts";
-import { activePersona, FALLBACK_PERSONA } from "./personaPaths.ts";
+import { activePersona, FALLBACK_PERSONA, personaLogDir } from "./personaPaths.ts";
 
 /**
  * Labels are PERSONA-SCOPED since #435 — `dev.phantombot.<persona>.phantombot`
@@ -80,12 +80,17 @@ function launchAgentsDir(): string {
  * Directory launchd writes every unit's stdout/stderr into. Exported so the
  * log-rotation pass (#428) can cap the files launchd itself never rotates.
  */
-export function launchdLogsDir(): string {
-  return join(homedir(), "Library", "Logs", "phantombot");
+export function launchdLogsDir(persona?: string): string {
+  // Per persona (#436), matching Windows (taskLogsDir -> personaLogDir) and the
+  // rest of the boundary: logs are persona state, and the pre-#436 host-global
+  // ~/Library/Logs/phantombot left two personas' output interleaved in one dir
+  // that no persona owned — and outside the tree an operator backs up or wipes
+  // when they retire a persona.
+  return personaLogDir(persona);
 }
 
-function logsDir(): string {
-  return launchdLogsDir();
+function logsDir(persona?: string): string {
+  return launchdLogsDir(persona);
 }
 
 export function defaultPlistPath(persona?: string): string {
@@ -99,7 +104,7 @@ export function defaultPlistPath(persona?: string): string {
  * logs` tails the same files launchd writes.
  */
 export function launchdLogPaths(persona?: string): { out: string; err: string } {
-  const base = join(logsDir(), phantombotPlistLabel(persona));
+  const base = join(logsDir(persona), phantombotPlistLabel(persona));
   return { out: `${base}.out.log`, err: `${base}.err.log` };
 }
 
@@ -213,7 +218,7 @@ function generatePlist(opts: BasePlistOptions): string {
 
   // Logs: ~/Library/Logs/phantombot/<label>.{out,err}.log. Created on demand
   // by launchd; we just point at them.
-  const logBase = join(logsDir(), opts.label);
+  const logBase = join(logsDir(opts.persona), opts.label);
   lines.push(`  <key>StandardOutPath</key>`);
   lines.push(`  <string>${xmlEscape(logBase + ".out.log")}</string>`);
   lines.push(`  <key>StandardErrorPath</key>`);
