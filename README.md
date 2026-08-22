@@ -472,21 +472,47 @@ Common paths:
 | `~/.local/share/phantombot/personas/<name>/.env` | That persona's runtime secrets, such as voice provider keys |
 | `~/.local/share/phantombot/personas/<name>/memory.sqlite` | That persona's rolling turns, tasks, capture log |
 | `~/.local/share/phantombot/personas/<name>/{run,logs,tmp}/` | Locks and markers, logs, and temp files — including every subprocess's `TMPDIR` |
-| `~/.local/share/phantombot/personas/config.toml` | The **only** global file: `default_persona` and `update_channel` |
+| `~/.local/share/phantombot/personas/config.toml` | The global file: `default_persona` and `update_channel` (plus `personas_dir` on boxes with a custom root — see below) |
 | `~/.env` | General credentials available to the harness |
 
-Two things, and only two, sit outside a persona directory. The global file
-above, because *which* persona you mean cannot itself be a persona setting and
+Two kinds of thing, and only two, sit outside a persona directory. The global
+file above, because *which* persona you mean cannot itself be a persona setting and
 because there is one binary per box (so personas cannot follow different release
 rings). And the service definitions — systemd user units, launchd plists,
 Windows scheduled tasks — because the OS insists on owning those; each is named
 for one persona and pins `PHANTOMBOT_PERSONA`.
 
+### Moving the personas root
+
+`PHANTOMBOT_PERSONAS_DIR` puts the whole root somewhere else. A file *inside*
+the root cannot tell you where the root is, so a box that does this needs one
+durable pointer outside it: `personas_dir` in the config file at the **default**
+root (`~/.local/share/phantombot/personas/config.toml`, or
+`PHANTOMBOT_GLOBAL_CONFIG` if you pinned one). That file is a bootstrap stub —
+the real global file still lives at `<custom-root>/config.toml`. Resolution
+order is:
+
+1. `PHANTOMBOT_PERSONAS_DIR` — wins over everything, and is baked into the
+   service definitions on a custom-root box so daemons agree with your shell.
+2. `personas_dir` in the file at the default root. A value equal to the default
+   root is ignored, so the pointer can never loop back on itself.
+3. The default root.
+
+You do not normally write this by hand: upgrading a pre-#435 box whose host
+config set `personas_dir` writes it for you, because the old host config gets
+archived and, without the pointer, the next fresh process (a service restart, a
+cron `phantombot tick`) would silently resolve the default root and boot a
+different config.
+
 Upgrading from an older layout needs no action: the first run after the upgrade
 moves `~/.config/phantombot/` and the shared state/data directories into the
 persona directories, renames the originals to `*.pre-435-<timestamp>` rather
 than deleting them, and copies the old host config verbatim into every persona
-so behaviour is unchanged. The shared database, secrets and logs follow the
+so behaviour is unchanged. The services rename themselves too, unattended: the
+half-hourly heartbeat (and `phantombot update` right after the binary swap)
+installs the per-persona units and boots out the retired host-global ones on all
+three platforms, so you do not have to rerun `phantombot install` to get
+`start`, `restart`, `status` and `logs` pointing at a live service again. The shared database, secrets and logs follow the
 persona that was using them (the default one); the others start with an empty
 task database, which the migration logs rather than hiding.
 

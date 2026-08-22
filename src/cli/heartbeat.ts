@@ -29,7 +29,12 @@ import {
   rotateServiceLogs,
   type RotateLogDirResult,
 } from "../lib/logRotate.ts";
-import { currentPlatform } from "../lib/platform.ts";
+import {
+  BunLaunchctlRunner,
+  ensureLaunchdAgentsCurrent,
+  guiDomain,
+} from "../lib/launchd.ts";
+import { currentPlatform, type Platform } from "../lib/platform.ts";
 import { openMemoryStore } from "../memory/store.ts";
 import { flushDueConversationTurns } from "../orchestrator/turnIndexer.ts";
 import {
@@ -323,13 +328,70 @@ async function defaultEmbedNotes(
  * platform without a backend.
  */
 async function defaultHealService(persona?: string): Promise<void> {
-  switch (currentPlatform()) {
+  const heal = healHandlerFor(currentPlatform());
+  if (!heal) return; // unsupported hosts
+  return heal(persona);
+}
+
+/**
+ * The service-manager self-heal for one platform, or null where phantombot
+ * installs no units. Exported so a test can assert the dispatch itself —
+ * macOS was silently a no-op here before #436, which is precisely how an
+ * upgraded Mac ended up with only the retired host-global agents loaded.
+ */
+export function healHandlerFor(
+  platform: Platform,
+): ((persona?: string) => Promise<void>) | null {
+  switch (platform) {
     case "linux":
-      return defaultHealSystemd();
+      return () => defaultHealSystemd();
     case "windows":
-      return defaultHealTaskScheduler(persona);
+      return (persona) => defaultHealTaskScheduler(persona);
+    case "darwin":
+      return (persona) => defaultHealLaunchd(persona);
     default:
-      return; // macOS (launchd self-heals via KeepAlive) and unsupported hosts
+      return null;
+  }
+}
+
+/**
+ * macOS analogue of `defaultHealSystemd`: rewrite any drifted plist, bootstrap
+ * any scoped agent that is not loaded, and bootout + delete the retired
+ * pre-#435 host-global agents.
+ *
+ * Before #436 this branch was a no-op on the theory that KeepAlive makes
+ * launchd self-healing. KeepAlive only restarts an agent that is ALREADY
+ * loaded — it cannot install one under a new label. Since the labels are now
+ * persona-scoped, an upgraded Mac that never reruns `phantombot install` would
+ * otherwise keep only the old shared agents loaded while every command targets
+ * the new label. Only fires when we ARE the compiled binary, so a dev
+ * `bun src/index.ts` run never rewrites plists.
+ */
+async function defaultHealLaunchd(persona?: string): Promise<void> {
+  const binPath = process.execPath;
+  if (!isPhantombotBinary(binPath)) return;
+  let domain: string;
+  try {
+    domain = guiDomain();
+  } catch {
+    return; // no uid (shouldn't happen on macOS) — nothing to reconcile
+  }
+  const r = await ensureLaunchdAgentsCurrent({
+    binPath,
+    persona,
+    domain,
+    launchctl: new BunLaunchctlRunner(),
+  });
+  if (
+    r.rewrote.length > 0 ||
+    r.reloaded.length > 0 ||
+    r.removedRetired.length > 0
+  ) {
+    log.info("heartbeat: healed launchd agents", {
+      rewrote: r.rewrote,
+      reloaded: r.reloaded,
+      removedRetired: r.removedRetired,
+    });
   }
 }
 

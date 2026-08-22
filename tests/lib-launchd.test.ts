@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import {
+  ensureLaunchdAgentsCurrent,
   generateHeartbeatPlist,
   generatePhantombotPlist,
   generateTickPlist,
@@ -385,5 +386,181 @@ describe("persona-scoped agents (#435)", () => {
     });
     expect(plist).toContain("<key>PHANTOMBOT_PERSONA</key>");
     expect(plist).toContain("<string>lena</string>");
+  });
+});
+
+
+/**
+ * Fake launchctl that models the gui domain: which labels are loaded, so
+ * `print` can answer truthfully and `bootstrap`/`bootout` mutate it. The
+ * plain FakeLaunchctl above always exits 0, which cannot distinguish "already
+ * loaded" from "never loaded" — the exact state the post-upgrade reconcile
+ * turns on.
+ */
+class DomainLaunchctl implements LaunchctlRunner {
+  calls: string[][] = [];
+  loaded: Set<string>;
+  constructor(loaded: string[] = []) {
+    this.loaded = new Set(loaded);
+  }
+  async run(args: readonly string[]): Promise<LaunchctlResult> {
+    this.calls.push([...args]);
+    const ok = { exitCode: 0, stdout: "", stderr: "" };
+    const fail = { exitCode: 3, stdout: "", stderr: "No such process" };
+    const [verb, a, b] = args;
+    const labelOf = (target?: string) => (target ?? "").split("/").pop() ?? "";
+    if (verb === "print") return this.loaded.has(labelOf(a)) ? ok : fail;
+    if (verb === "bootout") {
+      const label = labelOf(a);
+      if (!this.loaded.has(label)) return fail;
+      this.loaded.delete(label);
+      return ok;
+    }
+    if (verb === "bootstrap") {
+      // b is a plist path; its basename minus .plist is the label.
+      const label = (b ?? "").split("/").pop()?.replace(/\.plist$/, "") ?? "";
+      this.loaded.add(label);
+      return ok;
+    }
+    return ok;
+  }
+  get callLines(): string[] {
+    return this.calls.map((c) => c.join(" "));
+  }
+}
+
+describe("ensureLaunchdAgentsCurrent (unattended macOS reconcile)", () => {
+  const BIN = "/Users/andrew/.local/bin/phantombot";
+  const overrides = () => ({
+    plistPath: mainPath,
+    heartbeatPlistPath: hbPath,
+    tickPlistPath: tkPath,
+    nightlyPlistPath: ngPath,
+  });
+
+  test("post-upgrade box with only pre-#435 agents ends up scoped and clean, with no reinstall", async () => {
+    // Exactly the shape of a Mac that upgraded in place: the three legacy
+    // host-global agents are loaded and on disk, and NOTHING under the new
+    // persona-scoped labels exists. This is the state `phantombot update`
+    // leaves behind, and the reason restart/logs broke until #436.
+    const dir = dirname(ngPath);
+    const legacy = RETIRED_PLIST_LABELS.map((l) => join(dir, `${l}.plist`));
+    for (const p of legacy) await Bun.write(p, "<plist>old</plist>");
+    const lc = new DomainLaunchctl([...RETIRED_PLIST_LABELS]);
+
+    const r = await ensureLaunchdAgentsCurrent({
+      binPath: BIN,
+      domain: "gui/501",
+      launchctl: lc,
+      ...overrides(),
+    });
+
+    // Scoped plists written AND actually live in the domain.
+    for (const p of [mainPath, hbPath, tkPath]) expect(existsSync(p)).toBe(true);
+    for (const label of [
+      phantombotPlistLabel(),
+      heartbeatPlistLabel(),
+      tickPlistLabel(),
+    ]) {
+      expect(lc.loaded.has(label)).toBe(true);
+      expect(r.reloaded).toContain(label);
+    }
+    // Nothing pre-#435 left loaded or on disk.
+    for (const label of RETIRED_PLIST_LABELS) {
+      expect(lc.loaded.has(label)).toBe(false);
+      expect(lc.callLines).toContain(`bootout gui/501/${label}`);
+    }
+    for (const p of legacy) expect(existsSync(p)).toBe(false);
+    expect(r.removedRetired.length).toBe(RETIRED_PLIST_LABELS.length);
+    expect(r.rewrote.length).toBe(3);
+  });
+
+  test("is idempotent: a healthy box is neither rewritten nor reloaded", async () => {
+    await Bun.write(mainPath, generatePhantombotPlist({ binPath: BIN, args: ["run"] }));
+    await Bun.write(hbPath, generateHeartbeatPlist(BIN));
+    await Bun.write(tkPath, generateTickPlist(BIN));
+    const lc = new DomainLaunchctl([
+      phantombotPlistLabel(),
+      heartbeatPlistLabel(),
+      tickPlistLabel(),
+    ]);
+
+    const r = await ensureLaunchdAgentsCurrent({
+      binPath: BIN,
+      domain: "gui/501",
+      launchctl: lc,
+      ...overrides(),
+    });
+
+    expect(r.rewrote).toEqual([]);
+    expect(r.reloaded).toEqual([]);
+    expect(r.removedRetired).toEqual([]);
+    expect(lc.callLines.some((c) => c.startsWith("bootstrap"))).toBe(false);
+  });
+
+  test("a plist left over from an older binary is rewritten and reloaded", async () => {
+    await Bun.write(mainPath, generatePhantombotPlist({ binPath: "/old/phantombot", args: ["run"] }));
+    await Bun.write(hbPath, generateHeartbeatPlist(BIN));
+    await Bun.write(tkPath, generateTickPlist(BIN));
+    const lc = new DomainLaunchctl([
+      phantombotPlistLabel(),
+      heartbeatPlistLabel(),
+      tickPlistLabel(),
+    ]);
+
+    const r = await ensureLaunchdAgentsCurrent({
+      binPath: BIN,
+      domain: "gui/501",
+      launchctl: lc,
+      ...overrides(),
+    });
+
+    expect(r.rewrote).toEqual([`${phantombotPlistLabel()}.plist`]);
+    expect(r.reloaded).toEqual([phantombotPlistLabel()]);
+    expect(await readFile(mainPath, "utf8")).toContain(`<string>${BIN}</string>`);
+    expect(existsSync(`${mainPath}.bak`)).toBe(true);
+  });
+
+  test("a scoped plist that is on disk but not loaded gets bootstrapped", async () => {
+    // The reinstall-less upgrade path can leave a correct plist that launchd
+    // has never been told about; only `print` distinguishes it from healthy.
+    await Bun.write(mainPath, generatePhantombotPlist({ binPath: BIN, args: ["run"] }));
+    await Bun.write(hbPath, generateHeartbeatPlist(BIN));
+    await Bun.write(tkPath, generateTickPlist(BIN));
+    const lc = new DomainLaunchctl([heartbeatPlistLabel(), tickPlistLabel()]);
+
+    const r = await ensureLaunchdAgentsCurrent({
+      binPath: BIN,
+      domain: "gui/501",
+      launchctl: lc,
+      ...overrides(),
+    });
+
+    expect(r.rewrote).toEqual([]);
+    expect(r.reloaded).toEqual([phantombotPlistLabel()]);
+    expect(lc.loaded.has(phantombotPlistLabel())).toBe(true);
+  });
+
+  test("scoped agents are live BEFORE the retired ones are booted out", async () => {
+    // Ordering matters: sweeping the old daemon first would leave a window
+    // (and, if a bootstrap fails, a permanent state) with no daemon at all.
+    const dir = dirname(ngPath);
+    for (const l of RETIRED_PLIST_LABELS) {
+      await Bun.write(join(dir, `${l}.plist`), "<plist>old</plist>");
+    }
+    const lc = new DomainLaunchctl([...RETIRED_PLIST_LABELS]);
+    await ensureLaunchdAgentsCurrent({
+      binPath: BIN,
+      domain: "gui/501",
+      launchctl: lc,
+      ...overrides(),
+    });
+    const lines = lc.callLines;
+    const lastBootstrap = lines.findLastIndex((c) => c.startsWith("bootstrap"));
+    const firstLegacyBootout = lines.findIndex((c) =>
+      RETIRED_PLIST_LABELS.some((l) => c === `bootout gui/501/${l}`),
+    );
+    expect(lastBootstrap).toBeGreaterThan(-1);
+    expect(firstLegacyBootout).toBeGreaterThan(lastBootstrap);
   });
 });

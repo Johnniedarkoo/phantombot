@@ -29,7 +29,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { isPhantombotBinary } from "./binaryIdentity.ts";
 import type { WriteSink } from "./io.ts";
 import { activePersona, FALLBACK_PERSONA, personaLogDir } from "./personaPaths.ts";
@@ -399,6 +399,54 @@ export interface InstallLaunchdOptions {
   err: WriteSink;
 }
 
+/** One launchd agent phantombot installs: where it lives, its label, its body. */
+export interface PhantombotPlistTarget {
+  path: string;
+  label: string;
+  body: string;
+}
+
+/** Optional per-plist path overrides (tests keep writes inside a tmpdir). */
+export interface PhantombotPlistPathOverrides {
+  plistPath?: string;
+  heartbeatPlistPath?: string;
+  tickPlistPath?: string;
+  /** Retired nightly path — never generated, only used to anchor cleanup. */
+  nightlyPlistPath?: string;
+}
+
+/**
+ * Canonical (path, label, body) tuples for every agent phantombot installs.
+ *
+ * Single source of truth shared by `installPhantombotPlists` (writes them
+ * fresh) and `ensureLaunchdAgentsCurrent` (rewrites whatever drifted), the
+ * launchd analogue of `phantombotUnitTargets` in systemd.ts — and for the same
+ * reason: two copies of the same list drift.
+ */
+export function phantombotPlistTargets(
+  binPath: string,
+  persona?: string,
+  overrides: PhantombotPlistPathOverrides = {},
+): PhantombotPlistTarget[] {
+  return [
+    {
+      path: overrides.plistPath ?? defaultPlistPath(persona),
+      label: phantombotPlistLabel(persona),
+      body: generatePhantombotPlist({ binPath, args: ["run"], persona }),
+    },
+    {
+      path: overrides.heartbeatPlistPath ?? heartbeatPlistPath(persona),
+      label: heartbeatPlistLabel(persona),
+      body: generateHeartbeatPlist(binPath, persona),
+    },
+    {
+      path: overrides.tickPlistPath ?? tickPlistPath(persona),
+      label: tickPlistLabel(persona),
+      body: generateTickPlist(binPath, persona),
+    },
+  ];
+}
+
 /**
  * Write the three plists, then bootstrap each into the user's gui domain.
  *
@@ -417,23 +465,11 @@ export async function installPhantombotPlists(
   const ngPath = opts.nightlyPlistPath ?? nightlyPlistPath();
   const tkPath = opts.tickPlistPath ?? tickPlistPath();
 
-  const plists: Array<{ path: string; label: string; body: string }> = [
-    {
-      path: mainPath,
-      label: phantombotPlistLabel(),
-      body: generatePhantombotPlist({ binPath: opts.binPath, args: ["run"] }),
-    },
-    {
-      path: hbPath,
-      label: heartbeatPlistLabel(),
-      body: generateHeartbeatPlist(opts.binPath),
-    },
-    {
-      path: tkPath,
-      label: tickPlistLabel(),
-      body: generateTickPlist(opts.binPath),
-    },
-  ];
+  const plists = phantombotPlistTargets(opts.binPath, undefined, {
+    plistPath: mainPath,
+    heartbeatPlistPath: hbPath,
+    tickPlistPath: tkPath,
+  });
 
   // Make sure the logs dir exists — launchd will refuse to start the
   // service if StandardOutPath/StandardErrorPath point at a non-existent
@@ -578,6 +614,93 @@ export async function ensurePlistCurrent(opts: {
   ]);
   await opts.launchctl.run(["bootstrap", opts.domain, opts.plistPath]);
   return { rerendered: true, backupPath };
+}
+
+export interface EnsureLaunchdAgentsOptions extends PhantombotPlistPathOverrides {
+  binPath: string;
+  /** Persona these agents serve. Defaults to the active persona. */
+  persona?: string;
+  domain: string;
+  launchctl: LaunchctlRunner;
+}
+
+export interface EnsureLaunchdAgentsResult {
+  /** Plist filenames whose body was (re)written. */
+  rewrote: string[];
+  /** Backups taken of drifted plists before overwriting. */
+  backups: string[];
+  /** Labels booted out + bootstrapped (rewritten, missing, or not loaded). */
+  reloaded: string[];
+  /** Retired plist paths deleted. */
+  removedRetired: string[];
+}
+
+/**
+ * Idempotently reconcile the macOS agents: make every persona-scoped plist
+ * match the running binary's templates, make sure each is actually loaded in
+ * the gui domain, and bootout + delete every retired (pre-#435) agent.
+ *
+ * This is the launchd analogue of `ensureSystemdUnitsCurrent`, and #436 is why
+ * it exists. Renaming the labels per persona means an upgraded Mac would keep
+ * only the OLD host-global agents loaded while `start`/`restart`/`status`/
+ * `logs` all target the NEW label — restart and diagnostics break until the
+ * operator manually reruns `phantombot install`. Wiring this into the
+ * unattended heal path (the heartbeat) means an upgrade needs no action, which
+ * is what README promises.
+ *
+ * Best-effort per agent: a bootout of something that was never loaded exits
+ * non-zero and that is fine.
+ */
+export async function ensureLaunchdAgentsCurrent(
+  opts: EnsureLaunchdAgentsOptions,
+): Promise<EnsureLaunchdAgentsResult> {
+  const targets = phantombotPlistTargets(opts.binPath, opts.persona, opts);
+
+  const rewrote: string[] = [];
+  const backups: string[] = [];
+  const reloaded: string[] = [];
+
+  // launchd refuses to start an agent whose StandardOutPath directory does not
+  // exist, so create it before anything is bootstrapped.
+  await mkdir(logsDir(opts.persona), { recursive: true });
+
+  for (const t of targets) {
+    let current: string | undefined;
+    if (existsSync(t.path)) current = await readFile(t.path, "utf8");
+    const drifted = current !== t.body;
+    if (drifted) {
+      await mkdir(dirname(t.path), { recursive: true });
+      if (current !== undefined) {
+        const bak = `${t.path}.bak`;
+        await writeFile(bak, current, "utf8");
+        backups.push(bak);
+      }
+      await writeFile(t.path, t.body, "utf8");
+      rewrote.push(basename(t.path));
+    }
+    // Reload when the body changed, and also when the agent simply is not in
+    // the domain — the post-rename upgrade case, where the plist we just wrote
+    // (or an install wrote) is correct on disk but nothing has ever loaded it.
+    const loaded = await opts.launchctl.run([
+      "print",
+      `${opts.domain}/${t.label}`,
+    ]);
+    if (!drifted && loaded.exitCode === 0) continue;
+    await opts.launchctl.run(["bootout", `${opts.domain}/${t.label}`]);
+    const r = await opts.launchctl.run(["bootstrap", opts.domain, t.path]);
+    if (r.exitCode === 0) reloaded.push(t.label);
+  }
+
+  // Only now sweep the old identities: the scoped agents are live first, so a
+  // failure midway can never leave the box with no daemon at all.
+  const removedRetired = await removeRetiredPlists({
+    domain: opts.domain,
+    launchctl: opts.launchctl,
+    out: { write: () => {} },
+    dir: dirname(opts.nightlyPlistPath ?? nightlyPlistPath()),
+  });
+
+  return { rewrote, backups, reloaded, removedRetired };
 }
 
 /**
