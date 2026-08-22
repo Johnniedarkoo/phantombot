@@ -254,7 +254,9 @@ describe("defaultLockPath", () => {
     process.env.XDG_RUNTIME_DIR = "/run/user/1003";
     try {
       const p = defaultLockPath("../../etc/evil");
-      expect(dirname(p)).toBe("/run/user/1003");
+      // Compare against a host-joined path: on Windows `dirname` normalises
+      // the separators, so a literal "/run/user/1003" would not match.
+      expect(dirname(p)).toBe(dirname(join("/run/user/1003", "x")));
       expect(p).not.toContain("..");
     } finally {
       if (saved === undefined) delete process.env.XDG_RUNTIME_DIR;
