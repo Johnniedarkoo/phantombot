@@ -8,7 +8,11 @@
 import { defineCommand } from "citty";
 import * as p from "@clack/prompts";
 
-import { type Config, loadConfig } from "../config.ts";
+import { existsSync } from "node:fs";
+
+import { type Config, loadConfig, personaDir } from "../config.ts";
+import type { WriteSink } from "../lib/io.ts";
+import { personaConfigPath } from "../lib/personaConfig.ts";
 import { setIn, updateConfigToml } from "../lib/configWriter.ts";
 import { defaultEnvFilePath, updateEnvFile } from "../lib/envFile.ts";
 import { defaultServiceControl, type ServiceControl } from "../lib/platform.ts";
@@ -69,6 +73,13 @@ export async function applyVoiceConfig(input: ApplyVoiceInput): Promise<void> {
 }
 
 interface RunInput {
+  /**
+   * Persona to configure (phantombot#439). Voice is persona-scoped — each
+   * phantom gets its own voice — so the settings are written to
+   * `<personas-root>/<persona>/config.toml`, not to the host's global file.
+   * Defaults to the host's default persona.
+   */
+  persona?: string;
   config?: Config;
   serviceControl?: ServiceControl;
   /**
@@ -81,10 +92,33 @@ interface RunInput {
    *     service afterwards, so there is nothing running to restart yet).
    */
   embedded?: boolean;
+  /** Error sink (test seam). Default: process.stderr. */
+  err?: WriteSink;
 }
 
 export async function runVoice(input: RunInput = {}): Promise<number> {
-  const config = input.config ?? (await loadConfig());
+  const err = input.err ?? process.stderr;
+  // Load the TARGET persona's layered config, so "Existing config" shows what
+  // that persona actually runs with rather than the default persona's voice.
+  const config = input.config ?? (await loadConfig(input.persona));
+  const persona = input.persona ?? config.defaultPersona;
+  // An explicit `--persona` must EXIST before anything is written. Without
+  // this check a typo is silently "successful": `loadConfig("robbei")` reads a
+  // missing persona file as an empty layer, and the writes below CREATE
+  // `<personas-root>/robbei/config.toml` (and its directory), store the
+  // provider credential and restart the service — for a persona that does not
+  // exist and never runs. `task --persona` already refuses this class of
+  // silent loss; so does this.
+  const dir = personaDir(config, persona);
+  if (!existsSync(dir)) {
+    err.write(`no persona '${persona}' at ${dir}\n`);
+    return 2;
+  }
+  // Writes land in the persona's own file. The global file is left alone: on
+  // an unmigrated host it still holds the old `[voice]` block, and the merge
+  // has the persona file winning, so the new value takes effect immediately
+  // and a rollback to an older binary still finds a working global block.
+  const voiceConfigPath = personaConfigPath(config.personasDir, persona);
   const svc = input.serviceControl ?? defaultServiceControl();
   const embedded = input.embedded ?? false;
 
@@ -129,7 +163,7 @@ export async function runVoice(input: RunInput = {}): Promise<number> {
 
   if (provider === "none") {
     await applyVoiceConfig({
-      configPath: config.configPath,
+      configPath: voiceConfigPath,
       envPath: defaultEnvFilePath(),
       voice: { provider: "none" },
     });
@@ -142,16 +176,17 @@ export async function runVoice(input: RunInput = {}): Promise<number> {
   }
 
   if (provider === "elevenlabs")
-    return runElevenLabsFlow(config, svc, existing, embedded);
+    return runElevenLabsFlow(voiceConfigPath, svc, existing, embedded);
   if (provider === "openai")
-    return runOpenAIFlow(config, svc, existing, embedded);
+    return runOpenAIFlow(voiceConfigPath, svc, existing, embedded);
   if (provider === "azure_edge")
-    return runAzureEdgeFlow(config, svc, existing, embedded);
+    return runAzureEdgeFlow(voiceConfigPath, svc, existing, embedded);
   return 0;
 }
 
 async function runElevenLabsFlow(
-  config: Config,
+  /** The persona config file these settings are written to. */
+  voiceConfigPath: string,
   svc: ServiceControl,
   existing: VoiceConfig,
   embedded: boolean,
@@ -195,7 +230,7 @@ async function runElevenLabsFlow(
   }
 
   await applyVoiceConfig({
-    configPath: config.configPath,
+    configPath: voiceConfigPath,
     envPath: defaultEnvFilePath(),
     apiKey: key as string,
     voice: {
@@ -225,7 +260,8 @@ async function runElevenLabsFlow(
 }
 
 async function runOpenAIFlow(
-  config: Config,
+  /** The persona config file these settings are written to. */
+  voiceConfigPath: string,
   svc: ServiceControl,
   existing: VoiceConfig,
   embedded: boolean,
@@ -272,7 +308,7 @@ async function runOpenAIFlow(
   }
 
   await applyVoiceConfig({
-    configPath: config.configPath,
+    configPath: voiceConfigPath,
     envPath: defaultEnvFilePath(),
     apiKey: key as string,
     voice: {
@@ -299,7 +335,8 @@ async function runOpenAIFlow(
 }
 
 async function runAzureEdgeFlow(
-  config: Config,
+  /** The persona config file these settings are written to. */
+  voiceConfigPath: string,
   svc: ServiceControl,
   existing: VoiceConfig,
   embedded: boolean,
@@ -316,7 +353,7 @@ async function runAzureEdgeFlow(
   }
 
   await applyVoiceConfig({
-    configPath: config.configPath,
+    configPath: voiceConfigPath,
     envPath: defaultEnvFilePath(),
     voice: {
       provider: "azure_edge",
@@ -359,7 +396,17 @@ export default defineCommand({
     description:
       "Configure TTS / STT provider (ElevenLabs / OpenAI / Azure Edge). Validates the API key before saving.",
   },
-  async run() {
-    process.exitCode = await runVoice();
+  args: {
+    persona: {
+      type: "string",
+      required: false,
+      description:
+        "Persona to configure voice for. Defaults to the host's default persona.",
+    },
+  },
+  async run({ args }) {
+    process.exitCode = await runVoice({
+      persona: args.persona as string | undefined,
+    });
   },
 });

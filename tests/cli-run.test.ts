@@ -11,6 +11,7 @@ import { join } from "node:path";
 import {
   armShutdownWatchdog,
   planListeners,
+  selectPhantomchatPersonas,
   runRun,
   SHUTDOWN_GRACE_MS,
 } from "../src/cli/run.ts";
@@ -304,6 +305,75 @@ describe("runRun — multi-persona telegram", () => {
     expect(chains.amanda).toEqual(["claude", "codex"]);
   });
 
+  test("a LEGACY-routed persona gets its OWN resolved config, not the default's", async () => {
+    // phantombot#439 round 2: `autostart_personas` is not the only road to a
+    // second listener — a host still routing through
+    // `[channels.telegram.personas.amanda]` gets one too, and a listener with
+    // no resolved config silently runs on the DEFAULT persona's harness chain,
+    // voice, chattiness and timeouts. Migration seeds amanda's config.toml, so
+    // the run wiring must resolve it.
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    await mkdir(join(workdir, "personas", "amanda"), { recursive: true });
+    await writeFile(join(workdir, "personas", "amanda", "BOOT.md"), "# Amanda");
+    await writeFile(
+      join(workdir, "personas", "amanda", "config.toml"),
+      'chattiness = true\n',
+      "utf8",
+    );
+    const asked: string[] = [];
+    const chains: Record<string, string[]> = {};
+
+    const code = await runRun({
+      config: {
+        ...config,
+        harnesses: {
+          ...config.harnesses,
+          chain: ["codex"],
+          codex: { bin: "codex", model: "" },
+        },
+        channels: {
+          telegram: { token: "default-tok", pollTimeoutS: 30, allowedUserIds: [] },
+          telegramPersonas: {
+            amanda: { token: "amanda-tok", pollTimeoutS: 30, allowedUserIds: [] },
+          },
+        },
+      },
+      lockPath: join(workdir, "run.lock"),
+      checkHarnesses: false,
+      loadPersonaConfig: async (name) => {
+        asked.push(name);
+        return {
+          ...config,
+          harnesses: {
+            ...config.harnesses,
+            chain: ["claude"],
+            claude: { ...config.harnesses.claude, bin: "claude" },
+          },
+          channels: {
+            telegramPersonas: {
+              amanda: {
+                token: "amanda-tok",
+                pollTimeoutS: 30,
+                allowedUserIds: [],
+              },
+            },
+          },
+        } as typeof config;
+      },
+      runTelegramServer: async (input) => {
+        chains[input.persona] = input.harnesses.map((h) => h.id);
+      },
+      out,
+      err,
+    });
+
+    expect(code).toBe(0);
+    expect(asked).toContain("amanda");
+    expect(chains.amanda).toEqual(["claude"]);
+    expect(chains.phantom).toEqual(["codex"]);
+  });
+
   test("fails startup when a telegram persona override has no usable harness", async () => {
     const out = new CaptureStream();
     const err = new CaptureStream();
@@ -421,6 +491,238 @@ describe("runRun — multi-persona telegram", () => {
     // Tokens are all distinct (the duplicate-token guard didn't trip).
     const tokens = plan.listeners.map((l) => l.account.token);
     expect(new Set(tokens).size).toBe(3);
+  });
+
+  test("runRun seeds the default persona's config file, idempotently (#439)", async () => {
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const globalPath = join(workdir, "config.toml");
+    const globalText =
+      'default_persona = "phantom"\nchattiness = false\n\n' +
+      '[channels.telegram]\ntoken = "tok"\n';
+    await writeFile(globalPath, globalText, "utf8");
+    const personaPath = join(workdir, "personas", "phantom", "config.toml");
+
+    const run = () =>
+      runRun({
+        config: {
+          ...config,
+          // Empty chain → exits at the harness guard, AFTER migration.
+          harnesses: { ...config.harnesses, chain: [] },
+          channels: {
+            telegram: { token: "tok", pollTimeoutS: 30, allowedUserIds: [] },
+          },
+        },
+        lockPath: join(workdir, "run.lock"),
+        out,
+        err,
+      });
+
+    expect(await run()).toBe(2);
+    const seeded = await readFile(personaPath, "utf8");
+    expect(seeded).toContain("tok");
+    expect(seeded).toContain("chattiness");
+    // The global file is untouched — an older binary must still boot.
+    expect(await readFile(globalPath, "utf8")).toBe(globalText);
+
+    // Second start over the already-seeded file changes nothing at all:
+    // /update is order-independent and re-running is free.
+    expect(await run()).toBe(2);
+    expect(await readFile(personaPath, "utf8")).toBe(seeded);
+
+    // A hand edit is preserved, and only the keys the file OMITS are filled
+    // back in — a partial file (e.g. one `phantombot voice --persona` wrote
+    // before the first restart) must not leave the persona half-migrated.
+    await writeFile(personaPath, 'chattiness = true\n', "utf8");
+    expect(await run()).toBe(2);
+    const reseeded = await readFile(personaPath, "utf8");
+    expect(reseeded).toContain("chattiness = true");
+    expect(reseeded).toContain("tok");
+  });
+
+  // --- autostart personas (phantombot#439) ---------------------------------
+
+  async function givePersona(name: string) {
+    await mkdir(join(workdir, "personas", name), { recursive: true });
+    await writeFile(join(workdir, "personas", name, "BOOT.md"), `# ${name}`);
+  }
+
+  function personaConfigWithBot(_name: string, token: string): Config {
+    return {
+      ...config,
+      channels: {
+        telegram: { token, pollTimeoutS: 30, allowedUserIds: [] },
+      },
+    };
+  }
+
+  test("selectPhantomchatPersonas gates on the explicit boot roster", () => {
+    const err = new CaptureStream();
+    const specs = [
+      { persona: "phantom" },
+      { persona: "lena" },
+      { persona: "imported" },
+    ];
+
+    // An explicit roster is the whole truth: an imported/restored identity
+    // that merely EXISTS on disk must never start talking to the world.
+    const gated = selectPhantomchatPersonas(
+      specs,
+      { autostartPersonas: ["lena"] },
+      "phantom",
+      err,
+    );
+    expect(gated.map((s) => s.persona)).toEqual(["phantom", "lena"]);
+    expect(err.text).toContain("imported");
+    expect(err.text).toContain("autostart_personas");
+  });
+
+  test("no autostart_personas key = every configured identity still starts", () => {
+    const err = new CaptureStream();
+    const specs = [{ persona: "phantom" }, { persona: "lena" }];
+    // Upgrade safety: a host that has never been told what to start keeps
+    // exactly today's behaviour rather than silently losing a channel.
+    const ungated = selectPhantomchatPersonas(
+      specs,
+      { autostartPersonas: undefined },
+      "phantom",
+      err,
+    );
+    expect(ungated).toEqual(specs);
+    expect(err.text).toBe("");
+  });
+
+  test("planListeners starts an autostart persona from its OWN config", async () => {
+    const err = new CaptureStream();
+    await givePersona("lena");
+
+    const plan = planListeners(
+      {
+        ...config,
+        autostartPersonas: ["lena"],
+        channels: {
+          telegram: { token: "default-tok", pollTimeoutS: 30, allowedUserIds: [] },
+        },
+      },
+      "phantom",
+      err,
+      new Map([["lena", personaConfigWithBot("lena", "lena-tok")]]),
+    );
+
+    expect(plan.fatal).toBeUndefined();
+    expect(plan.listeners).toHaveLength(2);
+    expect(plan.listeners[1]).toMatchObject({
+      persona: "lena",
+      source: "autostart.lena",
+      account: { token: "lena-tok" },
+    });
+    // The listener carries its own config so its turns run with its settings.
+    expect(plan.listeners[1]!.config?.channels.telegram?.token).toBe("lena-tok");
+  });
+
+  test("listing the default persona in autostart does NOT start it twice", async () => {
+    const err = new CaptureStream();
+    const plan = planListeners(
+      {
+        ...config,
+        autostartPersonas: ["phantom"],
+        channels: {
+          telegram: { token: "default-tok", pollTimeoutS: 30, allowedUserIds: [] },
+        },
+      },
+      "phantom",
+      err,
+      new Map([["phantom", personaConfigWithBot("phantom", "default-tok")]]),
+    );
+    expect(plan.fatal).toBeUndefined();
+    expect(plan.listeners).toHaveLength(1);
+  });
+
+  test("a migrated persona in BOTH its own file and the legacy table starts once", async () => {
+    const err = new CaptureStream();
+    await givePersona("lena");
+    // This is exactly the post-migration shape: copy-not-delete leaves the bot
+    // described in the legacy table AND in lena's own config file.
+    const plan = planListeners(
+      {
+        ...config,
+        autostartPersonas: ["lena"],
+        channels: {
+          telegram: {
+            token: "default-tok",
+            pollTimeoutS: 30,
+            allowedUserIds: [],
+          },
+          telegramPersonas: {
+            lena: { token: "lena-tok", pollTimeoutS: 30, allowedUserIds: [] },
+          },
+        },
+      },
+      "phantom",
+      err,
+      new Map([["lena", personaConfigWithBot("lena", "lena-tok")]]),
+    );
+    // Without the dedupe this is the duplicate-token fatal, and Telegram dies
+    // on every migrated multi-persona host.
+    expect(plan.fatal).toBeUndefined();
+    expect(plan.listeners.filter((l) => l.persona === "lena")).toHaveLength(1);
+  });
+
+  test("an autostart persona with no bot of its own is skipped, not fatal", async () => {
+    const err = new CaptureStream();
+    await givePersona("lena");
+    const plan = planListeners(
+      {
+        ...config,
+        autostartPersonas: ["lena"],
+        channels: {
+          telegram: { token: "default-tok", pollTimeoutS: 30, allowedUserIds: [] },
+        },
+      },
+      "phantom",
+      err,
+      new Map([["lena", { ...config, channels: {} }]]),
+    );
+    expect(plan.fatal).toBeUndefined();
+    expect(plan.listeners).toHaveLength(1);
+  });
+
+  test("an autostart persona with no dir on disk warns and is skipped", async () => {
+    const err = new CaptureStream();
+    const plan = planListeners(
+      {
+        ...config,
+        autostartPersonas: ["ghost"],
+        channels: {
+          telegram: { token: "default-tok", pollTimeoutS: 30, allowedUserIds: [] },
+        },
+      },
+      "phantom",
+      err,
+      new Map([["ghost", personaConfigWithBot("ghost", "ghost-tok")]]),
+    );
+    expect(plan.listeners).toHaveLength(1);
+    expect(err.text).toContain("ghost");
+  });
+
+  test("two autostart personas sharing one bot token still fatal", async () => {
+    const err = new CaptureStream();
+    await givePersona("lena");
+    await givePersona("kai");
+    const plan = planListeners(
+      {
+        ...config,
+        autostartPersonas: ["lena", "kai"],
+        channels: {},
+      },
+      "phantom",
+      err,
+      new Map([
+        ["lena", personaConfigWithBot("lena", "shared")],
+        ["kai", personaConfigWithBot("kai", "shared")],
+      ]),
+    );
+    expect(plan.fatal).toContain("token reused");
   });
 
   test("planListeners returns personas-only listeners when no default block is set", async () => {

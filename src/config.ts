@@ -27,6 +27,12 @@ import {
   resolveRouting,
 } from "./lib/piRouting.ts";
 import { DEFAULT_STT_TIMEOUT_MS } from "./lib/voice.ts";
+import {
+  mergeToml,
+  readPersonaToml,
+  stripHostOnlyKeys,
+} from "./lib/personaConfig.ts";
+import type { TomlObject } from "./lib/configWriter.ts";
 import { loadState } from "./state.ts";
 
 /**
@@ -552,6 +558,29 @@ export interface Config {
   /** Persona used by `ask`/`chat` when --persona is omitted. */
   defaultPersona: string;
   /**
+   * Personas that get their channels started at boot ALONGSIDE the default
+   * persona (phantombot#439). Host-level: it lives in the global config.toml,
+   * never in a persona file.
+   *
+   * Explicit list, never inferred from what happens to be on disk — an
+   * imported or archived persona must not start talking to the world because
+   * its directory exists. Empty (or absent) means exactly the old behaviour:
+   * the default persona only. The default persona is always started and is
+   * filtered out of this list, so listing it is harmless.
+   *
+   * Optional on the type (mirrors `updateChannel`) so partial test fixtures
+   * need no update; `loadConfig` always populates it and read sites treat
+   * absence as [].
+   */
+  autostartPersonas?: string[];
+  /**
+   * The persona whose `<persona>/config.toml` layer was merged into this
+   * object, when any. `loadConfig()` sets it to the default persona;
+   * `loadConfigForPersona(name)` sets it to `name`. Undefined only in
+   * hand-built test fixtures.
+   */
+  personaLayer?: string;
+  /**
    * Kill the harness subprocess if no output lands on stdout for this
    * long. Resets every time the harness emits a chunk. Right knob for
    * "subprocess wedged on a hung tool call" — productive work that's
@@ -743,15 +772,166 @@ export function xdgStateHome(): string {
 
 const DEFAULT_HARNESS_CHAIN = ["claude"] as const;
 
-export async function loadConfig(): Promise<Config> {
+/**
+ * Merge a persona's own TOML over the host globals, with the two corrections
+ * the plain deep-merge cannot make on its own.
+ *
+ * 1. A persona's own `[harnesses].chain` must beat the LEGACY
+ *    `[harnesses.personas.<name>].chain` entry. Migration copies rather than
+ *    deletes (so a rollback still boots), which means both descriptions of the
+ *    same persona live on forever; `harnessChainIds` reads the legacy table
+ *    first, so without this the persona's own file could never take effect and
+ *    editing it would silently do nothing. The persona's own entry is dropped
+ *    from the merged legacy table only when the persona file actually states a
+ *    chain — an unmigrated host keeps the legacy entry and behaves exactly as
+ *    it did before.
+ *
+ * 2. A NON-DEFAULT persona never inherits the global `[channels.telegram]`
+ *    account — not even key by key. That block is the DEFAULT persona's bot;
+ *    handing it to a second persona would put two listeners on one token,
+ *    which planListeners (rightly) refuses to start. Its account is therefore
+ *    REBUILT, not merged: its legacy `[channels.telegram.personas.<name>]`
+ *    entry first, then its own `[channels.telegram]` table on top, and no
+ *    Telegram at all when it has neither. A persona file stating only part of
+ *    an account (an allowlist but no token) is incomplete, not a licence to
+ *    borrow the host's token.
+ *
+ * Everything else is the ordinary per-key deep merge: persona wins, absent
+ * keys fall back to the global file, never to a constant.
+ */
+export function applyPersonaLayer(
+  globalToml: TomlObject,
+  personaToml: TomlObject,
+  opts: { persona: string; isDefault: boolean },
+): TomlObject {
+  const merged = mergeToml(globalToml, personaToml);
+
+  const personaHarnesses = personaToml.harnesses;
+  const statesOwnChain =
+    isTomlTable(personaHarnesses) && Array.isArray(personaHarnesses.chain);
+  if (statesOwnChain) {
+    const harnesses = merged.harnesses;
+    if (isTomlTable(harnesses) && isTomlTable(harnesses.personas)) {
+      const { [opts.persona]: _legacy, ...rest } = harnesses.personas;
+      merged.harnesses = { ...harnesses, personas: rest };
+    }
+  }
+
+  if (!opts.isDefault) {
+    const channels = merged.channels;
+    if (isTomlTable(channels)) {
+      // NEVER start from the merged account: `mergeToml` has already folded the
+      // GLOBAL `[channels.telegram]` (the default persona's bot) into it, so a
+      // persona file stating only `allowed_user_ids` would otherwise resolve to
+      // the default token with this persona's allowlist — two listeners on one
+      // token, or worse, this persona answering on the owner's bot. Build the
+      // account from scratch out of the only two sources that describe THIS
+      // persona: its legacy routing entry, then its own file on top.
+      const telegram = channels.telegram;
+      const globalRouting =
+        isTomlTable(telegram) && isTomlTable(telegram.personas)
+          ? telegram.personas
+          : undefined;
+      const legacyEntry =
+        globalRouting && isTomlTable(globalRouting[opts.persona])
+          ? (globalRouting[opts.persona] as TomlObject)
+          : undefined;
+      const personaChannels = personaToml.channels;
+      const ownTelegram =
+        isTomlTable(personaChannels) && isTomlTable(personaChannels.telegram)
+          ? personaChannels.telegram
+          : undefined;
+      // The routing table stays visible either way: planListeners still reads
+      // it to plan the legacy listeners of OTHER personas.
+      const routing =
+        (ownTelegram && isTomlTable(ownTelegram.personas)
+          ? ownTelegram.personas
+          : undefined) ?? globalRouting;
+
+      let account: TomlObject | undefined;
+      if (legacyEntry || ownTelegram) {
+        account = { ...(legacyEntry ?? {}), ...(ownTelegram ?? {}) };
+        delete account.personas;
+      }
+
+      const nextChannels: TomlObject = { ...channels };
+      if (account) {
+        nextChannels.telegram = {
+          ...account,
+          ...(routing ? { personas: routing } : {}),
+        };
+      } else if (routing) {
+        nextChannels.telegram = { personas: routing };
+      } else {
+        delete nextChannels.telegram;
+      }
+      merged.channels = nextChannels;
+    }
+  }
+
+  return merged;
+}
+
+function isTomlTable(v: unknown): v is TomlObject {
+  return typeof v === "object" && v !== null && !Array.isArray(v) &&
+    !(v instanceof Date);
+}
+
+
+
+/**
+ * Load the effective config for ONE persona.
+ *
+ * Two layers, merged per key, persona wins:
+ *   1. the host's global config.toml (paths, harness bins, default persona)
+ *   2. `<personas-root>/<persona>/config.toml` (that persona's own settings)
+ *
+ * Env vars are applied after both and still win over everything, so
+ * `PHANTOMBOT_*` remains the top of the precedence order it has always been.
+ *
+ * A key the persona file does not mention falls back to the GLOBAL FILE, not
+ * to a built-in default. An unmigrated host therefore behaves exactly as it
+ * did before this existed: no persona file, empty layer, identical config.
+ *
+ * @param persona persona whose layer to apply. Omit for the default persona.
+ */
+export async function loadConfig(persona?: string): Promise<Config> {
   const configPath =
     process.env.PHANTOMBOT_CONFIG ??
     join(xdgConfigHome(), "phantombot", "config.toml");
 
-  const toml = await tryReadToml(configPath);
+  const globalToml = await tryReadToml(configPath);
   const state = await loadState();
 
   const dataDir = join(xdgDataHome(), "phantombot");
+
+  // personas_dir and default_persona are resolved from the GLOBAL layer only —
+  // they are what tells us which persona file to read, so they cannot
+  // themselves come from it.
+  const personasDir =
+    process.env.PHANTOMBOT_PERSONAS_DIR ??
+    asString(globalToml.personas_dir) ??
+    join(dataDir, "personas");
+  const personaLayer =
+    persona ??
+    process.env.PHANTOMBOT_DEFAULT_PERSONA ??
+    state.default_persona ??
+    asString(globalToml.default_persona) ??
+    "phantom";
+
+  const personaToml = stripHostOnlyKeys(
+    await readPersonaToml(personasDir, personaLayer),
+  );
+  const isDefaultPersona =
+    personaLayer ===
+    (process.env.PHANTOMBOT_DEFAULT_PERSONA ??
+      state.default_persona ??
+      asString(globalToml.default_persona) ??
+      "phantom");
+  const toml = applyPersonaLayer(globalToml, personaToml, {
+    persona: personaLayer,
+    isDefault: isDefaultPersona,
+  });
 
   const tomlHarnesses = (toml.harnesses ?? {}) as Record<string, unknown>;
   const tomlClaude = (tomlHarnesses.claude ?? {}) as Record<string, unknown>;
@@ -819,8 +999,12 @@ export async function loadConfig(): Promise<Config> {
     defaultPersona:
       process.env.PHANTOMBOT_DEFAULT_PERSONA ??
       state.default_persona ??
-      asString(toml.default_persona) ??
+      asString(globalToml.default_persona) ??
       "phantom",
+
+    autostartPersonas: parseAutostartPersonas(globalToml),
+
+    personaLayer,
 
     // Legacy alias: pre-PR-#56 configs only had `turn_timeout_s`, which
     // meant "kill at this wall-clock with no other constraints." The new
@@ -861,14 +1045,11 @@ export async function loadConfig(): Promise<Config> {
 
     harnessHardTimeoutMs,
 
-    personasDir:
-      process.env.PHANTOMBOT_PERSONAS_DIR ??
-      asString(toml.personas_dir) ??
-      join(dataDir, "personas"),
+    personasDir,
 
     memoryDbPath:
       process.env.PHANTOMBOT_MEMORY_DB ??
-      asString(toml.memory_db) ??
+      asString(globalToml.memory_db) ??
       join(dataDir, "memory.sqlite"),
 
     configPath,
@@ -917,7 +1098,12 @@ export async function loadConfig(): Promise<Config> {
     },
 
     channels: {
-      telegram: buildTelegramConfig(tomlTelegram),
+      telegram: buildTelegramConfig(
+        tomlTelegram,
+        // Default persona keeps the unsuffixed env vars; every other persona
+        // reads only its own suffixed ones. See buildTelegramConfig.
+        isDefaultPersona ? undefined : personaEnvSuffix(personaLayer),
+      ),
       telegramPersonas: buildTelegramPersonasConfig(tomlTelegram),
     },
 
@@ -939,7 +1125,7 @@ export async function loadConfig(): Promise<Config> {
     // as opt-in: a typo (`update_channel = "prevew"`) must never leave a
     // box quietly following a ring the operator did not choose, and stable
     // is the fail-closed direction.
-    updateChannel: resolveUpdateChannel(toml.update_channel),
+    updateChannel: resolveUpdateChannel(globalToml.update_channel),
 
     embeddings: buildEmbeddingsConfig(tomlEmbeddings, tomlGemini),
 
@@ -952,6 +1138,73 @@ export async function loadConfig(): Promise<Config> {
     voice: buildVoiceConfig(tomlVoice),
 
     p2p: buildP2PConfig(tomlP2p),
+  };
+}
+
+/**
+ * Resolve the persona a persona-aware command targets, and load THAT persona's
+ * effective config (phantombot#439).
+ *
+ * Every persona-aware entry point used to do this the other way round — load
+ * the config first, read `defaultPersona` off it, then act on some other
+ * persona while still holding the DEFAULT persona's settings. With per-persona
+ * config files that silently runs the wrong Telegram bot, the wrong harness
+ * chain, the wrong voice and the wrong retrieval policy for every persona but
+ * one. So: resolve the target first, then load its layer.
+ *
+ * Host-level harness BINARY paths are kept from the host layer — a `bin` names
+ * something installed on this machine, not a property of a personality — which
+ * is the same rule the daemon applies to its listeners.
+ *
+ * Costs one extra config read, and only when the target is not the default.
+ */
+export async function loadConfigForPersona(
+  persona?: string,
+  base?: Config,
+): Promise<{ config: Config; persona: string; host: Config }> {
+  const host = base ?? (await loadConfig());
+  const target = persona ?? host.defaultPersona;
+  // `host` already IS the target's layer when it was loaded for it — or when
+  // the caller injected a config that names no layer, in which case there is
+  // nothing else to load.
+  if (target === (host.personaLayer ?? host.defaultPersona)) {
+    return { config: host, persona: target, host };
+  }
+  const layered = await loadConfig(target);
+  // `host` is returned alongside because a non-default persona's layer
+  // deliberately does NOT carry the host's default Telegram account (see
+  // applyPersonaLayer). Callers that legitimately need the host account —
+  // notify, which broadcasts an incident to the owner's bot as well — read it
+  // from here rather than reaching back into the file system.
+  return { config: withHostHarnessBins(layered, host), persona: target, host };
+}
+
+/**
+ * Take a persona's config but keep the HOST's harness binary paths.
+ *
+ * Binaries are a property of the machine, not the personality: `claude` lives
+ * at one path on this box for everyone, and the host layer's paths are the
+ * ones `doctor`/`run` probed for real. A persona file carrying a stale `bin`
+ * must not quietly run a different binary. Everything else the persona
+ * overrode — notably `harnesses.chain` — is preserved.
+ */
+export function withHostHarnessBins(personaConfig: Config, host: Config): Config {
+  if (personaConfig === host) return host;
+  return {
+    ...personaConfig,
+    harnesses: {
+      ...personaConfig.harnesses,
+      claude: { ...personaConfig.harnesses.claude, bin: host.harnesses.claude.bin },
+      pi: { ...personaConfig.harnesses.pi, bin: host.harnesses.pi.bin },
+      ...(personaConfig.harnesses.codex
+        ? {
+            codex: {
+              ...personaConfig.harnesses.codex,
+              bin: host.harnesses.codex?.bin ?? personaConfig.harnesses.codex.bin,
+            },
+          }
+        : {}),
+    },
   };
 }
 
@@ -1465,20 +1718,41 @@ function buildEmbeddingsConfig(
   };
 }
 
+/**
+ * Build the persona layer's own Telegram account.
+ *
+ * The env overrides are PERSONA-SCOPED. `TELEGRAM_BOT_TOKEN` and the
+ * `PHANTOMBOT_TELEGRAM_*` vars describe the DEFAULT persona's bot — on a real
+ * host that is exactly where the default token arrives (vault → env). Applying
+ * them to a non-default persona would hand it the owner's bot even though
+ * `applyPersonaLayer` just rebuilt its TOML account from scratch to prevent
+ * precisely that, putting two listeners on one token. So for a NON-DEFAULT
+ * persona we read only the suffixed form (`TELEGRAM_BOT_TOKEN_<PERSONA>`, the
+ * convention the README already documents for named accounts) and IGNORE the
+ * unsuffixed vars entirely — never falling back to them, since a fallback is
+ * the same leak by another name.
+ *
+ * @param envSuffix persona env-var suffix, or undefined for the default
+ *                  persona (which keeps the historical unsuffixed vars).
+ */
 function buildTelegramConfig(
   tomlTelegram: Record<string, unknown>,
+  envSuffix?: string,
 ): Config["channels"]["telegram"] {
+  const sfx = envSuffix ? `_${envSuffix}` : "";
   const token =
-    process.env.TELEGRAM_BOT_TOKEN ?? asString(tomlTelegram.token);
+    process.env[`TELEGRAM_BOT_TOKEN${sfx}`] ?? asString(tomlTelegram.token);
   if (!token) return undefined;
 
   const pollTimeoutS = clampPollTimeout(
-    asInt(process.env.PHANTOMBOT_TELEGRAM_POLL_S) ??
+    asInt(process.env[`PHANTOMBOT_TELEGRAM_POLL_S${sfx}`]) ??
       asInt(tomlTelegram.poll_timeout_s) ??
       30,
   );
 
-  const allowedFromEnv = process.env.PHANTOMBOT_TELEGRAM_ALLOWED_USERS
+  const allowedFromEnv = process.env[
+    `PHANTOMBOT_TELEGRAM_ALLOWED_USERS${sfx}`
+  ]
     ?.split(",")
     .map((s) => Number(s.trim()))
     .filter((n) => Number.isInteger(n));
@@ -1486,7 +1760,9 @@ function buildTelegramConfig(
   const allowedUserIds = allowedFromEnv ?? allowedFromToml ?? [];
 
   const groupPersonaNames =
-    parseGroupPersonaNames(process.env.PHANTOMBOT_TELEGRAM_GROUP_PERSONAS) ??
+    parseGroupPersonaNames(
+      process.env[`PHANTOMBOT_TELEGRAM_GROUP_PERSONAS${sfx}`],
+    ) ??
     asStringArray(tomlTelegram.group_persona_names) ??
     [];
 
@@ -1604,6 +1880,40 @@ function asIntArray(v: unknown): number[] | undefined {
   for (const x of v) {
     const n = asInt(x);
     if (n !== undefined) out.push(n);
+  }
+  return out;
+}
+
+/**
+ * Read `autostart_personas` from the global config (env override:
+ * `PHANTOMBOT_AUTOSTART_PERSONAS`, comma-separated).
+ *
+ * Unknown shapes resolve to [] rather than throwing: an autostart list is a
+ * convenience, and a malformed one must not stop the daemon from starting the
+ * default persona. Entries are trimmed, empties dropped, duplicates collapsed,
+ * and order preserved (it is the order listeners come up in).
+ */
+export function parseAutostartPersonas(
+  toml: Record<string, unknown>,
+): string[] {
+  const env = process.env.PHANTOMBOT_AUTOSTART_PERSONAS;
+  const raw = env !== undefined ? env.split(",") : toml.autostart_personas;
+  if (!Array.isArray(raw)) {
+    if (raw !== undefined) {
+      log.warn(
+        "config: autostart_personas must be an array of persona names — ignoring",
+      );
+    }
+    return [];
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string") continue;
+    const name = entry.trim();
+    if (name.length === 0 || seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
   }
   return out;
 }
