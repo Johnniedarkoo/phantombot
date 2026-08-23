@@ -94,6 +94,28 @@ export function retiredPlistPaths(dir: string = launchAgentsDir()): string[] {
 }
 
 /**
+ * The pre-#435 label a given persona-scoped label replaces, or undefined when
+ * nothing scoped replaces it. Retirement is decided per ROLE off this map: a
+ * legacy agent may only be swept once the scoped agent taking over its job is
+ * confirmed live, so a partial reconcile can never leave BOTH loaded.
+ *
+ * {@link NIGHTLY_PLIST_LABEL} is deliberately absent — the nightly no longer
+ * runs on a clock, so no scoped agent replaces it and it is retired only on a
+ * fully converged reconcile.
+ */
+export function legacyLabelReplacedBy(
+  scopedLabel: string,
+  persona?: string,
+): string | undefined {
+  if (scopedLabel === phantombotPlistLabel(persona))
+    return LEGACY_PHANTOMBOT_PLIST_LABEL;
+  if (scopedLabel === heartbeatPlistLabel(persona))
+    return LEGACY_HEARTBEAT_PLIST_LABEL;
+  if (scopedLabel === tickPlistLabel(persona)) return LEGACY_TICK_PLIST_LABEL;
+  return undefined;
+}
+
+/**
  * Bootout and delete every retired agent. Best-effort per label: a bootout of
  * something that was never loaded returns non-zero and that is fine — the goal
  * is only that nothing pre-#435 is left active or on disk afterwards.
@@ -107,9 +129,16 @@ export async function removeRetiredPlists(opts: {
   launchctl: LaunchctlRunner;
   out: WriteSink;
   dir?: string;
+  /**
+   * Retire only these labels. Defaults to all of {@link RETIRED_PLIST_LABELS}.
+   * The reconcile path passes a subset so a legacy agent is retired exactly
+   * when the scoped agent that replaces it is confirmed live — see
+   * {@link ensureLaunchdAgentsCurrent}.
+   */
+  labels?: readonly string[];
 }): Promise<string[]> {
   const removed: string[] = [];
-  for (const label of RETIRED_PLIST_LABELS) {
+  for (const label of opts.labels ?? RETIRED_PLIST_LABELS) {
     const path = join(opts.dir ?? launchAgentsDir(), `${label}.plist`);
     const onDisk = existsSync(path);
     // Bootout even when the plist is gone: launchd keeps a loaded job in the
@@ -635,8 +664,9 @@ export interface EnsureLaunchdAgentsResult {
   removedRetired: string[];
   /**
    * Scoped agents whose bootstrap failed, with the launchctl error. Non-empty
-   * means the reconcile did NOT converge: the retired sweep is skipped, so the
-   * box keeps whatever pre-#435 agents it had rather than ending up with none.
+   * means the reconcile did NOT converge: the legacy agent each failed role
+   * replaces is left loaded rather than the box ending up with none for that
+   * role, and the retired nightly is left alone entirely.
    */
   failures: { label: string; error: string }[];
   /**
@@ -663,8 +693,9 @@ export interface EnsureLaunchdAgentsResult {
  * Best-effort per agent for BOOTOUT: booting out something that was never
  * loaded exits non-zero and that is fine. BOOTSTRAP is not best-effort — a
  * failure is recorded in `failures`, the drifted plist is rolled back to its
- * previous body where we have one, and the retired sweep is skipped entirely
- * so the box never ends up with neither the old agents nor the new ones.
+ * previous body where we have one, and the legacy agent for THAT role is left
+ * loaded — so the box never ends up with neither the old agent nor the new one
+ * for any role, and never with both.
  */
 export async function ensureLaunchdAgentsCurrent(
   opts: EnsureLaunchdAgentsOptions,
@@ -676,6 +707,11 @@ export async function ensureLaunchdAgentsCurrent(
   const reloaded: string[] = [];
   const failures: { label: string; error: string }[] = [];
   const rolledBack: string[] = [];
+  // Scoped labels confirmed to be loaded in the domain when we are done —
+  // whether we reloaded them now, found them already healthy and skipped them,
+  // or rolled them back onto their previous body. Each one earns the
+  // retirement of the legacy agent it replaces, and NOTHING else does.
+  const live = new Set<string>();
 
   // launchd refuses to start an agent whose StandardOutPath directory does not
   // exist, so create it before anything is bootstrapped.
@@ -704,11 +740,19 @@ export async function ensureLaunchdAgentsCurrent(
       `${opts.domain}/${t.label}`,
     ]);
     const wasLoaded = loaded.exitCode === 0;
-    if (!drifted && wasLoaded) continue;
+    if (!drifted && wasLoaded) {
+      // Already correct and already running. It still counts as live: a second
+      // reconcile pass must be able to finish a sweep the first one earned but
+      // could not complete, otherwise a single partial failure would strand the
+      // legacy agents forever.
+      live.add(t.label);
+      continue;
+    }
     await opts.launchctl.run(["bootout", `${opts.domain}/${t.label}`]);
     const r = await opts.launchctl.run(["bootstrap", opts.domain, t.path]);
     if (r.exitCode === 0) {
       reloaded.push(t.label);
+      live.add(t.label);
       continue;
     }
     // The reload failed. We have just booted the agent OUT, so doing nothing
@@ -723,6 +767,10 @@ export async function ensureLaunchdAgentsCurrent(
       if (idx >= 0) rewrote.splice(idx, 1);
       if (back.exitCode === 0) {
         rolledBack.push(t.label);
+        // Stale body, but the scoped agent IS running this role. Leaving its
+        // legacy twin loaded alongside it is the two-daemons race, so it is
+        // live for retirement purposes even though it is still a failure.
+        live.add(t.label);
         failures.push({
           label: t.label,
           error: `${error} (rolled back to the previous plist)`,
@@ -733,19 +781,35 @@ export async function ensureLaunchdAgentsCurrent(
     failures.push({ label: t.label, error });
   }
 
-  // Only sweep the old identities once EVERY scoped agent is confirmed live.
-  // The ordering alone is not enough: bootstrap can fail (malformed plist,
-  // transient launchd error), and sweeping anyway would boot out and DELETE
-  // the only agents left running, leaving an upgraded Mac with no daemon, no
-  // heartbeat and no tick — and no plist to recover from. Leaving the retired
-  // agents in place is the recoverable failure: the next heartbeat retries.
+  // Retire the old identities ROLE BY ROLE, each one exactly when the scoped
+  // agent that replaces it is confirmed live.
+  //
+  // Neither extreme is safe. Sweeping unconditionally would boot out and DELETE
+  // the only agents left running when bootstrap fails, leaving an upgraded Mac
+  // with no daemon, no heartbeat and no tick — and no plist to recover from.
+  // But gating the whole sweep on total success is just as wrong in the other
+  // direction: if two of three scoped agents come up and one does not, ALL the
+  // legacy agents stay loaded, so the box runs two daemons and two heartbeats
+  // against one database — the exact race the persona boundary exists to end.
+  // Per-role retirement leaves exactly one agent per role in every case.
+  //
+  // The nightly has no scoped replacement, so it keeps the conservative gate:
+  // it is only removed on a fully converged reconcile.
+  const retireable = new Set<string>();
+  for (const t of targets) {
+    if (!live.has(t.label)) continue;
+    const legacy = legacyLabelReplacedBy(t.label, opts.persona);
+    if (legacy !== undefined) retireable.add(legacy);
+  }
+  if (failures.length === 0) retireable.add(NIGHTLY_PLIST_LABEL);
   const removedRetired =
-    failures.length === 0
+    retireable.size > 0
       ? await removeRetiredPlists({
           domain: opts.domain,
           launchctl: opts.launchctl,
           out: { write: () => {} },
           dir: dirname(opts.nightlyPlistPath ?? nightlyPlistPath()),
+          labels: RETIRED_PLIST_LABELS.filter((l) => retireable.has(l)),
         })
       : [];
 

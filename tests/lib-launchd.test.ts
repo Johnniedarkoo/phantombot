@@ -22,6 +22,9 @@ import {
   phantombotPlistLabel,
   heartbeatPlistLabel,
   NIGHTLY_PLIST_LABEL,
+  LEGACY_PHANTOMBOT_PLIST_LABEL,
+  LEGACY_HEARTBEAT_PLIST_LABEL,
+  LEGACY_TICK_PLIST_LABEL,
   RETIRED_PLIST_LABELS,
   tickPlistLabel,
   launchdLogPaths,
@@ -616,9 +619,13 @@ describe("ensureLaunchdAgentsCurrent (unattended macOS reconcile)", () => {
     for (const p of legacy) expect(existsSync(p)).toBe(true);
   });
 
-  test("a partial failure also blocks the sweep", async () => {
-    // Two of three agents load. The box is still not converged, so the retired
-    // identities stay — a half-migrated Mac must not lose its old daemon.
+  test("a partial failure retires ROLE BY ROLE: exactly one agent per role, never two", async () => {
+    // Two of three scoped agents load, tick does not. Skipping the whole sweep
+    // here would leave the legacy daemon and heartbeat loaded ALONGSIDE their
+    // scoped replacements — two daemons and two heartbeats on one database,
+    // the exact race the persona boundary exists to end. Each legacy agent is
+    // retired the moment its own replacement is live; tick's is not, because
+    // its replacement is down.
     const dir = dirname(ngPath);
     const legacy = RETIRED_PLIST_LABELS.map((l) => join(dir, `${l}.plist`));
     for (const p of legacy) await Bun.write(p, "<plist>old</plist>");
@@ -633,8 +640,57 @@ describe("ensureLaunchdAgentsCurrent (unattended macOS reconcile)", () => {
 
     expect(r.failures.map((f) => f.label)).toEqual([tickPlistLabel()]);
     expect(r.reloaded).toEqual([phantombotPlistLabel(), heartbeatPlistLabel()]);
-    expect(r.removedRetired).toEqual([]);
-    for (const p of legacy) expect(existsSync(p)).toBe(true);
+
+    // The invariant, stated directly against the domain: one loaded label per
+    // role. Daemon and heartbeat: the scoped one only. Tick: the legacy one
+    // only, since the scoped one failed to come up.
+    expect(lc.loaded.has(phantombotPlistLabel())).toBe(true);
+    expect(lc.loaded.has(LEGACY_PHANTOMBOT_PLIST_LABEL)).toBe(false);
+    expect(lc.loaded.has(heartbeatPlistLabel())).toBe(true);
+    expect(lc.loaded.has(LEGACY_HEARTBEAT_PLIST_LABEL)).toBe(false);
+    expect(lc.loaded.has(tickPlistLabel())).toBe(false);
+    expect(lc.loaded.has(LEGACY_TICK_PLIST_LABEL)).toBe(true);
+
+    // On disk, the same split. The nightly has no scoped replacement, so it
+    // survives an unconverged reconcile entirely.
+    expect(existsSync(join(dir, `${LEGACY_PHANTOMBOT_PLIST_LABEL}.plist`))).toBe(false);
+    expect(existsSync(join(dir, `${LEGACY_HEARTBEAT_PLIST_LABEL}.plist`))).toBe(false);
+    expect(existsSync(join(dir, `${LEGACY_TICK_PLIST_LABEL}.plist`))).toBe(true);
+    expect(existsSync(join(dir, `${NIGHTLY_PLIST_LABEL}.plist`))).toBe(true);
+    expect(lc.loaded.has(NIGHTLY_PLIST_LABEL)).toBe(true);
+  });
+
+  test("a scoped agent already healthy from an earlier pass still retires its legacy twin", async () => {
+    // Second reconcile after a partial one: the scoped daemon is already
+    // correct on disk AND loaded, so the loop skips it via `continue` and it
+    // never lands in `reloaded`. If retirement keyed off `reloaded` alone, the
+    // legacy daemon would be stranded forever — every later pass would decline
+    // to finish the sweep it had already earned.
+    const dir = dirname(ngPath);
+    await Bun.write(mainPath, generatePhantombotPlist({ binPath: BIN, args: ["run"] }));
+    const legacyMain = join(dir, `${LEGACY_PHANTOMBOT_PLIST_LABEL}.plist`);
+    const legacyTick = join(dir, `${LEGACY_TICK_PLIST_LABEL}.plist`);
+    for (const p of [legacyMain, legacyTick]) await Bun.write(p, "<plist>old</plist>");
+    const lc = new DomainLaunchctl(
+      [phantombotPlistLabel(), LEGACY_PHANTOMBOT_PLIST_LABEL, LEGACY_TICK_PLIST_LABEL],
+      [tickPlistLabel()],
+    );
+
+    const r = await ensureLaunchdAgentsCurrent({
+      binPath: BIN,
+      domain: "gui/501",
+      launchctl: lc,
+      ...overrides(),
+    });
+
+    // Untouched this pass — and still enough to retire its twin.
+    expect(r.reloaded).not.toContain(phantombotPlistLabel());
+    expect(lc.loaded.has(phantombotPlistLabel())).toBe(true);
+    expect(lc.loaded.has(LEGACY_PHANTOMBOT_PLIST_LABEL)).toBe(false);
+    expect(existsSync(legacyMain)).toBe(false);
+    // Tick still failing, so its legacy twin is still the one running.
+    expect(lc.loaded.has(LEGACY_TICK_PLIST_LABEL)).toBe(true);
+    expect(existsSync(legacyTick)).toBe(true);
   });
 
   test("a drifted-but-healthy agent that fails to reload is restored and re-bootstrapped", async () => {
@@ -677,9 +733,12 @@ describe("ensureLaunchdAgentsCurrent (unattended macOS reconcile)", () => {
     expect(r.rolledBack).toEqual([phantombotPlistLabel()]);
     // And we do not claim to have rewritten a plist we put back.
     expect(r.rewrote).toEqual([]);
-    // Still a failure, so the sweep is still skipped.
+    // Still a failure, so the nightly (which nothing replaces) is left alone.
     expect(r.failures.map((f) => f.label)).toEqual([phantombotPlistLabel()]);
-    expect(r.removedRetired).toEqual([]);
+    expect(lc.callLines).not.toContain(`bootout gui/501/${NIGHTLY_PLIST_LABEL}`);
+    // But a rolled-back agent IS running its role, so its legacy twin must not
+    // be left loaded next to it — that would be two daemons, not zero.
+    expect(lc.callLines).toContain(`bootout gui/501/${LEGACY_PHANTOMBOT_PLIST_LABEL}`);
   });
 
   test("a fully healthy reconcile still sweeps — the guard does not block the happy path", async () => {
