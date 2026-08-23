@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applyRouting, clearPiRouting } from "../src/cli/harness.ts";
+import {
+  applyRouting,
+  clearPiRouting,
+  resolveHarnessWriteTarget,
+} from "../src/cli/harness.ts";
 import {
   computeRoutingClears,
   resolveRoutingProvider,
@@ -101,6 +105,44 @@ describe("clearPiRouting (the 'Use Pi's own config' path)", () => {
       "provider",
     ]);
     expect(Object.values(clears.env).every((v) => v === "")).toBe(true);
+  });
+});
+
+describe("applyRouting for a non-default persona (phantombot#441)", () => {
+  test("TOML lands in the persona file and the env mirror is SUFFIXED", async () => {
+    // The env file is shared by every persona on the host, so writing the
+    // unsuffixed vars while configuring Lena would repoint Kai and Robbie too —
+    // and, because env outranks the global TOML, would keep doing so. The
+    // suffixed vars are what config.ts reads for a non-default persona.
+    await applyRouting(
+      configPath,
+      { provider: "openrouter", primaryModel: "lena-primary", imageModel: "lena-vision" },
+      envPath,
+      "LENA",
+    );
+
+    const toml = await readConfigToml(configPath);
+    expect((toml as any).harnesses.pi.routing.primary_model).toBe("lena-primary");
+
+    const env = await loadEnvFile(envPath);
+    expect(env.PHANTOMBOT_PRIMARY_MODEL_LENA).toBe("lena-primary");
+    expect(env.PHANTOMBOT_IMAGE_MODEL_LENA).toBe("lena-vision");
+    expect(env.PHANTOMBOT_PI_PROVIDER_LENA).toBe("openrouter");
+    // The host's own vars are untouched — configuring one persona must never
+    // move another persona's brain.
+    expect(env.PHANTOMBOT_PRIMARY_MODEL).toBeUndefined();
+    expect(env.PHANTOMBOT_IMAGE_MODEL).toBeUndefined();
+  });
+
+  test("clearPiRouting clears the SUFFIXED vars, not the host's", async () => {
+    await applyRouting(configPath, { primaryModel: "host-primary" }, envPath);
+    await applyRouting(configPath, { primaryModel: "lena-primary" }, envPath, "LENA");
+    await clearPiRouting(configPath, envPath, "LENA");
+
+    const env = await loadEnvFile(envPath);
+    // An empty write REMOVES the var (updateEnvFile's "" = unset semantics).
+    expect(env.PHANTOMBOT_PRIMARY_MODEL_LENA).toBeUndefined();
+    expect(env.PHANTOMBOT_PRIMARY_MODEL).toBe("host-primary");
   });
 });
 
@@ -266,5 +308,113 @@ describe("applyRouting", () => {
     expect((toml.harnesses as Record<string, any>).pi.routing.primary_model).toBe(
       "gpt-5.2",
     );
+  });
+});
+
+describe("resolveHarnessWriteTarget (phantombot#441, wizard scope)", () => {
+  const cfg = (defaultPersona: string) =>
+    ({
+      configPath,
+      personasDir: join(workdir, "personas"),
+      defaultPersona,
+    }) as any;
+
+  test("a NON-DEFAULT persona is written in persona scope even with no file yet", async () => {
+    // THE edge Lena caught: resolvePersonaWriteTarget falls back to the GLOBAL
+    // file until the persona has one of its own. For the chain that fallback is
+    // harmless (it writes the legacy per-persona table), but routing is written
+    // as a plain [harnesses.pi.routing] — in the global file that is the HOST
+    // default every other persona inherits under the per-key merge. Configuring
+    // Lena would move Kai's models via TOML, which is the very leak the suffixed
+    // env mirror closes on the env side.
+    const target = await resolveHarnessWriteTarget(cfg("robbie"), "lena");
+    expect(target.scope).toBe("persona");
+    expect(target.path).toBe(join(workdir, "personas", "lena", "config.toml"));
+    expect(target.envSuffix).toBe("LENA");
+
+    // And the write actually materialises that file rather than the global one.
+    await applyRouting(target.path, { primaryModel: "lena-primary" }, envPath, target.envSuffix);
+    expect((await readConfigToml(target.path) as any).harnesses.pi.routing.primary_model)
+      .toBe("lena-primary");
+    expect(await readConfigToml(configPath)).toEqual({});
+  });
+
+  test("the DEFAULT persona keeps the global-file fallback until migration runs", async () => {
+    // Unmigrated hosts must stay readable by an older binary — release rings
+    // make rollback real — so the default persona only moves to its own file
+    // once that file exists.
+    const before = await resolveHarnessWriteTarget(cfg("robbie"), "robbie");
+    expect(before.scope).toBe("global");
+    expect(before.path).toBe(configPath);
+    expect(before.envSuffix).toBeUndefined();
+
+    const personaPath = join(workdir, "personas", "robbie", "config.toml");
+    await applyRouting(personaPath, { primaryModel: "host-primary" }, envPath);
+    const after = await resolveHarnessWriteTarget(cfg("robbie"), "robbie");
+    expect(after.scope).toBe("persona");
+    expect(after.path).toBe(personaPath);
+    expect(after.envSuffix).toBeUndefined();
+  });
+
+  test("no --persona is the default persona, not a suffixed one", async () => {
+    const target = await resolveHarnessWriteTarget(cfg("robbie"));
+    expect(target.persona).toBe("robbie");
+    expect(target.envSuffix).toBeUndefined();
+    expect(target.scope).toBe("global");
+  });
+});
+
+describe("persona clears are tombstoned, not deleted (phantombot#441)", () => {
+  const cfg = (defaultPersona: string) =>
+    ({
+      configPath,
+      personasDir: join(workdir, "personas"),
+      defaultPersona,
+    }) as any;
+
+  test("PERSONA scope writes an explicit use_local_config opt-out", async () => {
+    // THE bug Kai caught: deleting a persona's routing keys is not clearing
+    // them. Under the per-key merge an absent key falls back to the HOST's
+    // [harnesses.pi.routing] — so "use Pi's own config" silently resolved to
+    // the host's provider and models. The cleared state needs its own spelling.
+    const target = await resolveHarnessWriteTarget(cfg("robbie"), "lena");
+    await applyRouting(
+      target.path,
+      { provider: "openrouter", primaryModel: "lena-primary", codingModel: "lena-coder" },
+      envPath,
+      target.envSuffix,
+    );
+
+    await clearPiRouting(target.path, envPath, target.envSuffix, { tombstone: true });
+
+    const routing = (await readConfigToml(target.path) as any).harnesses.pi.routing;
+    expect(routing.use_local_config).toBe(true);
+    expect(routing.provider).toBeUndefined();
+    expect(routing.primary_model).toBeUndefined();
+    expect(routing.coding_model).toBeUndefined();
+  });
+
+  test("GLOBAL scope never writes the tombstone (it would be inherited host-wide)", async () => {
+    // In the global file the flag is not this persona's opt-out, it is every
+    // persona's: any persona that does not state its own routing inherits it.
+    await applyRouting(configPath, { primaryModel: "host-primary" }, envPath);
+    await clearPiRouting(configPath, envPath);
+    const routing = (await readConfigToml(configPath) as any).harnesses.pi.routing;
+    expect(routing.use_local_config).toBeUndefined();
+    expect(routing.primary_model).toBeUndefined();
+  });
+
+  test("configuring models REVOKES a previous opt-out in the same write", async () => {
+    const target = await resolveHarnessWriteTarget(cfg("robbie"), "lena");
+    await clearPiRouting(target.path, envPath, target.envSuffix, { tombstone: true });
+    await applyRouting(
+      target.path,
+      { primaryModel: "lena-primary-2" },
+      envPath,
+      target.envSuffix,
+    );
+    const routing = (await readConfigToml(target.path) as any).harnesses.pi.routing;
+    expect(routing.use_local_config).toBeUndefined();
+    expect(routing.primary_model).toBe("lena-primary-2");
   });
 });

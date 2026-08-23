@@ -623,6 +623,43 @@ describe("PiHarness routing (subprocess)", () => {
     expect(out).not.toContain("PHANTOMBOT_CODING_MODEL=qwen-coder");
   });
 
+  test("the child is pointed at THIS persona's routing.json, not the host's", async () => {
+    // phantombot#441. The managed extension dir is stamped once per HOST, so
+    // its sibling routing.json can only describe one persona's delegates — on a
+    // multi-persona box every other persona's vision delegate was the default
+    // persona's model. The harness now writes its OWN models into the persona's
+    // per-turn temp dir and names that file in the child env.
+    process.env.FAKE_PI_MODE = "env";
+    const out = (
+      await collect(
+        routed({
+          primaryModel: "gpt-5.2",
+          imageModel: "vision-x",
+          codingModel: "qwen-coder",
+        }).invoke(newRequest()),
+      )
+    )
+      .filter((c) => c.type === "text")
+      .map((c) => (c as { text: string }).text)
+      .join("");
+    expect(out).toContain('routing={"primaryModel":"gpt-5.2","imageModel":"vision-x"}');
+    // The coding model drives the in-harness brain swap, not any extension
+    // tool, so it is deliberately absent from the file.
+    expect(out).not.toContain("qwen-coder");
+  });
+
+  test("a routing-free harness states an EMPTY routing file (no host inheritance)", async () => {
+    // Stating `{}` is the point: without it the child falls back to the
+    // host-stamped sibling routing.json and a persona with no routing of its
+    // own silently borrows the default persona's vision delegate.
+    process.env.FAKE_PI_MODE = "env";
+    const out = (await collect(mkHarness().invoke(newRequest())))
+      .filter((c) => c.type === "text")
+      .map((c) => (c as { text: string }).text)
+      .join("");
+    expect(out).toContain("routing={}");
+  });
+
   test("the active harness's provider + api-key ARE projected into the child env (for the extension's delegates)", async () => {
     // The capability-routing extension runs INSIDE this spawned pi and threads
     // the pair onto its OWN delegate children. It reads them from this env, so
@@ -691,6 +728,31 @@ describe("PiHarness routing (subprocess)", () => {
       .map((c) => (c as { text: string }).text)
       .join("");
     expect(argv).not.toContain("--api-key");
+  });
+
+  test("an opted-out persona passes NO provider/model/api-key, even with a host key in the env", async () => {
+    // The persona picked "use Pi's own config". That opt-out has to cover the
+    // API KEY as well as the models: the key is read from the ambient env,
+    // which on a multi-persona host is the HOST's key — firing another
+    // persona's credential at a provider this persona never chose.
+    process.env.FAKE_PI_MODE = "argv";
+    process.env.PHANTOMBOT_PI_API_KEY = "sk-host-key";
+    try {
+      const argv = (
+        await collect(
+          new PiHarness({ bin: FAKE_PI, routing: { useLocalConfig: true } })
+            .invoke(newRequest()),
+        )
+      )
+        .filter((c) => c.type === "text")
+        .map((c) => (c as { text: string }).text)
+        .join("");
+      expect(argv).not.toContain("--api-key");
+      expect(argv).not.toContain("--provider");
+      expect(argv).not.toContain("--model");
+    } finally {
+      delete process.env.PHANTOMBOT_PI_API_KEY;
+    }
   });
 
   test("invoke re-sources env files each turn (reloadEnvFiles is called)", async () => {

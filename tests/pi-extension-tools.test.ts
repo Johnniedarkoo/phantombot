@@ -9,6 +9,7 @@ import { describe, expect, test } from "bun:test";
 import {
   imageDelegationPrompt,
   planRouting,
+  routingConfigCandidates,
 } from "../pi-extension/capability-routing/tools.ts";
 import {
   buildDelegateBaseArgs,
@@ -173,5 +174,40 @@ describe("delegation prompts", () => {
     expect(prompt).toContain("/tmp/x.png");
     expect(prompt).toContain("How many people are in this photo?");
     expect(prompt).toContain("answer the question");
+  });
+});
+
+
+describe("routingConfigCandidates (phantombot#441)", () => {
+  const join = (a: string, b: string) => `${a}/${b}`;
+
+  test("a STATED override is authoritative — the host sibling is not a fallback", () => {
+    // Kai's finding: falling through to the sibling when the persona's file is
+    // missing/unreadable/invalid hands this persona the host-stamped delegate
+    // models of ANOTHER persona — the precise isolation this override exists to
+    // provide. A broken authoritative file must resolve to `{}` (inert), which
+    // is what returning it as the ONLY candidate produces.
+    expect(
+      routingConfigCandidates("/ext", { PHANTOMBOT_ROUTING_JSON: "/p/lena.json" }, join),
+    ).toEqual(["/p/lena.json"]);
+  });
+
+  test("no override = today's behaviour exactly", () => {
+    expect(routingConfigCandidates("/ext", {}, join)).toEqual(["/ext/routing.json"]);
+  });
+
+  test("a blank override is unset, not a path", () => {
+    // An empty value is how a CLEARED setting looks everywhere else in
+    // phantombot; treating it as a path would make every read fail and quietly
+    // disable the vision delegate.
+    expect(
+      routingConfigCandidates("/ext", { PHANTOMBOT_ROUTING_JSON: "  " }, join),
+    ).toEqual(["/ext/routing.json"]);
+  });
+
+  test("an unresolvable extension dir still yields the persona's file", () => {
+    expect(
+      routingConfigCandidates(undefined, { PHANTOMBOT_ROUTING_JSON: "/p/lena.json" }, join),
+    ).toEqual(["/p/lena.json"]);
   });
 });
