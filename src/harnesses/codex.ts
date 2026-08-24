@@ -20,7 +20,7 @@ import type {
   HarnessRequest,
 } from "./types.ts";
 import { buildToolCall } from "./toolNote.ts";
-import { reloadEnvFiles, withPersonaEnv } from "../lib/envBootstrap.ts";
+import { withPersonaEnv } from "../lib/envBootstrap.ts";
 import { reloadVaultForPersona } from "../lib/vault.ts";
 import {
   type HarnessActivity,
@@ -61,7 +61,6 @@ export class CodexHarness implements Harness {
       argCount: args.length,
     });
 
-    await reloadEnvFiles();
     // Reconcile this persona's encrypted vault into the env (see claude.ts).
     await reloadVaultForPersona(req.persona);
 

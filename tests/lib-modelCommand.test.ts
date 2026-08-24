@@ -20,7 +20,6 @@ import {
   parseModelRequest,
 } from "../src/lib/modelCommand.ts";
 import { getIn, readConfigToml } from "../src/lib/configWriter.ts";
-import { loadEnvFile } from "../src/lib/envFile.ts";
 
 const TOUCHED_ENV = [
   "PHANTOMBOT_PRIMARY_MODEL",
@@ -32,13 +31,11 @@ const TOUCHED_ENV = [
 
 let dir: string;
 let configPath: string;
-let envPath: string;
 let savedEnv: Record<string, string | undefined>;
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "phantombot-modelcmd-"));
   configPath = join(dir, "config.toml");
-  envPath = join(dir, ".env");
   savedEnv = {};
   for (const k of TOUCHED_ENV) {
     savedEnv[k] = process.env[k];
@@ -177,13 +174,12 @@ describe("formatModelShow", () => {
 // ---------------------------------------------------------------------------
 
 describe("applyModelRequest pi", () => {
-  test("set primary writes toml + env + in-memory", async () => {
+  test("set primary writes config.toml + in-memory (env is process-local only)", async () => {
     const config = makeConfig();
     const r = await applyModelRequest(
       { kind: "set", role: "primary", slug: "deepseek-v3" },
       "pi",
-      config,
-      envPath,
+      config
     );
     expect(r).toEqual({ ok: true, summary: "pi primary model → deepseek-v3" });
 
@@ -191,9 +187,9 @@ describe("applyModelRequest pi", () => {
     expect(getIn(toml, ["harnesses", "pi", "routing", "primary_model"])).toBe(
       "deepseek-v3",
     );
-    const env = await loadEnvFile(envPath);
-    expect(env.PHANTOMBOT_PRIMARY_MODEL).toBe("deepseek-v3");
     expect(config.harnesses.pi.routing?.primaryModel).toBe("deepseek-v3");
+    // Live-process sync only: config.toml is the store, process.env just keeps
+    // this process consistent with it until the restart lands (#452).
     expect(process.env.PHANTOMBOT_PRIMARY_MODEL).toBe("deepseek-v3");
   });
 
@@ -202,14 +198,12 @@ describe("applyModelRequest pi", () => {
     await applyModelRequest(
       { kind: "set", role: "coding", slug: "qwen-coder" },
       "pi",
-      config,
-      envPath,
+      config
     );
     await applyModelRequest(
       { kind: "set", role: "image", slug: "qwen-vl" },
       "pi",
-      config,
-      envPath,
+      config
     );
     const toml = await readConfigToml(configPath);
     expect(getIn(toml, ["harnesses", "pi", "routing", "coding_model"])).toBe(
@@ -218,17 +212,15 @@ describe("applyModelRequest pi", () => {
     expect(getIn(toml, ["harnesses", "pi", "routing", "image_model"])).toBe(
       "qwen-vl",
     );
-    const env = await loadEnvFile(envPath);
-    expect(env.PHANTOMBOT_CODING_MODEL).toBe("qwen-coder");
-    expect(env.PHANTOMBOT_IMAGE_MODEL).toBe("qwen-vl");
+    expect(process.env.PHANTOMBOT_CODING_MODEL).toBe("qwen-coder");
+    expect(process.env.PHANTOMBOT_IMAGE_MODEL).toBe("qwen-vl");
   });
 
   test("clear is refused — pi has no default to fall back to", async () => {
     const r = await applyModelRequest(
       { kind: "clear" },
       "pi",
-      makeConfig(),
-      envPath,
+      makeConfig()
     );
     expect(r.ok).toBe(false);
   });
@@ -248,7 +240,7 @@ describe("applyModelRequest persona scope", () => {
     for (const k of PERSONA_ENV) delete process.env[k];
   });
 
-  test("a non-default persona's /model writes ITS file and ITS suffixed env", async () => {
+  test("a non-default persona's /model writes ITS file (and only its suffixed live env)", async () => {
     // `[harnesses]` is persona-scoped, so a /model typed in Lena's chat must
     // not land in the host file — under the per-key merge that is the default
     // every OTHER persona inherits, so Lena's choice would move Kai's brain.
@@ -257,7 +249,6 @@ describe("applyModelRequest persona scope", () => {
       { kind: "set", role: "primary", slug: "lena-primary" },
       "pi",
       config,
-      envPath,
       "lena",
     );
     const personaToml = await readConfigToml(join(dir, "lena", "config.toml"));
@@ -265,9 +256,6 @@ describe("applyModelRequest persona scope", () => {
       .toBe("lena-primary");
     expect(await readConfigToml(configPath)).toEqual({});
 
-    const env = await loadEnvFile(envPath);
-    expect(env.PHANTOMBOT_PRIMARY_MODEL_LENA).toBe("lena-primary");
-    expect(env.PHANTOMBOT_PRIMARY_MODEL).toBeUndefined();
     expect(process.env.PHANTOMBOT_PRIMARY_MODEL_LENA).toBe("lena-primary");
     expect(process.env.PHANTOMBOT_PRIMARY_MODEL).toBeUndefined();
   });
@@ -278,23 +266,20 @@ describe("applyModelRequest persona scope", () => {
       { kind: "set", role: "primary", slug: "haiku" },
       "claude",
       config,
-      envPath,
       "lena",
     );
     await applyModelRequest(
       { kind: "set", role: "primary", slug: "gpt-5.2-codex" },
       "codex",
       config,
-      envPath,
       "lena",
     );
     const personaToml = await readConfigToml(join(dir, "lena", "config.toml"));
     expect(getIn(personaToml, ["harnesses", "claude", "model"])).toBe("haiku");
     expect(getIn(personaToml, ["harnesses", "codex", "model"])).toBe("gpt-5.2-codex");
     expect(await readConfigToml(configPath)).toEqual({});
-    const env = await loadEnvFile(envPath);
-    expect(env.PHANTOMBOT_CLAUDE_MODEL_LENA).toBe("haiku");
-    expect(env.PHANTOMBOT_CODEX_MODEL_LENA).toBe("gpt-5.2-codex");
+    expect(process.env.PHANTOMBOT_CLAUDE_MODEL_LENA).toBe("haiku");
+    expect(process.env.PHANTOMBOT_CODEX_MODEL_LENA).toBe("gpt-5.2-codex");
   });
 
   test("a persona's codex CLEAR is a stated '' pin, not a delete", async () => {
@@ -305,7 +290,6 @@ describe("applyModelRequest persona scope", () => {
       { kind: "clear" },
       "codex",
       config,
-      envPath,
       "lena",
     );
     const personaToml = await readConfigToml(join(dir, "lena", "config.toml"));
@@ -322,7 +306,6 @@ describe("applyModelRequest persona scope", () => {
       { kind: "set", role: "primary", slug: "lena-primary" },
       "pi",
       config,
-      envPath,
       "lena",
     );
     const routing = getIn(
@@ -333,13 +316,12 @@ describe("applyModelRequest persona scope", () => {
     expect(routing.primary_model).toBe("lena-primary");
   });
 
-  test("the DEFAULT persona still writes the host file and unsuffixed env", async () => {
+  test("the DEFAULT persona still writes the host file", async () => {
     const config = makeConfig();
     await applyModelRequest(
       { kind: "set", role: "primary", slug: "host-primary" },
       "pi",
       config,
-      envPath,
       "phantom",
     );
     expect(getIn(await readConfigToml(configPath), [
@@ -348,7 +330,7 @@ describe("applyModelRequest persona scope", () => {
       "routing",
       "primary_model",
     ])).toBe("host-primary");
-    expect((await loadEnvFile(envPath)).PHANTOMBOT_PRIMARY_MODEL).toBe("host-primary");
+    expect(process.env.PHANTOMBOT_PRIMARY_MODEL).toBe("host-primary");
   });
 });
 
@@ -357,19 +339,17 @@ describe("applyModelRequest persona scope", () => {
 // ---------------------------------------------------------------------------
 
 describe("applyModelRequest claude", () => {
-  test("accepts allowlisted aliases, writes both stores", async () => {
+  test("accepts allowlisted aliases, writes config.toml", async () => {
     const config = makeConfig();
     const r = await applyModelRequest(
       { kind: "set", role: "primary", slug: "Sonnet" },
       "claude",
       config,
-      envPath,
     );
     expect(r.ok).toBe(true);
     const toml = await readConfigToml(configPath);
     expect(getIn(toml, ["harnesses", "claude", "model"])).toBe("sonnet");
-    const env = await loadEnvFile(envPath);
-    expect(env.PHANTOMBOT_CLAUDE_MODEL).toBe("sonnet");
+    expect(process.env.PHANTOMBOT_CLAUDE_MODEL).toBe("sonnet");
     expect(config.harnesses.claude.model).toBe("sonnet");
   });
 
@@ -377,8 +357,7 @@ describe("applyModelRequest claude", () => {
     const r = await applyModelRequest(
       { kind: "set", role: "primary", slug: "opys" },
       "claude",
-      makeConfig(),
-      envPath,
+      makeConfig()
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toContain(CLAUDE_MODEL_ALIASES[0]);
@@ -387,15 +366,14 @@ describe("applyModelRequest claude", () => {
   test("rejects clear and non-primary roles", async () => {
     const config = makeConfig();
     expect(
-      (await applyModelRequest({ kind: "clear" }, "claude", config, envPath)).ok,
+      (await applyModelRequest({ kind: "clear" }, "claude", config)).ok,
     ).toBe(false);
     expect(
       (
         await applyModelRequest(
           { kind: "set", role: "coding", slug: "opus" },
           "claude",
-          config,
-          envPath,
+          config
         )
       ).ok,
     ).toBe(false);
@@ -412,12 +390,11 @@ describe("applyModelRequest codex", () => {
     const set = await applyModelRequest(
       { kind: "set", role: "primary", slug: "gpt-5.2-codex" },
       "codex",
-      config,
-      envPath,
+      config
     );
     expect(set.ok).toBe(true);
     expect(config.harnesses.codex?.model).toBe("gpt-5.2-codex");
-    const clear = await applyModelRequest({ kind: "clear" }, "codex", config, envPath);
+    const clear = await applyModelRequest({ kind: "clear" }, "codex", config);
     expect(clear.ok).toBe(true);
     expect(config.harnesses.codex?.model).toBe("");
   });
@@ -427,8 +404,7 @@ describe("applyModelRequest codex", () => {
     const r = await applyModelRequest(
       { kind: "set", role: "primary", slug: "gpt-5.2-codex" },
       "codex",
-      config,
-      envPath,
+      config
     );
     expect(r.ok).toBe(true);
     const toml = await readConfigToml(configPath);
@@ -439,8 +415,7 @@ describe("applyModelRequest codex", () => {
     const r = await applyModelRequest(
       { kind: "set", role: "image", slug: "x" },
       "codex",
-      makeConfig(),
-      envPath,
+      makeConfig()
     );
     expect(r.ok).toBe(false);
   });
@@ -450,8 +425,7 @@ test("unknown harness id is refused", async () => {
   const r = await applyModelRequest(
     { kind: "set", role: "primary", slug: "x" },
     "mystery",
-    makeConfig(),
-    envPath,
+    makeConfig()
   );
   expect(r.ok).toBe(false);
 });

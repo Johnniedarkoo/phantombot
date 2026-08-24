@@ -44,7 +44,7 @@ import {
   loadConfigForPersona,
 } from "../config.ts";
 import { loadPhantomchatPersonaConfig } from "../channels/phantomchat/personaStore.ts";
-import { synthesize, ttsSupport } from "../lib/audio.ts";
+import { type AudioSupport, synthesize, ttsSupport } from "../lib/audio.ts";
 import type { WriteSink } from "../lib/io.ts";
 import { log } from "../lib/logger.ts";
 import {
@@ -267,7 +267,7 @@ export async function runNotify(input: RunNotifyInput = {}): Promise<number> {
     // text sends means a provider misconfig fails before we half-notify.
     let voiceAudio: { data: Buffer; mime: string } | undefined;
     if (input.voice) {
-      const support = ttsSupport(config);
+      const support = await ttsSupport(config);
       if (!support.ok) {
         if (!input.message) {
           err.write(
@@ -373,7 +373,7 @@ export async function runNotify(input: RunNotifyInput = {}): Promise<number> {
 }
 
 function describeAudioFailure(
-  s: Extract<ReturnType<typeof ttsSupport>, { ok: false }>,
+  s: Extract<AudioSupport, { ok: false }>,
 ): string {
   if (s.reason === "provider_none") return "no TTS provider configured";
   if (s.reason === "provider_no_stt") {
@@ -381,7 +381,7 @@ function describeAudioFailure(
     // the same provider, but TS still wants the branch covered.
     return `${s.provider} has no STT (shouldn't happen on tts path)`;
   }
-  return `key missing for ${s.provider} (env var ${s.envVar})`;
+  return `key missing for ${s.provider} (vault key ${s.envVar})`;
 }
 
 export default defineCommand({

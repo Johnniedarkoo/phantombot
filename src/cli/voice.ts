@@ -1,8 +1,9 @@
 /**
  * `phantombot voice` — interactive TUI for TTS/STT provider configuration.
  *
- * Provider + voice metadata land in config.toml under [voice]. API keys
- * land in the .env file alongside config.toml.
+ * Provider + voice metadata land in config.toml under [voice]. API keys land
+ * in the PERSONA'S ENCRYPTED VAULT (#452) — never in a plaintext .env, which
+ * nothing reads at runtime any more.
  */
 
 import { defineCommand } from "citty";
@@ -14,7 +15,7 @@ import { type Config, loadConfig, personaDir } from "../config.ts";
 import type { WriteSink } from "../lib/io.ts";
 import { personaConfigPath } from "../lib/personaConfig.ts";
 import { setIn, updateConfigToml } from "../lib/configWriter.ts";
-import { defaultEnvFilePath, updateEnvFile } from "../lib/envFile.ts";
+import { setPersonaSecret } from "../lib/vaultSecrets.ts";
 import { defaultServiceControl, type ServiceControl } from "../lib/platform.ts";
 import {
   AZURE_EDGE_DEFAULTS,
@@ -32,9 +33,12 @@ import { maybePromptRestart } from "./harness.ts";
 
 export interface ApplyVoiceInput {
   configPath: string;
-  envPath: string;
+  /** Host config — resolves which persona's vault the key is written to. */
+  config: Config;
+  /** Persona whose vault receives the key. Defaults to the default persona. */
+  persona?: string;
   voice: VoiceConfig;
-  /** If set, write to env. If "" (empty string), CLEAR the env var. If undefined, leave env untouched. */
+  /** If set, store in the persona vault. If undefined, leave secrets alone. */
   apiKey?: string;
 }
 
@@ -63,11 +67,24 @@ export async function applyVoiceConfig(input: ApplyVoiceInput): Promise<void> {
     }
   });
 
-  if (input.apiKey !== undefined) {
+  if (input.apiKey !== undefined && input.apiKey !== "") {
     const provider = input.voice.provider;
     if (provider === "elevenlabs" || provider === "openai") {
       const envVar = ENV_KEY_FOR_PROVIDER[provider];
-      await updateEnvFile(input.envPath, { [envVar]: input.apiKey });
+      const r = await setPersonaSecret(
+        input.config,
+        envVar,
+        input.apiKey,
+        input.persona,
+      );
+      if (!r.ok) {
+        // Surfaced, not swallowed: the config now names a provider whose key
+        // did not persist, and a silent failure here reads to the operator as
+        // "voice configured" right up until the first turn goes mute.
+        throw new Error(
+          `voice: could not store ${envVar} in the ${r.persona} vault: ${r.error}`,
+        );
+      }
     }
   }
 }
@@ -164,7 +181,8 @@ export async function runVoice(input: RunInput = {}): Promise<number> {
   if (provider === "none") {
     await applyVoiceConfig({
       configPath: voiceConfigPath,
-      envPath: defaultEnvFilePath(),
+      config,
+      persona,
       voice: { provider: "none" },
     });
     p.note(`provider set to "none"`, "Saved");
@@ -176,17 +194,19 @@ export async function runVoice(input: RunInput = {}): Promise<number> {
   }
 
   if (provider === "elevenlabs")
-    return runElevenLabsFlow(voiceConfigPath, svc, existing, embedded);
+    return runElevenLabsFlow(voiceConfigPath, config, persona, svc, existing, embedded);
   if (provider === "openai")
-    return runOpenAIFlow(voiceConfigPath, svc, existing, embedded);
+    return runOpenAIFlow(voiceConfigPath, config, persona, svc, existing, embedded);
   if (provider === "azure_edge")
-    return runAzureEdgeFlow(voiceConfigPath, svc, existing, embedded);
+    return runAzureEdgeFlow(voiceConfigPath, config, persona, svc, existing, embedded);
   return 0;
 }
 
 async function runElevenLabsFlow(
   /** The persona config file these settings are written to. */
   voiceConfigPath: string,
+  config: Config,
+  persona: string,
   svc: ServiceControl,
   existing: VoiceConfig,
   embedded: boolean,
@@ -231,7 +251,8 @@ async function runElevenLabsFlow(
 
   await applyVoiceConfig({
     configPath: voiceConfigPath,
-    envPath: defaultEnvFilePath(),
+    config,
+    persona,
     apiKey: key as string,
     voice: {
       provider: "elevenlabs",
@@ -249,7 +270,7 @@ async function runElevenLabsFlow(
     `provider:  elevenlabs\n` +
       `voice id:  ${(voiceId as string) || cur.voiceId}\n` +
       `model:     ${(modelId as string) || cur.modelId}\n` +
-      `key saved to ${defaultEnvFilePath()} as ${ENV_KEY_FOR_PROVIDER.elevenlabs}`,
+      `key saved to the ${persona} vault as ${ENV_KEY_FOR_PROVIDER.elevenlabs}`,
     "Saved",
   );
   if (!embedded) {
@@ -262,6 +283,8 @@ async function runElevenLabsFlow(
 async function runOpenAIFlow(
   /** The persona config file these settings are written to. */
   voiceConfigPath: string,
+  config: Config,
+  persona: string,
   svc: ServiceControl,
   existing: VoiceConfig,
   embedded: boolean,
@@ -309,7 +332,8 @@ async function runOpenAIFlow(
 
   await applyVoiceConfig({
     configPath: voiceConfigPath,
-    envPath: defaultEnvFilePath(),
+    config,
+    persona,
     apiKey: key as string,
     voice: {
       provider: "openai",
@@ -324,7 +348,7 @@ async function runOpenAIFlow(
     `provider:  openai\n` +
       `voice:     ${voice}\n` +
       `model:     ${model}\n` +
-      `key saved to ${defaultEnvFilePath()} as ${ENV_KEY_FOR_PROVIDER.openai}`,
+      `key saved to the ${persona} vault as ${ENV_KEY_FOR_PROVIDER.openai}`,
     "Saved",
   );
   if (!embedded) {
@@ -337,6 +361,8 @@ async function runOpenAIFlow(
 async function runAzureEdgeFlow(
   /** The persona config file these settings are written to. */
   voiceConfigPath: string,
+  config: Config,
+  persona: string,
   svc: ServiceControl,
   existing: VoiceConfig,
   embedded: boolean,
@@ -354,7 +380,8 @@ async function runAzureEdgeFlow(
 
   await applyVoiceConfig({
     configPath: voiceConfigPath,
-    envPath: defaultEnvFilePath(),
+    config,
+    persona,
     voice: {
       provider: "azure_edge",
       azure_edge: {

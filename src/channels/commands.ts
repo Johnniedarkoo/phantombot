@@ -963,13 +963,7 @@ async function handleModel(
   }
   // Persona-scoped write: /model must change the models of the persona whose
   // chat this is, not the host's (phantombot#441).
-  const result = await applyModelRequest(
-    req,
-    primary.id,
-    ctx.config,
-    undefined,
-    ctx.persona,
-  );
+  const result = await applyModelRequest(req, primary.id, ctx.config, ctx.persona);
   if (!result.ok) return { reply: result.error };
 
   log.info("commands: /model applied", {

@@ -39,7 +39,8 @@ import {
   restartCommand,
   type ServiceControl,
 } from "../lib/platform.ts";
-import { defaultEnvFilePath, updateEnvFile } from "../lib/envFile.ts";
+import { setPersonaSecret } from "../lib/vaultSecrets.ts";
+import { openPersonaVault } from "../lib/vault.ts";
 import { parseOpenClawVoice } from "../lib/voice.ts";
 import { applyVoiceConfig } from "./voice.ts";
 import { parseOpenClawTelegram } from "./telegram.ts";
@@ -401,32 +402,49 @@ async function maybeImportOpenclawVoice(args: {
   if (!v) return;
   await applyVoiceConfig({
     configPath: args.config.configPath,
-    envPath: defaultEnvFilePath(),
+    config: args.config,
     voice: v.config,
-    // Don't overwrite an existing key in the .env from openclaw.json.
-    // If the user wants to import the key too, they can re-run
-    // `phantombot voice` and paste it.
+    // Key handled below so an existing vault entry is never overwritten.
   });
   if (v.importedKey) {
-    // Conservatively SET if missing; never overwrite a key the user's
-    // already configured.
-    const envPath = defaultEnvFilePath();
-    const { loadEnvFile } = await import("../lib/envFile.ts");
-    const cur = await loadEnvFile(envPath);
-    if (!cur[v.importedKey.var]) {
-      await updateEnvFile(envPath, {
-        [v.importedKey.var]: v.importedKey.value,
-      });
+    // Conservatively SET if missing; never overwrite a key the user's already
+    // configured. "Already configured" now means the persona VAULT (#452), not
+    // a plaintext .env.
+    const persona = args.config.defaultPersona;
+    let existing: string | undefined;
+    try {
+      const vault = await openPersonaVault(
+        personaDir(args.config, persona),
+      );
+      try {
+        existing = vault.get(v.importedKey.var);
+      } finally {
+        vault.close();
+      }
+    } catch {
+      // Vault unreadable — treat as "don't touch it". Importing over a vault
+      // we cannot read risks clobbering a key we simply failed to see.
+      existing = "";
+    }
+    if (!existing) {
+      const r = await setPersonaSecret(
+        args.config,
+        v.importedKey.var,
+        v.importedKey.value,
+        persona,
+      );
       args.out.write(
         `\nimported voice config from ${openclawJsonPath}:\n` +
           `  provider: ${v.config.provider}\n` +
-          `  api key:  ${v.importedKey.var} (saved to .env — was empty before)\n`,
+          (r.ok
+            ? `  api key:  ${v.importedKey.var} (saved to the ${persona} vault — was empty before)\n`
+            : `  api key:  ${v.importedKey.var} FAILED to save (${r.error}); run \`phantombot voice\`\n`),
       );
     } else {
       args.out.write(
         `\nimported voice metadata from ${openclawJsonPath}:\n` +
           `  provider: ${v.config.provider}\n` +
-          `  api key:  ${v.importedKey.var} already set in .env (left unchanged)\n`,
+          `  api key:  ${v.importedKey.var} already in the ${persona} vault (left unchanged)\n`,
       );
     }
   } else {

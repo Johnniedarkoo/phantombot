@@ -18,12 +18,11 @@
  * appends to them forever with no size cap, so the heartbeat rotates them
  * itself — see src/lib/logRotate.ts.
  *
- * Note on env files: launchd's `EnvironmentVariables` plist key only
- * accepts inline static values — it has no equivalent of systemd's
- * `EnvironmentFile=`. Phantombot self-loads `~/.env` and
- * `~/.config/phantombot/.env` at startup (see src/index.ts), so the
- * agent finds credentials in process.env on both platforms without
- * needing per-plist env entries here.
+ * Note on credentials: launchd's `EnvironmentVariables` plist key only
+ * accepts inline static values, and since #452 no platform sources a
+ * plaintext env file anyway — phantombot decrypts the active persona's
+ * vault at startup (see src/index.ts), so the agent finds credentials in
+ * process.env on every platform without per-plist env entries here.
  */
 
 import { existsSync } from "node:fs";

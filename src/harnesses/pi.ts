@@ -53,7 +53,7 @@ import {
 } from "../lib/piRouting.ts";
 import { CODER_SWAP_MAX_ATTEMPTS, getCoderSwapOverride, resolveSwapModel } from "../lib/coderSwap.ts";
 import { buildToolCall, type ToolCallDetail } from "./toolNote.ts";
-import { reloadEnvFiles, withPersonaEnv } from "../lib/envBootstrap.ts";
+import { withPersonaEnv } from "../lib/envBootstrap.ts";
 import { reloadVaultForPersona } from "../lib/vault.ts";
 import {
   type HarnessActivity,
@@ -217,10 +217,6 @@ export class PiHarness implements Harness {
     // choice that pairs with the saved models.
     const provider = this.config.routing?.provider;
 
-    // Re-source the legacy/runtime env files so file-backed model and routing
-    // settings changed on the previous turn are visible without a daemon
-    // restart. See envBootstrap.ts for the sticky-vs-reloadable rules.
-    await reloadEnvFiles();
     // Reconcile this persona's encrypted vault into the env BEFORE the Pi API
     // key is read below — the key is a vault secret post-migration. See claude.ts.
     await reloadVaultForPersona(req.persona);

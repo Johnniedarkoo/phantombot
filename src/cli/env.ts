@@ -7,11 +7,9 @@
  * agent muscle-memory and scripts don't break, but it now prints a one-line
  * deprecation notice to stderr and forwards straight to the vault runners.
  *
- * `userEnvPath()` is still exported here because harness.ts writes the Pi
- * routing key to it via updateEnvFile — that write path stays intact so
- * nothing fails to compile or run. (Those writes feed the plaintext-file
- * migration on the next startup, which fans keys into the vault and then
- * removes the file.)
+ * `userEnvPath()` names the LEGACY `~/.env` for the one-way migration in
+ * lib/vaultMigrate.ts. Nothing writes it any more (#452) and nothing reads it
+ * at runtime; it exists so the importer can find the file it is retiring.
  */
 
 import { defineCommand } from "citty";
@@ -29,8 +27,8 @@ import type { WriteSink } from "../lib/io.ts";
 
 /**
  * Path to the user's legacy centralized credentials file. Override via env var
- * for testing. Still used by harness.ts for the Pi routing key write; the
- * startup migration then folds that file's keys into the vault.
+ * for testing. Read-only legacy: the startup migration folds this file's keys
+ * into the persona vaults once and nothing writes it (#452).
  */
 export function userEnvPath(): string {
   return process.env.PHANTOMBOT_USER_ENV_FILE ?? join(homedir(), ".env");

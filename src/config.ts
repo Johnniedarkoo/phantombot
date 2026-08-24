@@ -33,6 +33,7 @@ import {
 import { DEFAULT_STT_TIMEOUT_MS } from "./lib/voice.ts";
 import {
   mergeToml,
+  personaConfigPath,
   readPersonaToml,
   stripHostOnlyKeys,
 } from "./lib/personaConfig.ts";
@@ -49,6 +50,86 @@ import { usablePersistedBin } from "./lib/harnessBinPath.ts";
  * gated by a module-scoped flag so loadConfig can be called multiple
  * times in tests without spamming.
  */
+/**
+ * RETIRED keys in a host or persona config.toml — each superseded, whether or
+ * not it is still read.
+ *
+ * "Retired" is not the same as "ignored". `max_payload_bytes` is genuinely
+ * dead; `turn_timeout_s` is still honoured as an alias for the two timeout
+ * ceilings, and the warning exists to move operators off it, NOT to tell them
+ * it does nothing. Each entry's `advice` carries that distinction — do not
+ * flatten it back into "ignored" in a caller, or someone deletes a key that is
+ * currently doing work.
+ *
+ * Each entry is a dotted path plus the one-line "do this instead". A retired
+ * key is not an error — the file still loads — but it MUST be loud, because
+ * the failure mode it causes is silent: the operator edits a setting, the
+ * daemon reads past it, and behaviour never changes. Warn on every load rather
+ * than once per process: a daemon that started before the operator opened the
+ * file would otherwise have burned its only chance to say so.
+ *
+ * Add to this list whenever a key is retired; never delete an entry just
+ * because the key is "old" — hosts upgrade from arbitrarily far back.
+ */
+export const DEPRECATED_CONFIG_KEYS: ReadonlyArray<{
+  path: readonly string[];
+  advice: string;
+}> = [
+  {
+    path: ["harnesses", "pi", "max_payload_bytes"],
+    advice:
+      "retired and ignored — pi streams its payload via temp files with no size ceiling. Remove it.",
+  },
+  {
+    path: ["turn_timeout_s"],
+    advice:
+      "deprecated — replace with harness_idle_timeout_s and harness_hard_timeout_s.",
+  },
+];
+
+function tomlHasPath(
+  toml: Record<string, unknown>,
+  path: readonly string[],
+): boolean {
+  let cur: unknown = toml;
+  for (const key of path) {
+    if (typeof cur !== "object" || cur === null) return false;
+    if (!(key in (cur as Record<string, unknown>))) return false;
+    cur = (cur as Record<string, unknown>)[key];
+  }
+  return cur !== undefined;
+}
+
+/**
+ * Warn — loudly, on every load — about retired keys still present in a
+ * config.toml, naming the file so the operator knows which one to edit.
+ *
+ * Called for BOTH layers. Since #441 a persona's own config.toml can set the
+ * same retired keys as the host's, and a persona file is exactly where a
+ * silent edit hides: the operator edits the file they think is authoritative,
+ * nothing changes, and no line in the log names it. The persona layer is
+ * checked BEFORE `stripHostOnlyKeys`, so a retired host-only key written into
+ * a persona file is reported rather than silently discarded.
+ *
+ * Pure apart from the log call; returns the paths warned about so a test can
+ * assert the mechanism rather than the log transport.
+ */
+export function warnDeprecatedConfigKeys(
+  globalToml: Record<string, unknown>,
+  configPath: string,
+): string[] {
+  const found: string[] = [];
+  for (const entry of DEPRECATED_CONFIG_KEYS) {
+    if (!tomlHasPath(globalToml, entry.path)) continue;
+    const dotted = entry.path.join(".");
+    found.push(dotted);
+    log.warn(
+      `DEPRECATED: ${configPath} still sets \`${dotted}\` — ${entry.advice}`,
+    );
+  }
+  return found;
+}
+
 /**
  * One-shot deprecation warning for the retired pi `max_payload_bytes` /
  * `PHANTOMBOT_PI_MAX_PAYLOAD` knob. Module-scoped flag so repeated loadConfig
@@ -938,6 +1019,7 @@ export async function loadConfig(persona?: string): Promise<Config> {
     join(xdgConfigHome(), "phantombot", "config.toml");
 
   const globalToml = await tryReadToml(configPath);
+  warnDeprecatedConfigKeys(globalToml, configPath);
   const state = await loadState();
 
   const dataDir = join(xdgDataHome(), "phantombot");
@@ -956,9 +1038,12 @@ export async function loadConfig(persona?: string): Promise<Config> {
     asString(globalToml.default_persona) ??
     "phantom";
 
-  const personaToml = stripHostOnlyKeys(
-    await readPersonaToml(personasDir, personaLayer),
+  const rawPersonaToml = await readPersonaToml(personasDir, personaLayer);
+  warnDeprecatedConfigKeys(
+    rawPersonaToml,
+    personaConfigPath(personasDir, personaLayer),
   );
+  const personaToml = stripHostOnlyKeys(rawPersonaToml);
   const isDefaultPersona =
     personaLayer ===
     (process.env.PHANTOMBOT_DEFAULT_PERSONA ??
@@ -2191,4 +2276,50 @@ function asBool(v: unknown): boolean | undefined {
     if (["0", "false", "no", "off"].includes(s)) return false;
   }
   return undefined;
+}
+
+/**
+ * Env var names that config.toml now OWNS outright (#452).
+ *
+ * These are the non-secret harness/model/routing MIRRORS the setup wizards
+ * used to write into `~/.env` alongside the real credentials. `/model` and
+ * `phantombot harness` write only `config.toml` now — but an upgraded host
+ * still has the stale mirrors sitting in its plaintext `~/.env`, and the
+ * one-way vault import would otherwise fan them into every persona vault.
+ *
+ * That would be strictly WORSE than leaving them in the plaintext file. A
+ * vaulted key is injected into `process.env` at every startup, and
+ * `harnessEnv(...) ?? asString(toml…)` resolves ENV FIRST — so a mirror that
+ * used to be inert-and-drifting would become a permanent override that
+ * outranks the only store now being written. `/model claude sonnet` would
+ * appear to work, then silently revert on the next spawn. The suffixed
+ * `_<PERSONA>` forms are worse still: they beat even the persona's own file.
+ *
+ * The vault is a SECRETS store. Settings with a live home in config.toml do
+ * not belong in it, so they are dropped at import rather than migrated.
+ */
+export const CONFIG_OWNED_ENV_MIRRORS: readonly string[] = [
+  "PHANTOMBOT_HARNESS_CHAIN",
+  "PHANTOMBOT_CLAUDE_BIN",
+  "PHANTOMBOT_CLAUDE_MODEL",
+  "PHANTOMBOT_CLAUDE_FALLBACK_MODEL",
+  "PHANTOMBOT_CODEX_BIN",
+  "PHANTOMBOT_CODEX_MODEL",
+  "PHANTOMBOT_PI_BIN",
+  "PHANTOMBOT_PI_PROVIDER",
+  "PHANTOMBOT_PRIMARY_MODEL",
+  "PHANTOMBOT_IMAGE_MODEL",
+  "PHANTOMBOT_CODING_MODEL",
+];
+
+/**
+ * True when `name` is a retired config.toml mirror — either the bare name or
+ * its per-persona `_<PERSONA>` variant. Suffixes are matched structurally
+ * (`<NAME>_<SUFFIX>`) rather than against the live persona list, because the
+ * plaintext file being imported can name personas that no longer exist.
+ */
+export function isConfigOwnedEnvMirror(name: string): boolean {
+  return CONFIG_OWNED_ENV_MIRRORS.some(
+    (base) => name === base || name.startsWith(`${base}_`),
+  );
 }
