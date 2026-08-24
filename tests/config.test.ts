@@ -1292,8 +1292,14 @@ describe("loadConfig — deprecation warnings cover the persona layer", () => {
       cap.restore();
     }
 
-    const warned = cap.lines.join("");
-    expect(warned).toContain("turn_timeout_s");
-    expect(warned).toContain(personaFile);
+    // Assert on the PARSED message, not raw stderr: the logger emits
+    // JSON.stringify'd lines, so a Windows path arrives backslash-escaped and
+    // never substring-matches the join()ed path. Matching one parsed line also
+    // stops two separate warnings from satisfying the two halves between them.
+    const msgs = cap.lines
+      .flatMap((l) => l.split("\n"))
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l).msg as string);
+    expect(msgs.some((m) => m.includes("turn_timeout_s") && m.includes(personaFile))).toBe(true);
   });
 });

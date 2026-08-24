@@ -17,7 +17,11 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "../src/config.ts";
-import { openPersonaVault } from "../src/lib/vault.ts";
+import {
+  _resetVaultTrackingForTesting,
+  loadVaultIntoEnv,
+  openPersonaVault,
+} from "../src/lib/vault.ts";
 
 const SAVED_ENV = {
   PHANTOMBOT_OPENAI_API_KEY: process.env.PHANTOMBOT_OPENAI_API_KEY,
@@ -386,5 +390,28 @@ describe("voiceApiKey — the key follows the persona, not the environment", () 
     // Pre-vault hosts, and shell/systemd exports, must keep working.
     process.env.PHANTOMBOT_OPENAI_API_KEY = "sk-ambient";
     expect(await voiceApiKey(cfgFor("never-provisioned"))).toBe("sk-ambient");
+  });
+
+  test("but NOT to an env value this process injected from another persona's vault", async () => {
+    // The ambient fallback is for HOST-wide values (shell export, systemd
+    // Environment=). A key startup injected from the default persona's vault
+    // is that persona's alone: falling back to it puts robbie's key on lena's
+    // TTS request — and nondeterministically, since reloadVaultForPersona()
+    // rewrites these names before every harness spawn.
+    delete process.env.PHANTOMBOT_OPENAI_API_KEY;
+    await seedVault("robbie", "sk-robbie");
+    await mkdir(join(workdir, "lena"), { recursive: true });
+    _resetVaultTrackingForTesting();
+    try {
+      await loadVaultIntoEnv(join(workdir, "robbie"));
+      expect(process.env.PHANTOMBOT_OPENAI_API_KEY as string | undefined).toBe(
+        "sk-robbie",
+      );
+
+      expect(await voiceApiKey(cfgFor("lena"))).toBeUndefined();
+      expect(await voiceApiKey(cfgFor("robbie"))).toBe("sk-robbie");
+    } finally {
+      _resetVaultTrackingForTesting();
+    }
   });
 });

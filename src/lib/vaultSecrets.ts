@@ -22,7 +22,7 @@ import { type Config, personaDir } from "../config.ts";
 import { log } from "./logger.ts";
 import { existsSync } from "node:fs";
 
-import { openPersonaVault, vaultPath } from "./vault.ts";
+import { isVaultInjectedEnvKey, openPersonaVault, vaultPath } from "./vault.ts";
 
 export interface SetPersonaSecretResult {
   ok: boolean;
@@ -120,18 +120,24 @@ export async function unsetPersonaSecret(
  * request. The value is returned to the caller and goes no further.
  *
  * The `process.env` fallback keeps pre-vault hosts working: a key exported by
- * the shell, or one this process injected at startup, is still honoured when
- * the persona's vault has no row of its own. Never throws — an unopenable
- * vault degrades to the env fallback.
+ * the shell or set by a systemd `Environment=` is host-wide, so it is still
+ * honoured when the persona's vault has no row of its own. A key this process
+ * injected FROM a vault is not: it belongs to exactly one persona, and letting
+ * it stand in here would put the startup persona's credential on a secondary
+ * persona's request — nondeterministically, since `reloadVaultForPersona()`
+ * rewrites those names before every harness spawn. Same guard tick's
+ * `--secret` resolution applies. Never throws — an unopenable vault degrades
+ * to the ambient fallback.
  */
 export async function getPersonaSecret(
   config: Config,
   name: string,
   persona?: string,
 ): Promise<string | undefined> {
-  return (
-    (await getPersonaSecretStrict(config, name, persona)) ?? process.env[name]
-  );
+  const fromVault = await getPersonaSecretStrict(config, name, persona);
+  if (fromVault !== undefined) return fromVault;
+  if (isVaultInjectedEnvKey(name)) return undefined;
+  return process.env[name];
 }
 
 /**
