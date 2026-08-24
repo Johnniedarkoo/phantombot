@@ -897,7 +897,7 @@ describe("ensureUnitCurrent", () => {
     expect(await readFile(unitPath, "utf8")).toBe(expected);
   });
 
-  test("pre-Phase-29 unit lacking EnvironmentFile= → rerender adds it", async () => {
+  test("a unit that drifted from the template is rerendered to it", async () => {
     const sys = new FakeSystemctl();
     const stale = `[Unit]
 Description=Phantombot — personality-first chat agent
@@ -915,14 +915,13 @@ StandardError=journal
 [Install]
 WantedBy=default.target
 `;
-    expect(stale).not.toContain("EnvironmentFile=");
     await writeFile(unitPath, stale, "utf8");
     const r = await ensureUnitCurrent({ unitPath, binPath: BIN, systemctl: sys });
     expect(r.rerendered).toBe(true);
     expect(sys.calls).toEqual([["--user", "daemon-reload"]]);
     const rewritten = await readFile(unitPath, "utf8");
-    expect(rewritten).toContain("EnvironmentFile=-%h/.config/phantombot/.env");
     expect(rewritten).toContain(`ExecStart=${BIN} run`);
+    expect(rewritten).toContain("SuccessExitStatus=143");
   });
 });
 

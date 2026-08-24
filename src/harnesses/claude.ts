@@ -55,7 +55,7 @@ import type {
   HarnessRequest,
 } from "./types.ts";
 import { buildToolCall } from "./toolNote.ts";
-import { reloadEnvFiles, withPersonaEnv } from "../lib/envBootstrap.ts";
+import { withPersonaEnv } from "../lib/envBootstrap.ts";
 import { reloadVaultForPersona } from "../lib/vault.ts";
 import {
   type HarnessActivity,
@@ -189,19 +189,16 @@ export class ClaudeHarness implements Harness {
       systemPromptBytes,
     });
 
-    // Re-source the legacy/runtime env files so file-backed model, routing,
-    // and voice settings changed on the previous turn are visible without a
-    // daemon restart. Shell-exported keys remain sticky — see envBootstrap.ts.
-    await reloadEnvFiles();
-    // Then reconcile THIS persona's encrypted vault into the env (the canonical
-    // credential store; the .env files above are only the legacy transitional
-    // path). This makes a `vault set` from the previous turn visible now and
-    // ensures the subprocess sees only this persona's secrets.
+    // Reconcile THIS persona's encrypted vault into the env — the ONLY runtime
+    // credential source since #452 (plaintext .env is a one-way legacy import,
+    // never re-read). This makes a `vault set` from the previous turn visible
+    // now and ensures the subprocess sees only this persona's secrets.
     await reloadVaultForPersona(req.persona);
 
     // OAuth-on-host: don't leak any ANTHROPIC_* / CLAUDE_CODE_* auth or
-    // routing var into the subprocess env (reloadEnvFiles just re-sourced
-    // ~/.env), so claude resolves credentials from ~/.claude/.credentials.json.
+    // routing var into the subprocess env (the vault reload above may have
+    // injected one), so claude resolves credentials from
+    // ~/.claude/.credentials.json.
     const env = withPersonaEnv(
       {
         ...filterAuthEnv(process.env),

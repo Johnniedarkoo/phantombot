@@ -180,8 +180,6 @@ export function buildNightlyLaunch(
       `--unit=${unitName}`,
       `--description=Phantombot nightly sweep (${persona})`,
       `--property=Environment=PATH=${nightlyUnitPath(env.home)}`,
-      `--property=EnvironmentFile=-${env.home}/.config/phantombot/.env`,
-      `--property=EnvironmentFile=-${env.home}/.env`,
       "--",
       bare.command,
       ...bare.args,
@@ -233,7 +231,7 @@ export function bareNightlyCommand(persona: string): {
  * asynchronously would re-open the same race one level up, with the helper
  * killed before it had registered the unit.
  *
- * A failing `systemd-run` (old systemd without transient EnvironmentFile, no
+ * A failing `systemd-run` (old systemd, no
  * user bus, a name collision) falls back to the bare detached child, which is
  * strictly what this function did before. The sweep is ledger-driven and
  * idempotent, so a duplicate launch is harmless.

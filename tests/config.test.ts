@@ -22,6 +22,7 @@ import {
   memoryIndexPath,
   personaDir,
   personaEnvSuffix,
+  warnDeprecatedHostConfigKeys,
 } from "../src/config.ts";
 
 const isWindows = process.platform === "win32";
@@ -1202,5 +1203,53 @@ describe("loadConfig — update_channel (release rings, #432)", () => {
     process.env.PHANTOMBOT_UPDATE_CHANNEL = "";
     const c = await loadConfig();
     expect(c.updateChannel).toBe("preview");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Deprecated host-config keys (#452)
+// ---------------------------------------------------------------------------
+
+describe("warnDeprecatedHostConfigKeys", () => {
+  test("names every retired key present in the host file", () => {
+    const warned = warnDeprecatedHostConfigKeys(
+      {
+        turn_timeout_s: 300,
+        harnesses: { pi: { max_payload_bytes: 1024, bin: "pi" } },
+      },
+      "/home/kai/.config/phantombot/config.toml",
+    );
+    expect(warned.sort()).toEqual([
+      "harnesses.pi.max_payload_bytes",
+      "turn_timeout_s",
+    ]);
+  });
+
+  test("says nothing about a clean file", () => {
+    expect(
+      warnDeprecatedHostConfigKeys(
+        { harnesses: { pi: { bin: "pi" } } },
+        "/home/kai/.config/phantombot/config.toml",
+      ),
+    ).toEqual([]);
+  });
+
+  test("warns EVERY time, not once per process", () => {
+    // The failure it reports is silent (an edit that does nothing), and a
+    // daemon that started before the operator opened the file would otherwise
+    // have already spent its single warning.
+    const toml = { turn_timeout_s: 300 };
+    expect(warnDeprecatedHostConfigKeys(toml, "/c.toml")).toEqual([
+      "turn_timeout_s",
+    ]);
+    expect(warnDeprecatedHostConfigKeys(toml, "/c.toml")).toEqual([
+      "turn_timeout_s",
+    ]);
+  });
+
+  test("a key whose PARENT table is absent is not reported", () => {
+    expect(warnDeprecatedHostConfigKeys({ harnesses: {} }, "/c.toml")).toEqual(
+      [],
+    );
   });
 });

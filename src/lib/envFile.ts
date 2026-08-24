@@ -1,9 +1,13 @@
 /**
- * Tiny .env reader/writer for phantombot's secrets file.
+ * Tiny READ-ONLY .env parser for the LEGACY plaintext secrets files.
  *
- * Lives at $XDG_CONFIG_HOME/phantombot/.env. Distinct from config.toml
- * (user-managed, may have comments) — secrets here are phantombot-managed
- * (set/cleared by `phantombot voice` and similar). Mode 600 on write.
+ * Lives at $XDG_CONFIG_HOME/phantombot/.env. As of #452 phantombot never
+ * WRITES a .env file and never reads one at runtime: the only remaining
+ * consumer is `vaultMigrate.ts`, which imports each file once into the
+ * encrypted per-persona vaults and stamps it as done. The writer half
+ * (`saveEnvFile`/`updateEnvFile`) has been deleted deliberately — a write path
+ * into a file nothing reads is a silent data-loss bug, and re-adding one is
+ * what `tests/lib-envFile.test.ts` guards against.
  *
  * Format: standard shell-style `KEY=value`, one per line, no quoting
  * unless the value contains whitespace or `#` (then we wrap in double
@@ -13,14 +17,8 @@
  */
 
 import { existsSync } from "node:fs";
-import {
-  mkdir,
-  readFile,
-  rename,
-  unlink,
-  writeFile,
-} from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { xdgConfigHome } from "../config.ts";
 
 export type EnvVars = Record<string, string>;
@@ -36,53 +34,6 @@ export async function loadEnvFile(path: string): Promise<EnvVars> {
   if (!existsSync(path)) return {};
   const text = await readFile(path, "utf8");
   return parseEnv(text);
-}
-
-export async function saveEnvFile(
-  path: string,
-  vars: EnvVars,
-): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  const lines: string[] = [];
-  for (const [k, v] of Object.entries(vars)) {
-    if (!/^[A-Z_][A-Z0-9_]*$/i.test(k)) continue; // skip invalid keys silently
-    lines.push(`${k}=${quote(v)}`);
-  }
-  // Write to a tempfile at mode 0o600 then atomically rename over the target.
-  // Avoids the chmod race where a fresh file is briefly world-readable at
-  // umask-default 0o644 between writeFile() and a follow-up chmod().
-  const tmp = `${path}.tmp`;
-  try {
-    await writeFile(tmp, lines.join("\n") + "\n", {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    await rename(tmp, path);
-  } catch (e) {
-    try {
-      await unlink(tmp);
-    } catch {
-      /* best-effort cleanup */
-    }
-    throw e;
-  }
-}
-
-/**
- * Update a subset of variables in-place, preserving the rest. Useful when
- * `phantombot voice` only knows about the TTS keys but the env file may
- * contain unrelated user-set values.
- */
-export async function updateEnvFile(
-  path: string,
-  patch: EnvVars,
-): Promise<void> {
-  const cur = await loadEnvFile(path);
-  for (const [k, v] of Object.entries(patch)) {
-    if (v === "") delete cur[k];
-    else cur[k] = v;
-  }
-  await saveEnvFile(path, cur);
 }
 
 export function parseEnv(text: string): EnvVars {
@@ -108,12 +59,4 @@ export function parseEnv(text: string): EnvVars {
     out[key] = val;
   }
   return out;
-}
-
-function quote(v: string): string {
-  if (v === "") return "";
-  if (/[\s#"'\\]/.test(v)) {
-    return `"${v.replace(/(["\\])/g, "\\$1")}"`;
-  }
-  return v;
 }

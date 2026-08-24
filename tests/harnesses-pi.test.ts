@@ -17,8 +17,8 @@ import {
   piActivity,
   renderPayload,
 } from "../src/harnesses/pi.ts";
-import * as envBootstrap from "../src/lib/envBootstrap.ts";
 import type { HarnessChunk, HarnessRequest } from "../src/harnesses/types.ts";
+import * as vault from "../src/lib/vault.ts";
 
 const FAKE_PI = resolve(__dirname, "fixtures/fake-pi.sh");
 
@@ -321,31 +321,28 @@ describe("piActivity — idle-watchdog classification", () => {
 
 let originalMode: string | undefined;
 
-// Hermetic env-file isolation. PiHarness.invoke() calls reloadEnvFiles(), which
-// re-sources ~/.env and $XDG_CONFIG_HOME/phantombot/.env into process.env. On
-// any machine that ACTUALLY has Pi configured (a dev box, or Lena), those files
-// carry a real PHANTOMBOT_PI_API_KEY / PHANTOMBOT_PI_PROVIDER — which the reload
-// would silently re-inject, undoing the `delete process.env...` these tests rely
-// on and breaking the "no key → no --api-key flag" / "clears stale provider"
-// assertions off the test author's machine. Redirecting env vars can't fix the
-// `~/.env` arm because Bun caches os.homedir() at startup. So stub the reload to
-// a no-op: these tests assert argv / child-env construction against process.env,
-// NOT the reconcile behavior (lib-envBootstrap.test.ts covers that with injected
-// paths). The spy makes every invoke read exactly the process.env the test set.
-let reloadSpy: ReturnType<typeof spyOn> | undefined;
+// Hermetic credential isolation. PiHarness.invoke() no longer re-sources a
+// plaintext .env (#452) — it reloads the ACTIVE PERSONA'S VAULT instead, and
+// that is now the leak this stub closes: on any machine where the running
+// persona genuinely has Pi configured (a dev box, Lena), the reload injects a
+// real PHANTOMBOT_PI_API_KEY / PHANTOMBOT_PI_PROVIDER into process.env, undoing
+// the `delete process.env…` these tests rely on and breaking the "no key → no
+// --api-key flag" assertions off the test author's machine. These tests assert
+// argv / child-env construction against the process.env each test sets, so the
+// reload is stubbed to a no-op and asserted separately below.
+let vaultReloadSpy: ReturnType<typeof spyOn> | undefined;
 
 beforeEach(() => {
   originalMode = process.env.FAKE_PI_MODE;
-  reloadSpy = spyOn(envBootstrap, "reloadEnvFiles").mockResolvedValue({
-    updated: [],
-    removed: [],
-  });
+  vaultReloadSpy = spyOn(vault, "reloadVaultForPersona").mockResolvedValue(
+    undefined as never,
+  );
 });
 
 afterEach(() => {
   if (originalMode === undefined) delete process.env.FAKE_PI_MODE;
   else process.env.FAKE_PI_MODE = originalMode;
-  reloadSpy?.mockRestore();
+  vaultReloadSpy?.mockRestore();
 });
 
 const mkHarness = () => new PiHarness({ bin: FAKE_PI });
@@ -755,15 +752,15 @@ describe("PiHarness routing (subprocess)", () => {
     }
   });
 
-  test("invoke re-sources env files each turn (reloadEnvFiles is called)", async () => {
-    // The reload is stubbed for hermeticity (see top-of-file note), so lock in
-    // the guarantee it stands for: phantombot re-sources ~/.env per turn so a
-    // file-backed runtime setting changed last turn is visible without a daemon
-    // restart. If a refactor ever drops the call, this fails instead of silently
-    // regressing behind the stub.
+  test("invoke reloads the persona VAULT each turn (the only credential source)", async () => {
+    // #452 replaced the per-turn `.env` re-source with this: the encrypted
+    // persona vault is now the sole path by which a credential changed on the
+    // previous turn (a `phantombot vault set`) reaches the next subprocess. If
+    // a refactor drops the call, keys go stale for the life of the daemon —
+    // silently — so assert the call itself (the stub is set in beforeEach).
     process.env.FAKE_PI_MODE = "argv";
     await collect(mkHarness().invoke(newRequest()));
-    expect(reloadSpy).toHaveBeenCalled();
+    expect(vaultReloadSpy).toHaveBeenCalled();
   });
 });
 

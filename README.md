@@ -476,8 +476,8 @@ Common paths:
 | Path | Purpose |
 |---|---|
 | `~/.config/phantombot/config.toml` | Main config |
-| `~/.config/phantombot/.env` | Phantombot runtime secrets, such as voice provider keys |
-| `~/.env` | General credentials available to the harness |
+| `~/.local/share/phantombot/personas/<name>/vault.sqlite` | That persona's secrets, encrypted at rest (`phantombot vault`) |
+| `~/.config/phantombot/.env`, `~/.env` | **Legacy plaintext credentials. Imported into the vaults once, then never read again.** Kept (with a `.migrated-to-vault` stamp beside them) so you can roll back to an older build; delete them when you're satisfied |
 | `~/.local/share/phantombot/memory.sqlite` | Rolling turns, tasks, capture log |
 | `~/.local/share/phantombot/personas/<name>/` | Persona markdown memory and KB |
 | `~/.local/share/phantombot/personas/<name>/config.toml` | That persona's own settings (channels, voice, chattiness, **and its `[harnesses]` block — chain, models, Pi routing**) |
@@ -1177,10 +1177,8 @@ mirrored into `config.toml` under `[harnesses.pi.routing]` and visible to
 `/model` shows and switches the model every configured harness runs — from
 chat, with no config-file editing. It works across all three supported
 harnesses, and writes are **permanent and survive restarts**: every change
-lands in *both* `config.toml` and `~/.env` (env takes precedence at startup,
-so a TOML-only write would be silently ignored on installs where the setup
-wizard already wrote `PHANTOMBOT_*_MODEL` vars), the in-memory config is
-synced, and phantombot restarts itself — the same dance as `/restart`, since
+lands in `config.toml` (the only store — the old `~/.env` mirror was removed
+in #452), the in-memory config is synced, and phantombot restarts itself — the same dance as `/restart`, since
 harness model config is baked in at process start.
 
 ```text

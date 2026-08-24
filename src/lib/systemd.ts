@@ -32,22 +32,18 @@ export const RETIRED_UNIT_NAMES = [
 export const TICK_SERVICE_NAME = "phantombot-tick.service";
 export const TICK_TIMER_NAME = "phantombot-tick.timer";
 
-/**
- * Both .env files we source into every phantombot unit:
- *   ~/.config/phantombot/.env  — phantombot's own runtime secrets
- *                                 (TTS keys; written by `phantombot voice`).
- *   ~/.env                     — legacy credentials plus file-backed harness
- *                                 routing settings; credentials migrate into
- *                                 the encrypted persona vault at startup.
+/*
+ * NOTE (#452): the units deliberately carry NO `EnvironmentFile=` lines.
+ * Phantombot's units used to source `~/.config/phantombot/.env` and `~/.env`,
+ * which made the plaintext files authoritative in practice while the docs
+ * called the vault canonical. Secrets now reach the process exactly one way —
+ * `loadVaultIntoEnv()` decrypting the active persona's vault at startup — and
+ * the plaintext files are a one-way legacy import kept only for rollback.
  *
- * Leading `-` makes both optional — a fresh install with neither file
- * present still starts cleanly. The merged process.env is what spawned
- * harnesses inherit, so the agent finds credentials without re-reading
- * the file.
+ * Rollback: an operator who needs the old behaviour can add the two
+ * `EnvironmentFile=-%h/...` lines back to the generated unit by hand (or
+ * install an older phantombot); the plaintext files are never deleted.
  */
-const ENVIRONMENT_FILE_LINES =
-  "EnvironmentFile=-%h/.config/phantombot/.env\n" +
-  "EnvironmentFile=-%h/.env";
 
 export const PHANTOMBOT_SERVICE_PATH =
   "%h/.local/share/pi-node/bin:" +
@@ -103,9 +99,8 @@ export interface SystemdUnitParams {
  *   shim locations. Versioned npm/node install paths must still leave a
  *   stable executable on one of these PATH entries or doctor/startup will
  *   report the missing harness.
- * - Two EnvironmentFile= lines: phantombot's own .env plus the user's
- *   general-purpose ~/.env. The agent finds credentials in process.env
- *   without re-reading either file. See ENVIRONMENT_FILE_LINES.
+ * - No EnvironmentFile= lines: credentials come from the encrypted persona
+ *   vault at startup, never from a plaintext file (#452).
  */
 export function generateSystemdUnit(params: SystemdUnitParams): string {
   const exec = [params.binPath, ...params.args].map(quoteArg).join(" ");
@@ -135,7 +130,6 @@ SuccessExitStatus=143
 # half. The code-level watchdog (~5s) is the primary fix; this is the floor.
 TimeoutStopSec=15s
 Environment="PATH=${PHANTOMBOT_SERVICE_PATH}"
-${ENVIRONMENT_FILE_LINES}
 StandardOutput=journal
 StandardError=journal
 
@@ -159,7 +153,6 @@ Description=Phantombot heartbeat — mechanical 30-minute maintenance pass
 Type=oneshot
 ExecStart=${exec}
 Environment="PATH=${PHANTOMBOT_SERVICE_PATH}"
-${ENVIRONMENT_FILE_LINES}
 StandardOutput=journal
 StandardError=journal
 `;
@@ -202,7 +195,6 @@ Type=oneshot
 ExecStart=${exec}
 TimeoutStartSec=infinity
 Environment="PATH=${PHANTOMBOT_SERVICE_PATH}"
-${ENVIRONMENT_FILE_LINES}
 StandardOutput=journal
 StandardError=journal
 `;
@@ -393,10 +385,11 @@ export interface ServiceControl {
    * it's stale (or absent under conditions where re-render is appropriate).
    * Returns whether a rewrite happened — callers can use it to print a notice.
    *
-   * Why this matters: a pre-Phase-29 unit lacks `EnvironmentFile=`, so
-   * secrets written to ~/.config/phantombot/.env (TTS keys, etc.) never
-   * reach the running service even after restart. The voice/telegram/harness
-   * TUIs call this before restart so the saved config actually takes effect.
+   * Why this matters: a stale unit can carry retired directives (e.g. the
+   * pre-#452 `EnvironmentFile=` lines that sourced plaintext .env files) or
+   * miss current ones, so a restart alone doesn't give the service the
+   * environment the current build expects. The voice/telegram/harness TUIs
+   * call this before restart so the saved config actually takes effect.
    */
   rerenderUnitIfStale(): Promise<{ rerendered: boolean; backupPath?: string }>;
 }

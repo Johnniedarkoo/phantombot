@@ -7,10 +7,10 @@
  *   - azure_edge:  Microsoft's free Edge TTS endpoint (no key)
  *   - none:        TTS/STT disabled
  *
- * API keys live in $XDG_CONFIG_HOME/phantombot/.env; voice metadata
- * (provider, voice ID, model, modulation params) lives in config.toml
- * under [voice]. The systemd unit reads the .env file via
- * EnvironmentFile= so the keys are available at runtime.
+ * API keys live in the PERSONA'S ENCRYPTED VAULT (#452), injected into
+ * process.env at startup by loadVaultIntoEnv(); voice metadata (provider,
+ * voice ID, model, modulation params) lives in that persona's config.toml
+ * under [voice].
  */
 
 export type VoiceProvider = "elevenlabs" | "openai" | "azure_edge" | "none";

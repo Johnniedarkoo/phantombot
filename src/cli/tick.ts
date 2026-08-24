@@ -23,12 +23,11 @@
  * the next minute's tick picks up. Skipping is preferred over piling
  * up — see the "skip missed runs" decision in the design doc.
  *
- * The tick runs as the OS user that owns the systemd timer
- * (typically the same user as `phantombot run`), so it inherits both
- * EnvironmentFile=-%h/.config/phantombot/.env and EnvironmentFile=-%h/.env
- * from the unit. Spawned harnesses see the merged environment; command
- * tasks do not. They get a minimal env plus explicitly allowlisted
- * `--secret NAME` values.
+ * The tick runs as the OS user that owns the systemd timer (typically the
+ * same user as `phantombot run`) and decrypts the active persona's vault at
+ * startup like any other invocation (#452). Spawned harnesses see that
+ * environment; command tasks do not. They get a minimal env plus explicitly
+ * allowlisted `--secret NAME` values.
  */
 
 import { defineCommand } from "citty";

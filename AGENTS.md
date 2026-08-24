@@ -97,7 +97,7 @@ phantombot/
 │   │   ├── init.ts           # phantombot init (first-run setup)
 │   │   ├── install.ts uninstall.ts
 │   │   ├── update.ts         # phantombot update (consumes the GH releases feed)
-│   │   ├── env.ts            # phantombot env (manages ~/.env)
+│   │   ├── env.ts            # phantombot env (DEPRECATED alias → phantombot vault)
 │   │   ├── notify.ts         # phantombot notify — broadcasts text/voice to all authorized recipients on every channel
 │   │   ├── task.ts           # phantombot task (CRUD over scheduled tasks)
 │   │   ├── tick.ts           # phantombot tick (called by phantombot-tick.timer every minute)
@@ -126,7 +126,7 @@ phantombot/
 │       ├── systemd.ts        # Linux unit generators + install/uninstall + ensureUnitCurrent
 │       ├── launchd.ts        # macOS LaunchAgent (plist) generators + install/uninstall (mirrors systemd.ts)
 │       ├── windowsJob.ts      # Windows Job Object process-tree ownership
-│       ├── envBootstrap.ts   # self-load ~/.env + .config/.env at startup; reloadEnvFiles() before each spawn
+│       ├── envBootstrap.ts   # withPersonaEnv() per-spawn context (no .env sourcing since #452)
 │       ├── harnessRunner.ts  # shared spawn/kill/idle-timeout/abort coordination for all harnesses
 │       ├── harnessAvailability.ts cooldown.ts  # binary-on-PATH detection + per-harness fast-fallback cooldown
 │       ├── tasks.ts          # task store (bun:sqlite tasks table) + CRUD
@@ -157,7 +157,7 @@ phantombot/
 - **Harness chain** (`harnesses/buildChain.ts` + `src/orchestrator/fallback.ts` + `lib/harnessRunner.ts`) resolves `[harnesses.personas.<name>].chain` first and uses the global `[harnesses].chain` when the persona has no non-empty override. Every turn entry point must pass its persona to `buildHarnessChain`; a daemon or tick process can serve several personas with different primaries. The resolved chain tries primary first and falls through on a recoverable error (with per-harness cooldown for fast fallback). Failover is invisible to the user by design, so `lib/harnessAlert.ts` notifies the owner when that silence would hide something real: a primary failing **authentication** for several turns in a row (still served, but by a fallback that may be billed per token), or the **whole chain exhausted** with no reply delivered. A harness killed by an external SIGTERM/SIGINT (systemd stopping the cgroup during a restart) is classified as shutdown, NOT as a recoverable harness error — otherwise every restart with a turn in flight spawns a paid fallback for a reply nobody receives.
 - **Security perimeter** (`lib/threatJudge.ts` + `orchestrator/screen.ts`) — trusted principals act directly; untrusted input is judged in code before any capable harness sees it. See "Security perimeter".
 - **Channels** are a channel-agnostic core + thin per-channel adapters (`src/channels/core/` + `src/channels/telegram/`); `phantombot run` is the long-running process. See "Channel layer".
-- **Env bootstrap** (`lib/envBootstrap.ts`) self-sources the legacy/runtime `.env` files at startup (required on macOS, no-op on Linux) and re-sources them before each harness spawn; each harness then reloads the active persona's encrypted vault so `phantombot vault set` takes effect mid-session.
+- **Credential bootstrap** (`lib/vaultMigrate.ts` → `lib/vault.ts`) imports any legacy plaintext `.env` into the per-persona encrypted vaults ONCE, then `loadVaultIntoEnv()` injects the active persona's secrets into `process.env` at startup; each harness reloads that vault before every spawn so `phantombot vault set` takes effect mid-session. Nothing reads a `.env` file at runtime (#452).
 - **Tick fires scheduled tasks** (`src/cli/tick.ts`); 1-minute systemd timer; lockfile prevents overlap; missed runs are skipped, not piled up.
 - **Heartbeat is mechanical** (no LLM); **nightly is cognitive** (LLM-driven distillation).
 - **`workingDir` is REQUIRED on every `runTurn` call** (#387) — the harness subprocess cwd, deliberately with no default. Interactive surfaces (telegram, phantomchat, ask, tick, reactions) pass `homedir()`, because the owner asks for work on repos all over their home dir. Machine-driven background turns (nightly) pass the **persona dir**. This used to silently default to `homedir()` and every background caller took the default, so nightly stages woke up in `$HOME` unable to see their own `memory/` from cwd — and went hunting for it. On macOS those recursive walks cross `~/Library/Containers`, tripping the TCC `kTCCServiceSystemPolicyAppData` prompt ("phantombot would like to access data from other apps") once per spawned date. If you add a `runTurn` caller, decide which tree it may treat as home and say so explicitly.
@@ -242,16 +242,9 @@ grant is claude-only — pi and codex have no positive-grant flag and ignore it 
 so treat it as defence-in-depth, **not** a trust boundary. `toolsMode: "none"`
 is the real boundary, and it's reserved for the threat judge.
 
-Every service has **two `EnvironmentFile=` lines**:
+Services carry **no `EnvironmentFile=` lines** (#452). They used to source `~/.config/phantombot/.env` and `~/.env`, which made those plaintext files authoritative in practice while the docs called the vault canonical — and gave macOS (whose launchd plists cannot source a file) a permanently different credential path.
 
-```
-EnvironmentFile=-%h/.config/phantombot/.env    # phantombot's own secrets (TTS keys)
-EnvironmentFile=-%h/.env                        # user's general credentials
-```
-
-Leading `-` makes both optional (no error if either file is absent). The merged `process.env` is what spawned harnesses inherit, so the agent finds credentials without re-reading either file.
-
-**macOS has no `EnvironmentFile=` equivalent.** launchd plists can't source a file, so on macOS `lib/envBootstrap.ts` self-loads both legacy/runtime `.env` files into `process.env` at startup (existing values win, so nothing already set is clobbered). On Linux this is a cheap no-op because systemd already sourced them. Before each spawn, harnesses reload those files and then reconcile the active persona's encrypted vault, so a freshly-written `phantombot vault set` secret is visible mid-session without a restart.
+Credentials now travel one way on every platform: `loadVaultIntoEnv()` decrypts the ACTIVE persona's vault at startup and injects it into `process.env`, and each harness calls `reloadVaultForPersona()` before a spawn so a `phantombot vault set` from the previous turn is visible without a restart. An existing shell export always wins over a vault value, exactly as it did over the old files.
 
 Service units also set a deterministic `PATH` that includes `~/.local/bin` plus stable user harness shim locations such as `~/.local/share/pi-node/bin` and `~/.local/share/pi-node/current/bin`. Do not rely on interactive shell startup files for service harness discovery. When Phantombot finds a harness in PATH or common npm/pi-node versioned locations, it saves the absolute path in `state.json` and executes that path directly on later starts. `phantombot run` must never fail startup just because a harness binary is missing; log loudly, keep the headless service alive, and let `phantombot doctor` report/repair the configured chain. Windows keep-alive tasks invoke `phantombot run --if-not-running`, which treats an existing run lock as a silent success; foreground invocations retain the diagnostic error.
 
@@ -436,3 +429,5 @@ If your PR does any of the things in the "contributing discipline" list above, *
 3. If your change introduces a new common pitfall (something a future contributor would trip on), add it to the **Common pitfalls** section.
 
 This file is short on purpose. Don't pad it. Each section earns its place by saving someone else 20 minutes of archeology.
+
+32. **`.env` is a ONE-WAY LEGACY IMPORT — no runtime read, no write, and the file is kept rather than deleted (issue #452).** Phantombot sold the vault as canonical while `~/.env` and `~/.config/phantombot/.env` were still live on both sides: the units sourced them, `lib/envBootstrap.ts` re-sourced them before every spawn, and the model/voice/harness/importer wizards wrote to them — so the startup migration deleted files a later wizard run promptly recreated, and docs and reality disagreed about where a secret lived. All of it is gone in one direction: `vaultMigrate.ts` imports each plaintext file into the per-persona vaults exactly once and NOTHING reads one afterwards (`envFile.ts` is a read-only parser with `vaultMigrate` as its only importer, guarded by a test that enumerates the importers). Wizards write secrets through `lib/vaultSecrets.ts` into the persona's vault; non-secret model/routing settings write to `config.toml` only, and the old `PHANTOMBOT_*_MODEL` env mirror is deleted — a mirror nothing reads can only drift. Three things are load-bearing. **The plaintext file is NOT deleted.** An operator has to be able to roll back to an older phantombot that still sources it, so the migration keeps the bytes; what changes is that they stop mattering. **Therefore the migration needs a STAMP, not an absence.** `<file>.migrated-to-vault` is what makes the import happen once; without it a retained file would be re-imported on every startup and would silently stomp any `phantombot vault set` rotation made since — the file's absence used to carry that state, and keeping the file removed the signal. The stamp is written only after every key read back through the decrypt path, and a failure to write it means the whole file is retried next startup (verified-but-unstamped is reported as NOT imported, never as done). **Deprecation must be LOUD and repeated.** A surviving `.env`, and any retired key still present in the host `config.toml` (`DEPRECATED_HOST_CONFIG_KEYS` in `src/config.ts`), warns on EVERY startup rather than once per process: the failure mode is silent — an operator edits a setting and nothing changes — and a daemon that started before they opened the file would otherwise have already spent its one chance to say so. Rollback for the units is manual and documented: re-add the two `EnvironmentFile=-%h/...` lines, or install an older build; the files are still there. Out of scope and still open: Telegram tokens and Gemini embedding keys living in `config.toml`.

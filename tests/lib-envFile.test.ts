@@ -1,21 +1,22 @@
+/**
+ * envFile.ts is a READ-ONLY legacy parser (#452), plus the guard that keeps it
+ * that way.
+ *
+ * The writer half (saveEnvFile / updateEnvFile) and its round-trip suite were
+ * deleted with the write paths themselves: phantombot never writes a .env file
+ * any more, and nothing reads one at runtime. The last two tests here are the
+ * regression guards — they fail if a new writer or a new runtime reader is
+ * added, which is the exact way this migration would silently un-finish.
+ */
+
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
-import {
-  chmod,
-  mkdtemp,
-  readFile,
-  rm,
-  stat,
-  writeFile,
-} from "node:fs/promises";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  loadEnvFile,
-  parseEnv,
-  saveEnvFile,
-  updateEnvFile,
-} from "../src/lib/envFile.ts";
+
+import * as envFile from "../src/lib/envFile.ts";
+import { loadEnvFile, parseEnv } from "../src/lib/envFile.ts";
 
 let workdir: string;
 let envPath: string;
@@ -41,122 +42,66 @@ describe("parseEnv", () => {
   });
 
   test("handles single-quoted values", () => {
-    expect(parseEnv("X='quoted'\n")).toEqual({ X: "quoted" });
+    expect(parseEnv(`A='hello world'\n`)).toEqual({ A: "hello world" });
+  });
+
+  test("unescapes a double-quoted value written by an older phantombot", () => {
+    // The retired writer escaped `\` and `"`. Files it produced are still on
+    // disk and still have to import correctly.
+    expect(parseEnv(`A="say \\"hi\\""\nB="back\\\\slash"\n`)).toEqual({
+      A: 'say "hi"',
+      B: "back\\slash",
+    });
   });
 });
 
-describe("saveEnvFile / loadEnvFile round-trip", () => {
-  test("writes the file and reads it back", async () => {
-    await saveEnvFile(envPath, { FOO: "bar", PHANTOMBOT_X: "abc-123" });
-    expect(existsSync(envPath)).toBe(true);
-    expect(await loadEnvFile(envPath)).toEqual({
-      FOO: "bar",
-      PHANTOMBOT_X: "abc-123",
-    });
-  });
-
-  test("write quotes values with spaces or special chars", async () => {
-    await saveEnvFile(envPath, { X: "has space", Y: "no-special" });
-    const text = await readFile(envPath, "utf8");
-    expect(text).toContain('X="has space"');
-    expect(text).toContain("Y=no-special");
-  });
-
-  test("file mode is 600 after save (owner-only)", async () => {
-    await saveEnvFile(envPath, { FOO: "bar" });
-    const s = await stat(envPath);
-    // Mode bits we care about: rwx for owner, none for group/world.
-    expect((s.mode & 0o077).toString(8)).toBe("0");
-  });
-
-  test("loadEnvFile returns {} when file is missing", async () => {
+describe("loadEnvFile", () => {
+  test("returns {} when the file is missing", async () => {
     expect(await loadEnvFile(envPath)).toEqual({});
   });
 
-  test("round-trips a value containing a double-quote", async () => {
-    const value = 'has " quote';
-    await saveEnvFile(envPath, { X: value });
-    expect((await loadEnvFile(envPath)).X).toBe(value);
-  });
-
-  test("round-trips a value containing a backslash", async () => {
-    const value = "has \\ backslash";
-    await saveEnvFile(envPath, { X: value });
-    expect((await loadEnvFile(envPath)).X).toBe(value);
-  });
-
-  test("round-trips a value containing both \\ and \"", async () => {
-    const value = 'mix \\ and " here';
-    await saveEnvFile(envPath, { X: value });
-    expect((await loadEnvFile(envPath)).X).toBe(value);
-  });
-
-  test('round-trips the literal two-char sequence \\"', async () => {
-    const value = '\\"'; // backslash + double-quote (2 chars)
-    expect(value.length).toBe(2);
-    await saveEnvFile(envPath, { X: value });
-    expect((await loadEnvFile(envPath)).X).toBe(value);
-  });
-
-  test("updateEnvFile replaces a 0644 file with mode 0600 (no chmod race)", async () => {
-    // Pre-create the file at a world-readable mode to simulate the case
-    // where the previous saveEnvFile lost the race or an outside process
-    // wrote it. After updateEnvFile the final mode must be 0o600.
-    await writeFile(envPath, "OLD=1\n", { encoding: "utf8", mode: 0o644 });
-    await chmod(envPath, 0o644); // belt-and-braces in case umask masked it
-    expect((await stat(envPath)).mode & 0o077).not.toBe(0);
-
-    await updateEnvFile(envPath, { OLD: "2", NEW: "3" });
-
-    const s = await stat(envPath);
-    expect((s.mode & 0o777).toString(8)).toBe("600");
-    expect(await loadEnvFile(envPath)).toEqual({ OLD: "2", NEW: "3" });
+  test("reads a hand-written legacy file", async () => {
+    await writeFile(envPath, 'FOO=bar\nQUOTED="a b"\n', "utf8");
+    expect(await loadEnvFile(envPath)).toEqual({ FOO: "bar", QUOTED: "a b" });
   });
 });
 
-describe("updateEnvFile", () => {
-  test("merges patch into existing keys", async () => {
-    await saveEnvFile(envPath, { A: "1", B: "2" });
-    await updateEnvFile(envPath, { B: "two", C: "3" });
-    expect(await loadEnvFile(envPath)).toEqual({
-      A: "1",
-      B: "two",
-      C: "3",
-    });
-  });
-
-  test("empty value DELETES the key", async () => {
-    await saveEnvFile(envPath, { A: "1", B: "2" });
-    await updateEnvFile(envPath, { B: "" });
-    expect(await loadEnvFile(envPath)).toEqual({ A: "1" });
-  });
-
-  test("creates the file if it doesn't exist", async () => {
-    await updateEnvFile(envPath, { NEW: "1" });
-    expect(await loadEnvFile(envPath)).toEqual({ NEW: "1" });
-  });
-
-  test("ignores keys that aren't valid env-var names", async () => {
-    await saveEnvFile(envPath, {
-      VALID: "1",
-      "with-dash": "skipped",
-      "1starts-digit": "skipped",
-    });
-    expect(await loadEnvFile(envPath)).toEqual({ VALID: "1" });
+describe("no .env WRITE path exists (#452)", () => {
+  test("envFile exports no writer", () => {
+    const exported = Object.keys(envFile).sort();
+    expect(exported).toEqual(["defaultEnvFilePath", "loadEnvFile", "parseEnv"]);
   });
 });
 
-describe("preserves keys it doesn't know about", () => {
-  test("hand-edited additional vars survive an updateEnvFile call", async () => {
-    await writeFile(
-      envPath,
-      "USER_VAR=keep_me\nPHANTOMBOT_X=managed\n",
+describe("no .env RUNTIME READ path exists (#452)", () => {
+  /** Every .ts file under src/, recursively. */
+  function srcFiles(dir: string, out: string[] = []): string[] {
+    for (const name of readdirSync(dir)) {
+      const full = join(dir, name);
+      if (statSync(full).isDirectory()) srcFiles(full, out);
+      else if (name.endsWith(".ts")) out.push(full);
+    }
+    return out;
+  }
+
+  test("vaultMigrate is the only module that imports envFile", () => {
+    const importers = srcFiles(join(import.meta.dir, "..", "src"))
+      .filter((f) => !f.endsWith("envFile.ts"))
+      .filter((f) => /from "[^"]*envFile\.ts"/.test(readFileSync(f, "utf8")))
+      .map((f) => f.split("/").pop());
+    // A second importer means something reads the plaintext file at runtime
+    // again — the exact state #452 removed. Migrate it to the vault
+    // (lib/vaultSecrets.ts) instead of widening this list.
+    expect(importers.sort()).toEqual(["vaultMigrate.ts"]);
+  });
+
+  test("no generated systemd unit sources a .env file", () => {
+    const systemd = readFileSync(
+      join(import.meta.dir, "..", "src", "lib", "systemd.ts"),
       "utf8",
     );
-    await updateEnvFile(envPath, { PHANTOMBOT_X: "managed_v2" });
-    expect(await loadEnvFile(envPath)).toEqual({
-      USER_VAR: "keep_me",
-      PHANTOMBOT_X: "managed_v2",
-    });
+    // Comments explain why the directive is absent; only an actual emitted
+    // `EnvironmentFile=` line (inside a unit template) would re-source it.
+    expect(systemd).not.toMatch(/^EnvironmentFile=/m);
   });
 });

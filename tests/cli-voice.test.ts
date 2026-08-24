@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { maybePromptRestart } from "../src/cli/harness.ts";
 import { applyVoiceConfig, runVoice } from "../src/cli/voice.ts";
 import type { Config } from "../src/config.ts";
-import { loadEnvFile } from "../src/lib/envFile.ts";
+import { personaDir } from "../src/config.ts";
+import { openPersonaVault } from "../src/lib/vault.ts";
 import {
   ensureUnitCurrent,
   generateSystemdUnit,
@@ -17,12 +18,28 @@ import {
 
 let workdir: string;
 let configPath: string;
-let envPath: string;
+let personasDir: string;
+let hostConfig: Config;
+
+/** Read one secret back out of a persona's encrypted vault. */
+async function readVault(
+  persona: string,
+  name: string,
+): Promise<string | undefined> {
+  const vault = await openPersonaVault(personaDir(hostConfig, persona));
+  try {
+    return vault.get(name);
+  } finally {
+    vault.close();
+  }
+}
 
 beforeEach(async () => {
   workdir = await mkdtemp(join(tmpdir(), "phantombot-voice-"));
   configPath = join(workdir, "config.toml");
-  envPath = join(workdir, ".env");
+  personasDir = join(workdir, "personas");
+  await mkdir(join(personasDir, "phantom"), { recursive: true });
+  hostConfig = { defaultPersona: "phantom", personasDir } as unknown as Config;
 });
 
 afterEach(async () => {
@@ -33,7 +50,7 @@ describe("applyVoiceConfig — elevenlabs", () => {
   test("writes [voice] + [voice.elevenlabs] to config.toml + key to env", async () => {
     await applyVoiceConfig({
       configPath,
-      envPath,
+      config: hostConfig,
       apiKey: "sk_live_TEST",
       voice: {
         provider: "elevenlabs",
@@ -51,8 +68,11 @@ describe("applyVoiceConfig — elevenlabs", () => {
     expect(cfg).toContain('provider = "elevenlabs"');
     expect(cfg).toContain("[voice.elevenlabs]");
     expect(cfg).toContain('voice_id = "voice_123"');
-    const env = await loadEnvFile(envPath);
-    expect(env.PHANTOMBOT_ELEVENLABS_API_KEY).toBe("sk_live_TEST");
+    // Key lands in the persona's ENCRYPTED vault, never a plaintext file.
+    expect(await readVault("phantom", "PHANTOMBOT_ELEVENLABS_API_KEY")).toBe(
+      "sk_live_TEST",
+    );
+    expect(existsSync(join(workdir, ".env"))).toBe(false);
   });
 });
 
@@ -60,7 +80,7 @@ describe("applyVoiceConfig — openai", () => {
   test("writes [voice.openai] block", async () => {
     await applyVoiceConfig({
       configPath,
-      envPath,
+      config: hostConfig,
       apiKey: "sk-OAITEST",
       voice: {
         provider: "openai",
@@ -69,8 +89,9 @@ describe("applyVoiceConfig — openai", () => {
     });
     const cfg = await readFile(configPath, "utf8");
     expect(cfg).toContain('voice = "nova"');
-    const env = await loadEnvFile(envPath);
-    expect(env.PHANTOMBOT_OPENAI_API_KEY).toBe("sk-OAITEST");
+    expect(await readVault("phantom", "PHANTOMBOT_OPENAI_API_KEY")).toBe(
+      "sk-OAITEST",
+    );
   });
 });
 
@@ -78,7 +99,7 @@ describe("applyVoiceConfig — azure_edge", () => {
   test("writes [voice.azure_edge] block; does NOT write any key (free)", async () => {
     await applyVoiceConfig({
       configPath,
-      envPath,
+      config: hostConfig,
       voice: {
         provider: "azure_edge",
         azure_edge: {
@@ -90,9 +111,12 @@ describe("applyVoiceConfig — azure_edge", () => {
     });
     const cfg = await readFile(configPath, "utf8");
     expect(cfg).toContain('voice = "en-US-JennyNeural"');
-    const env = await loadEnvFile(envPath);
-    expect(env.PHANTOMBOT_ELEVENLABS_API_KEY).toBeUndefined();
-    expect(env.PHANTOMBOT_OPENAI_API_KEY).toBeUndefined();
+    expect(
+      await readVault("phantom", "PHANTOMBOT_ELEVENLABS_API_KEY"),
+    ).toBeUndefined();
+    expect(
+      await readVault("phantom", "PHANTOMBOT_OPENAI_API_KEY"),
+    ).toBeUndefined();
   });
 });
 
@@ -100,7 +124,7 @@ describe("applyVoiceConfig — none", () => {
   test('flips provider to "none"', async () => {
     await applyVoiceConfig({
       configPath,
-      envPath,
+      config: hostConfig,
       voice: { provider: "none" },
     });
     const cfg = await readFile(configPath, "utf8");
@@ -109,9 +133,11 @@ describe("applyVoiceConfig — none", () => {
 });
 
 describe("voice save flow rewrites stale systemd unit before restart", () => {
-  test("on-disk unit lacking EnvironmentFile= is rewritten and restart sees the upgraded unit", async () => {
-    // Pre-create a stale unit (no EnvironmentFile=). This is the exact
-    // shape of an install from before Phase 29 — the bug the PR fixes.
+  test("a stale on-disk unit is rewritten to the current template before restart", async () => {
+    // Pre-create a stale unit. Since #452 the staleness that matters is the
+    // reverse of the original bug: an OLD unit still carries the retired
+    // `EnvironmentFile=` lines that sourced plaintext .env files, and the
+    // rerender is what strips them.
     const unitPath = join(workdir, "phantombot.service");
     const BIN = "/home/kai/.local/bin/phantombot";
     const stale = `[Unit]
@@ -120,11 +146,13 @@ Description=Phantombot — personality-first chat agent
 [Service]
 Type=simple
 ExecStart=${BIN} run
+EnvironmentFile=-%h/.config/phantombot/.env
+EnvironmentFile=-%h/.env
 
 [Install]
 WantedBy=default.target
 `;
-    expect(stale).not.toContain("EnvironmentFile=");
+    expect(stale).toContain("EnvironmentFile=");
     await writeFile(unitPath, stale, "utf8");
 
     class FakeSystemctl implements SystemctlRunner {
@@ -159,11 +187,9 @@ WantedBy=default.target
     // instrumentation. This is the gap #35 was filed to close.
     await maybePromptRestart(svc, async () => true);
 
-    // The on-disk unit now has EnvironmentFile= — the actual fix.
+    // The on-disk unit no longer sources any plaintext .env — the #452 fix.
     const rewritten = await readFile(unitPath, "utf8");
-    expect(rewritten).toContain(
-      "EnvironmentFile=-%h/.config/phantombot/.env",
-    );
+    expect(rewritten).not.toContain("EnvironmentFile=");
     expect(rewritten).toBe(generateSystemdUnit({ binPath: BIN, args: ["run"] }));
 
     // daemon-reload was issued as part of the rerender.
@@ -173,9 +199,7 @@ WantedBy=default.target
     // restart. If a refactor swaps the two lines, this fails — that's
     // what was missing from the previous version of this test.
     expect(callOrder).toEqual(["rerender", "restart"]);
-    expect(unitContentAtRestart).toContain(
-      "EnvironmentFile=-%h/.config/phantombot/.env",
-    );
+    expect(unitContentAtRestart).not.toContain("EnvironmentFile=");
   });
 
   test("maybePromptRestart skips restart when confirm returns false", async () => {

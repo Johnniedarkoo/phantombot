@@ -42,9 +42,8 @@ import {
   resolveRoutingProvider,
   type RoutingChoices,
 } from "../lib/piRouting.ts";
-import { updateEnvFile } from "../lib/envFile.ts";
+import { setPersonaSecret, unsetPersonaSecret } from "../lib/vaultSecrets.ts";
 import { writePiApiKey } from "../lib/piAuthStore.ts";
-import { userEnvPath } from "./env.ts";
 import { saveHarnessBins } from "../state.ts";
 import { harnessChainIds } from "../harnesses/buildChain.ts";
 
@@ -59,7 +58,6 @@ export {
 } from "../lib/harnessWriteTarget.ts";
 import {
   resolveHarnessWriteTarget,
-  suffixEnvKeys,
   type HarnessWriteTarget,
 } from "../lib/harnessWriteTarget.ts";
 
@@ -154,18 +152,19 @@ export async function applyHarnessChain(
 
 /**
  * Persist the capability-routing choices: write the `[harnesses.pi.routing]`
- * sub-table to config.toml AND the PHANTOMBOT_*_MODEL env vars to ~/.env. The
- * image model is whatever the wizard collected (it pre-selects the primary as
- * the default image model when the primary is vision-capable). Returns the
- * computed writes so callers/tests can assert.
+ * sub-table to config.toml. The image model is whatever the wizard collected
+ * (it pre-selects the primary as the default image model when the primary is
+ * vision-capable). Returns the computed writes so callers/tests can assert.
  *
- * `envPath` is injectable for tests (defaults to ~/.env via userEnvPath()).
+ * Since #452 config.toml is the ONLY store for these non-secret settings; the
+ * old `PHANTOMBOT_*_MODEL` mirror into `~/.env` is gone, because nothing reads
+ * that file at runtime and a mirror nothing reads is just a second source of
+ * truth to drift. `computeRoutingWrites().env` is still returned so callers can
+ * see the effective values (the pi harness projects them per-turn).
  */
 export async function applyRouting(
   configPath: string,
   choices: RoutingChoices,
-  envPath: string = userEnvPath(),
-  envSuffix?: string,
 ): Promise<ReturnType<typeof computeRoutingWrites>> {
   const writes = computeRoutingWrites(choices);
   await updateConfigToml(configPath, (toml) => {
@@ -183,7 +182,6 @@ export async function applyRouting(
     // would report success while changing nothing.
     setRoutingKey(toml, ROUTING_LOCAL_CONFIG_KEY, undefined);
   });
-  await updateEnvFile(envPath, suffixEnvKeys(writes.env, envSuffix));
   return writes;
 }
 
@@ -196,12 +194,10 @@ export async function applyRouting(
  * The empty `[harnesses.pi.routing]` table is left behind rather than deleted:
  * `resolveRouting` maps an empty table to all-undefined, which is exactly the
  * "no overrides" state we want, and keeping the table avoids churning the TOML
- * shape. `envPath` is injectable for tests, matching applyRouting.
+ * shape.
  */
 export async function clearPiRouting(
   configPath: string,
-  envPath: string = userEnvPath(),
-  envSuffix?: string,
   opts: { tombstone?: boolean } = {},
 ): Promise<ReturnType<typeof computeRoutingClears>> {
   const clears = computeRoutingClears();
@@ -221,7 +217,6 @@ export async function clearPiRouting(
     if (!routing) return;
     for (const key of clears.tomlKeys) delete routing[key];
   });
-  await updateEnvFile(envPath, suffixEnvKeys(clears.env, envSuffix));
   return clears;
 }
 
@@ -473,7 +468,7 @@ async function configurePi(
     // ACTIVELY clear both stores — see clearPiRouting/computeRoutingClears. The
     // old "later" branch returned without clearing, so any previously-configured
     // routing kept being threaded onto every turn and this option did nothing.
-    await clearPiRouting(target.path, userEnvPath(), target.envSuffix, {
+    await clearPiRouting(target.path, {
       // Only a persona file may carry the opt-out tombstone: in the global
       // file it would be inherited by every persona that has not stated its
       // own routing, turning one persona's "use Pi's own config" into the
@@ -487,8 +482,8 @@ async function configurePi(
         "provider + model you set by running `pi` and logging in.",
         "",
         `cleared phantombot's Pi routing from ${target.path}`,
-        `and ${userEnvPath()} (provider, primary/image/coding model, API key),`,
-        "so no --model/--provider/--api-key is passed and Pi decides for itself.",
+        "(provider, primary/image/coding model), so no --model/--provider is",
+        "passed and Pi decides for itself.",
         "",
         "Re-run `phantombot harness` and pick 'Configure models' to override.",
       ].join("\n"),
@@ -527,8 +522,21 @@ async function configurePi(
   // decision is a pure, tested function; here we just enact it.
   const keyWrite = resolvePiApiKeyWrite(apiKey, provider, currentRouting.provider);
   if (keyWrite.action === "set") {
-    await updateEnvFile(userEnvPath(), { [ENV_PI_API_KEY]: keyWrite.value });
-    p.note(`saved ${ENV_PI_API_KEY} to ${userEnvPath()}`, "Pi API key");
+    const stored = await setPersonaSecret(
+      config,
+      ENV_PI_API_KEY,
+      keyWrite.value,
+      target.persona,
+    );
+    if (!stored.ok) {
+      p.note(
+        `could not save ${ENV_PI_API_KEY} to the ${stored.persona} vault: ${stored.error}\n` +
+          "Pi will fall back to its own local store until this is fixed.",
+        "Pi API key",
+      );
+    } else {
+      p.note(`saved ${ENV_PI_API_KEY} to the ${stored.persona} vault`, "Pi API key");
+    }
     // Refresh the catalog with the key we just took. On a fresh install the
     // first listing was EMPTY (Pi had no key, so `--list-models` printed "No
     // models available"), which is what forced the model pickers into free-text.
@@ -579,7 +587,7 @@ async function configurePi(
     }
     if (refreshed.length > 0) models = refreshed;
   } else if (keyWrite.action === "clear") {
-    await updateEnvFile(userEnvPath(), { [ENV_PI_API_KEY]: "" });
+    await unsetPersonaSecret(config, ENV_PI_API_KEY, target.persona);
     p.note(
       `provider changed and no new key entered — cleared the stale ${ENV_PI_API_KEY} ` +
         `so Pi falls back to its own local store`,
@@ -731,12 +739,7 @@ async function runRoutingWizard(
     imageModel,
     codingModel,
   };
-  const writes = await applyRouting(
-    target.path,
-    choices,
-    userEnvPath(),
-    target.envSuffix,
-  );
+  const writes = await applyRouting(target.path, choices);
   p.note(
     [
       `provider: ${writes.toml.provider ?? "(none — Pi's default)"}`,
@@ -744,8 +747,7 @@ async function runRoutingWizard(
       `image:   ${writes.toml.image_model ?? "(none — primary is multimodal)"}`,
       `coding:  ${writes.toml.coding_model ?? "(none)"}`,
       "",
-      `saved to ${target.path} and ${userEnvPath()}` +
-        (target.envSuffix ? ` (env vars suffixed _${target.envSuffix})` : ""),
+      `saved to ${target.path}`,
     ].join("\n"),
     "Capability routing",
   );
@@ -867,10 +869,11 @@ export const defaultConfirm: ConfirmFn = async (message) => {
  * Shared post-apply hook for the config-mutating TUIs.
  *
  * Two steps. Always: re-render the on-disk service-manager unit if it's
- * stale (a pre-Phase-29 systemd unit lacks `EnvironmentFile=` and
- * silently swallows the .env secrets the TUI just wrote; the launchd
- * plist has analogous templating). Then: if phantombot is running, offer
- * to restart it inline so the change takes effect.
+ * stale (an old unit can carry retired directives — e.g. the pre-#452
+ * `EnvironmentFile=` lines — or miss current ones, so a restart alone need
+ * not give the service the environment this build expects; the launchd plist
+ * has analogous templating). Then: if phantombot is running, offer to restart
+ * it inline so the change takes effect.
  *
  * `confirm` is parameterized so tests can drive the full ordering
  * (rerender → confirm → restart) without going through @clack's

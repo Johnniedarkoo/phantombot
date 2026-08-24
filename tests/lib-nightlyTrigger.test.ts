@@ -90,15 +90,14 @@ describe("buildNightlyLaunch", () => {
     expect(l.args.slice(sep + 1)).toEqual([bare.command, ...bare.args]);
   });
 
-  test("the transient unit re-sources the env files and pins PATH", () => {
+  test("the transient unit pins PATH and sources NO plaintext env file", () => {
     // A --user transient unit inherits the user MANAGER's environment, not the
-    // caller's, so without this the sweep would run with neither phantombot's
-    // own .env nor the agent's ~/.env, and with whatever PATH the manager has.
+    // caller's, so PATH has to be pinned explicitly. Credentials do NOT travel
+    // this way any more (#452): the sweep decrypts the persona vault itself at
+    // startup, so an EnvironmentFile= here would only resurrect the plaintext
+    // path the migration removed.
     const l = buildNightlyLaunch(bare, "robbie", systemd);
-    expect(l.args).toContain("--property=EnvironmentFile=-/home/robbie/.env");
-    expect(l.args).toContain(
-      "--property=EnvironmentFile=-/home/robbie/.config/phantombot/.env",
-    );
+    expect(l.args.some((a) => a.includes("EnvironmentFile="))).toBe(false);
     const path = l.args.find((a) => a.startsWith("--property=Environment=PATH="));
     // `%h` is a unit-FILE specifier; transient properties travel over D-Bus
     // where nothing expands it, so home must already be resolved here.

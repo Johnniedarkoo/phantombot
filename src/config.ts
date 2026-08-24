@@ -50,6 +50,70 @@ import { usablePersistedBin } from "./lib/harnessBinPath.ts";
  * times in tests without spamming.
  */
 /**
+ * Keys in the GLOBAL host config.toml that phantombot no longer honours.
+ *
+ * Each entry is a dotted path plus the one-line "do this instead". A retired
+ * key is not an error — the file still loads — but it MUST be loud, because
+ * the failure mode it causes is silent: the operator edits a setting, the
+ * daemon reads past it, and behaviour never changes. Warn on every load rather
+ * than once per process: a daemon that started before the operator opened the
+ * file would otherwise have burned its only chance to say so.
+ *
+ * Add to this list whenever a key is retired; never delete an entry just
+ * because the key is "old" — hosts upgrade from arbitrarily far back.
+ */
+export const DEPRECATED_HOST_CONFIG_KEYS: ReadonlyArray<{
+  path: readonly string[];
+  advice: string;
+}> = [
+  {
+    path: ["harnesses", "pi", "max_payload_bytes"],
+    advice:
+      "retired and ignored — pi streams its payload via temp files with no size ceiling. Remove it.",
+  },
+  {
+    path: ["turn_timeout_s"],
+    advice:
+      "deprecated — replace with harness_idle_timeout_s and harness_hard_timeout_s.",
+  },
+];
+
+function tomlHasPath(
+  toml: Record<string, unknown>,
+  path: readonly string[],
+): boolean {
+  let cur: unknown = toml;
+  for (const key of path) {
+    if (typeof cur !== "object" || cur === null) return false;
+    if (!(key in (cur as Record<string, unknown>))) return false;
+    cur = (cur as Record<string, unknown>)[key];
+  }
+  return cur !== undefined;
+}
+
+/**
+ * Warn — loudly, on every load — about retired keys still present in the host
+ * config.toml, naming the file so the operator knows which one to edit. Pure
+ * apart from the log call; returns the paths warned about so a test can assert
+ * the mechanism rather than the log transport.
+ */
+export function warnDeprecatedHostConfigKeys(
+  globalToml: Record<string, unknown>,
+  configPath: string,
+): string[] {
+  const found: string[] = [];
+  for (const entry of DEPRECATED_HOST_CONFIG_KEYS) {
+    if (!tomlHasPath(globalToml, entry.path)) continue;
+    const dotted = entry.path.join(".");
+    found.push(dotted);
+    log.warn(
+      `DEPRECATED: ${configPath} still sets \`${dotted}\` — ${entry.advice}`,
+    );
+  }
+  return found;
+}
+
+/**
  * One-shot deprecation warning for the retired pi `max_payload_bytes` /
  * `PHANTOMBOT_PI_MAX_PAYLOAD` knob. Module-scoped flag so repeated loadConfig
  * calls (tests, reloads) don't spam.
@@ -938,6 +1002,7 @@ export async function loadConfig(persona?: string): Promise<Config> {
     join(xdgConfigHome(), "phantombot", "config.toml");
 
   const globalToml = await tryReadToml(configPath);
+  warnDeprecatedHostConfigKeys(globalToml, configPath);
   const state = await loadState();
 
   const dataDir = join(xdgDataHome(), "phantombot");
