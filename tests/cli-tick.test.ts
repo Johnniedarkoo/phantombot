@@ -427,6 +427,106 @@ describe("runTick — normal task fire", () => {
     }
   });
 
+  test("--secret resolves from the TASK's persona vault, not the startup persona's", async () => {
+    // One tick process runs tasks for EVERY persona, but only the startup
+    // persona's vault is injected into process.env. Reading the ambient env
+    // here would hand kai's poller robbie's credential.
+    const { openPersonaVault } = await import("../src/lib/vault.ts");
+    for (const [persona, value] of [
+      ["phantom", "default-persona-value"],
+      ["kai", "kai-value"],
+    ] as const) {
+      await mkdir(join(workdir, "personas", persona), { recursive: true });
+      const v = await openPersonaVault(join(workdir, "personas", persona));
+      try {
+        v.set("SHARED_SECRET", value);
+      } finally {
+        v.close();
+      }
+    }
+    await writeFile(join(workdir, "personas", "kai", "BOOT.md"), "# Kai\n", "utf8");
+
+    const markerPath = join(workdir, "kai-secret.txt");
+    const created = store.add({
+      persona: "kai",
+      description: "kai poll",
+      schedule: "0 * * * *",
+      prompt: "audit context only",
+      command: `printf "%s" "$SHARED_SECRET" > ${markerPath}`,
+      commandSecrets: ["SHARED_SECRET"],
+      reviewIntervalMs: 1,
+      now: new Date("2026-05-02T09:30:00Z"),
+    });
+    if (!created.ok) throw new Error("setup");
+
+    const code = await runTick({
+      config,
+      taskStore: store,
+      memory,
+      // kai's layer resolves to the same fixture tree — the point under test is
+      // WHICH persona's vault the secret comes from, not config loading.
+      loadPersonaConfig: async (persona) => ({ ...config, personaLayer: persona }),
+      harnesses: [
+        new ScriptedHarness("h", [{ type: "done", finalText: "should not run" }]),
+      ],
+      lockPath,
+      now: new Date("2026-05-02T10:00:00Z"),
+    });
+    expect(code).toBe(0);
+    expect(await readFile(markerPath, "utf8")).toBe("kai-value");
+  });
+
+  test("another persona's vault value in process.env never stands in for a missing secret", async () => {
+    // The leak direction: kai has no row of his own. An ambient value that we
+    // injected from ANOTHER persona's vault must not be handed to his task —
+    // a genuinely host-wide export still may be (covered above).
+    const { openPersonaVault, loadVaultIntoEnv } = await import(
+      "../src/lib/vault.ts"
+    );
+    await mkdir(join(workdir, "personas", "kai"), { recursive: true });
+    await writeFile(join(workdir, "personas", "kai", "BOOT.md"), "# Kai\n", "utf8");
+    const v = await openPersonaVault(join(workdir, "personas", "phantom"));
+    try {
+      v.set("LEAKY_SECRET", "phantoms-own");
+    } finally {
+      v.close();
+    }
+    // Startup: the default persona's vault lands in the ambient environment.
+    await loadVaultIntoEnv(join(workdir, "personas", "phantom"));
+    expect(process.env.LEAKY_SECRET).toBe("phantoms-own");
+
+    const markerPath = join(workdir, "kai-leak.txt");
+    const created = store.add({
+      persona: "kai",
+      description: "kai poll",
+      schedule: "0 * * * *",
+      prompt: "audit context only",
+      command: `printf "[%s]" "$LEAKY_SECRET" > ${markerPath}`,
+      commandSecrets: ["LEAKY_SECRET"],
+      reviewIntervalMs: 1,
+      now: new Date("2026-05-02T09:30:00Z"),
+    });
+    if (!created.ok) throw new Error("setup");
+
+    try {
+      const code = await runTick({
+        config,
+        taskStore: store,
+        memory,
+        loadPersonaConfig: async (persona) => ({ ...config, personaLayer: persona }),
+        harnesses: [
+          new ScriptedHarness("h", [{ type: "done", finalText: "should not run" }]),
+        ],
+        lockPath,
+        now: new Date("2026-05-02T10:00:00Z"),
+      });
+      expect(code).toBe(0);
+      expect(await readFile(markerPath, "utf8")).toBe("[]");
+    } finally {
+      delete process.env.LEAKY_SECRET;
+    }
+  });
+
   test("command-backed due task runs without invoking any harness", async () => {
     const markerPath = join(workdir, "command-ran.txt");
     const created = store.add({

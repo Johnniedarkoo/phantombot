@@ -25,6 +25,8 @@ import type { Config } from "../src/config.ts";
 import { personaDir } from "../src/config.ts";
 import { openPersonaVault as _openPersonaVault } from "../src/lib/vault.ts";
 import { openPersonaVault, vaultPath } from "../src/lib/vault.ts";
+import { loadVaultIntoEnv } from "../src/lib/vault.ts";
+import { loadConfig } from "../src/config.ts";
 import {
   migratePlaintextToVault,
   migrationStampPath,
@@ -212,5 +214,128 @@ describe("migratePlaintextToVault", () => {
     await migratePlaintextToVault(cfg());
     // default persona vault may exist but is empty of these keys.
     expect(await readVault("robbie", "ANYTHING")).toBeUndefined();
+  });
+});
+
+describe("retired config.toml mirrors are NOT imported (#452 review)", () => {
+  test("a legacy ~/.env model mirror is dropped, secrets beside it still land", async () => {
+    // Exactly what a host upgraded from a pre-#452 build has on disk: the
+    // wizards used to write both into the same plaintext file.
+    await writeLegacyEnv(userEnv, {
+      GITHUB_TOKEN: "ghp_real_secret",
+      PHANTOMBOT_CLAUDE_MODEL: "stale-opus",
+      PHANTOMBOT_PRIMARY_MODEL: "stale/primary",
+      PHANTOMBOT_HARNESS_CHAIN: "pi",
+      PHANTOMBOT_CLAUDE_BIN: "/stale/claude",
+    });
+
+    await migratePlaintextToVault(cfg());
+
+    // The secret migrates.
+    expect(await readVault("robbie", "GITHUB_TOKEN")).toBe("ghp_real_secret");
+    // The settings do NOT. A vaulted mirror is injected into process.env at
+    // every startup, and env beats config.toml — so importing it would turn a
+    // dead mirror into a permanent override of the only store `/model` writes.
+    expect(await readVault("robbie", "PHANTOMBOT_CLAUDE_MODEL")).toBeUndefined();
+    expect(await readVault("robbie", "PHANTOMBOT_PRIMARY_MODEL")).toBeUndefined();
+    expect(await readVault("robbie", "PHANTOMBOT_HARNESS_CHAIN")).toBeUndefined();
+    expect(await readVault("robbie", "PHANTOMBOT_CLAUDE_BIN")).toBeUndefined();
+  });
+
+  test("the per-persona `_<PERSONA>` mirror variants are dropped too", async () => {
+    await mkdir(join(personasDir, "kai"), { recursive: true });
+    await writeLegacyEnv(userEnv, {
+      PHANTOMBOT_CLAUDE_MODEL_KAI: "stale-kai-opus",
+      PHANTOMBOT_CODING_MODEL_KAI: "stale/kai-coder",
+      OPENAI_API_KEY: "sk-real",
+    });
+
+    await migratePlaintextToVault(cfg());
+
+    // Worse than the bare form: a suffixed mirror outranks even the persona's
+    // OWN config.toml.
+    expect(await readVault("kai", "PHANTOMBOT_CLAUDE_MODEL_KAI")).toBeUndefined();
+    expect(await readVault("kai", "PHANTOMBOT_CODING_MODEL_KAI")).toBeUndefined();
+    expect(await readVault("kai", "OPENAI_API_KEY")).toBe("sk-real");
+  });
+
+  test("the central file's mirrors are dropped as well", async () => {
+    await writeLegacyEnv(centralEnv, {
+      PHANTOMBOT_CODEX_MODEL: "stale-codex",
+      PHANTOMBOT_ELEVENLABS_API_KEY: "el-real",
+    });
+
+    await migratePlaintextToVault(cfg());
+
+    expect(await readVault("robbie", "PHANTOMBOT_CODEX_MODEL")).toBeUndefined();
+    expect(await readVault("robbie", "PHANTOMBOT_ELEVENLABS_API_KEY")).toBe("el-real");
+  });
+
+  test("a file of NOTHING BUT mirrors is still stamped, so it is not retried forever", async () => {
+    await writeLegacyEnv(userEnv, { PHANTOMBOT_CLAUDE_MODEL: "stale-opus" });
+
+    await migratePlaintextToVault(cfg());
+
+    expect(existsSync(userEnv)).toBe(true);
+    expect(existsSync(migrationStampPath(userEnv))).toBe(true);
+  });
+
+  test("split state: a STAMPED ~/.env still wins the collision against an unstamped central file", async () => {
+    // Startup 1 imports ~/.env but the central file is left unstamped (one
+    // persona's vault failed to open). Startup 2 must still know which keys
+    // ~/.env won, or the central fan-out overwrites them.
+    await writeLegacyEnv(userEnv, { SHARED: "local-wins" });
+    await migratePlaintextToVault(cfg());
+    expect(existsSync(migrationStampPath(userEnv))).toBe(true);
+
+    await writeLegacyEnv(centralEnv, { SHARED: "central-value" });
+    await migratePlaintextToVault(cfg());
+
+    expect(await readVault("robbie", "SHARED")).toBe("local-wins");
+  });
+});
+
+describe("end-to-end: config.toml still wins after a legacy migration (#452 review)", () => {
+  test("a stale ~/.env model mirror does not survive into the resolved config", async () => {
+    // The whole point of the deny-list: the operator ran `/model claude
+    // fresh-sonnet` (which now writes config.toml ONLY), on a host whose old
+    // ~/.env still carries the mirror the pre-#452 wizard wrote.
+    await writeLegacyEnv(userEnv, {
+      PHANTOMBOT_CLAUDE_MODEL: "stale-opus",
+      GITHUB_TOKEN: "ghp_real",
+    });
+    await migratePlaintextToVault(cfg());
+
+    // Startup then injects the persona vault into the environment...
+    const env: NodeJS.ProcessEnv = {};
+    await loadVaultIntoEnv(personaDir(cfg(), "robbie"), env, new Set());
+    expect(env.GITHUB_TOKEN).toBe("ghp_real");
+    // ...and the mirror must not be among what it injects, or it would outrank
+    // config.toml on every single startup, forever.
+    expect(env.PHANTOMBOT_CLAUDE_MODEL).toBeUndefined();
+
+    const configPath = join(workdir, "config.toml");
+    await writeFile(
+      configPath,
+      '[harnesses.claude]\nmodel = "fresh-sonnet"\n',
+      "utf8",
+    );
+    const savedConfig = process.env.PHANTOMBOT_CONFIG;
+    const savedModel = process.env.PHANTOMBOT_CLAUDE_MODEL;
+    const savedPersonas = process.env.PHANTOMBOT_PERSONAS_DIR;
+    process.env.PHANTOMBOT_CONFIG = configPath;
+    process.env.PHANTOMBOT_PERSONAS_DIR = personasDir;
+    delete process.env.PHANTOMBOT_CLAUDE_MODEL;
+    try {
+      const c = await loadConfig();
+      expect(c.harnesses.claude.model).toBe("fresh-sonnet");
+    } finally {
+      if (savedConfig === undefined) delete process.env.PHANTOMBOT_CONFIG;
+      else process.env.PHANTOMBOT_CONFIG = savedConfig;
+      if (savedModel === undefined) delete process.env.PHANTOMBOT_CLAUDE_MODEL;
+      else process.env.PHANTOMBOT_CLAUDE_MODEL = savedModel;
+      if (savedPersonas === undefined) delete process.env.PHANTOMBOT_PERSONAS_DIR;
+      else process.env.PHANTOMBOT_PERSONAS_DIR = savedPersonas;
+    }
   });
 });

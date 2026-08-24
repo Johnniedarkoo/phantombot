@@ -45,11 +45,12 @@
  */
 
 import { existsSync, readdirSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { type Config, personaDir } from "../config.ts";
+import { type Config, isConfigOwnedEnvMirror, personaDir } from "../config.ts";
 import { defaultEnvFilePath, loadEnvFile } from "./envFile.ts";
 import { log } from "./logger.ts";
 import { openPersonaVault, type Vault } from "./vault.ts";
@@ -119,6 +120,30 @@ export function legacyUserEnvPath(): string {
 }
 
 /**
+ * The key names recorded in a migration stamp, or [] if it is unreadable.
+ *
+ * Load-bearing for split-state recovery: `~/.env` and the central file are
+ * stamped independently, so a startup where one persona's vault failed to open
+ * can leave `~/.env` stamped and the central file not. On the retry the
+ * `~/.env` import is (correctly) a no-op — but without its key list the
+ * central fan-out no longer knows which keys `~/.env` already won, and would
+ * overwrite them with the central file's values. Reading the names back off
+ * the stamp keeps "local wins" true across restarts. Names only; the stamp
+ * never contains values.
+ */
+async function stampedKeys(envPath: string): Promise<string[]> {
+  try {
+    const body = await readFile(migrationStampPath(envPath), "utf8");
+    return body
+      .split("\n")
+      .map((line) => /^#\s*key:\s*(\S+)\s*$/.exec(line)?.[1])
+      .filter((name): name is string => name !== undefined);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Every persona name that has a directory under personasDir. Hidden dirs
  * (leading dot — `.git`, `.DS_Store` dirs, editor scratch) are skipped so the
  * central fan-out doesn't spray an identity.json + a vault full of secrets into
@@ -133,6 +158,42 @@ function listPersonaNames(config: Config): string[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Drop the retired non-secret config.toml mirrors before importing (#452).
+ *
+ * A plaintext file on an upgraded host carries whatever the pre-#452 wizards
+ * wrote, which includes `PHANTOMBOT_*_MODEL` / `_BIN` / `_CHAIN` mirrors that
+ * now live only in config.toml. Migrating those into the vault would not
+ * preserve them, it would PROMOTE them: vault keys are injected into
+ * `process.env` at startup and env outranks config.toml, so the stale mirror
+ * would permanently override the store `/model` now writes — and, with the
+ * file retained and stamped, the old re-import loop can no longer heal it.
+ *
+ * They are dropped rather than migrated: they are not secrets and they have a
+ * live home. Names only in the log — a dropped key is still a key an operator
+ * may be looking for.
+ */
+function importableEntries(
+  vars: Record<string, string>,
+  path: string,
+): Array<[string, string]> {
+  const kept: Array<[string, string]> = [];
+  const dropped: string[] = [];
+  for (const [name, value] of Object.entries(vars)) {
+    if (isConfigOwnedEnvMirror(name)) dropped.push(name);
+    else kept.push([name, value]);
+  }
+  if (dropped.length > 0) {
+    log.warn(
+      `vault-migrate: NOT importing retired config.toml mirrors from ${path} — ` +
+        "these are settings, not secrets, and importing them would override " +
+        "config.toml on every startup. Set them with `phantombot /model` or in " +
+        `config.toml: ${dropped.join(", ")}`,
+    );
+  }
+  return kept;
 }
 
 /**
@@ -179,14 +240,16 @@ function writeAndVerify(
 async function migrateUserEnv(
   config: Config,
   personas: string[],
-): Promise<{ imported: boolean; keys: string[] }> {
+): Promise<{ settled: boolean; keys: string[] }> {
   const path = legacyUserEnvPath();
-  if (!existsSync(path)) return { imported: false, keys: [] };
+  if (!existsSync(path)) return { settled: false, keys: [] };
   if (existsSync(migrationStampPath(path))) {
     // Already imported on an earlier startup. Re-importing would overwrite any
-    // vault rotation made since with the stale plaintext value.
+    // vault rotation made since with the stale plaintext value. Still report
+    // the keys it won — the central file may be unstamped and about to fan
+    // out, and those keys must keep losing to this file's values.
     warnLegacyEnvFilePresent(path, true);
-    return { imported: false, keys: [] };
+    return { settled: true, keys: await stampedKeys(path) };
   }
   let vars: Record<string, string>;
   try {
@@ -195,13 +258,13 @@ async function migrateUserEnv(
     log.warn("vault-migrate: could not parse ~/.env — leaving it unimported", {
       error: (e as Error).message,
     });
-    return { imported: false, keys: [] };
+    return { settled: false, keys: [] };
   }
-  const entries = Object.entries(vars);
+  const entries = importableEntries(vars, path);
   const keys = entries.map(([k]) => k);
   if (personas.length === 0) {
     // No personas to fan out to — leave the file unstamped for a later run.
-    return { imported: false, keys };
+    return { settled: false, keys };
   }
 
   let allOk = true;
@@ -235,7 +298,7 @@ async function migrateUserEnv(
         keyCount: keys.length,
       });
       warnLegacyEnvFilePresent(path, true);
-      return { imported: true, keys };
+      return { settled: true, keys };
     }
     // Verified but unstamped: report NOT imported so the caller does not treat
     // these keys as settled, and so the next startup retries the whole file.
@@ -245,7 +308,7 @@ async function migrateUserEnv(
     );
   }
   warnLegacyEnvFilePresent(path, false);
-  return { imported: false, keys };
+  return { settled: false, keys };
 }
 
 /**
@@ -279,7 +342,7 @@ async function migrateCentralEnv(
     );
     return false;
   }
-  const entries = Object.entries(vars);
+  const entries = importableEntries(vars, path);
   if (personas.length === 0) {
     // No personas to fan out to — nothing we can safely migrate into. Leave the
     // file unstamped so a later run (once a persona exists) can migrate it.
@@ -353,13 +416,19 @@ export async function migratePlaintextToVault(config: Config): Promise<void> {
   const userResult = await migrateUserEnv(config, personas);
 
   // Record which keys came from `~/.env` so the central fan-out lets those win
-  // (skips them) in EVERY persona. ONLY when the ~/.env migration actually
-  // SUCCEEDED (imported === true, i.e. every key wrote and read back in every
-  // persona): if it failed and we skipped these keys, a persona could end up
-  // with the value from NEITHER source. On failure we let the central value
-  // populate it, and a later ~/.env retry re-asserts local-wins.
+  // (skips them) in EVERY persona. ONLY when those keys are SETTLED — either
+  // written and read back in every persona just now, or recorded in an
+  // existing stamp from a previous startup. If the import FAILED and we
+  // skipped these keys, a persona could end up with the value from NEITHER
+  // source; on failure we let the central value populate it, and a later
+  // ~/.env retry re-asserts local-wins. The stamped case matters because the
+  // two files are stamped independently: `~/.env` can be settled while the
+  // central file is still waiting to fan out.
+  //
+  // `settled`, not `imported`: a key does not stop having been won by
+  // `~/.env` just because the run that won it was a previous one.
   const localKeys = new Map<string, Set<string>>();
-  if (userResult.imported && userResult.keys.length > 0) {
+  if (userResult.settled && userResult.keys.length > 0) {
     const won = new Set(userResult.keys);
     for (const persona of personas) localKeys.set(persona, won);
   }

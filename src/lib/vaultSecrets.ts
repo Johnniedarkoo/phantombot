@@ -20,7 +20,9 @@
 
 import { type Config, personaDir } from "../config.ts";
 import { log } from "./logger.ts";
-import { openPersonaVault } from "./vault.ts";
+import { existsSync } from "node:fs";
+
+import { openPersonaVault, vaultPath } from "./vault.ts";
 
 export interface SetPersonaSecretResult {
   ok: boolean;
@@ -96,4 +98,82 @@ export async function unsetPersonaSecret(
   }
   delete process.env[name];
   return { ok: true, persona: target };
+}
+
+/**
+ * Read `name` from `persona`'s vault, falling back to `process.env`.
+ *
+ * The counterpart to `setPersonaSecret` for code that runs OUTSIDE a harness
+ * spawn. `reloadVaultForPersona()` reconciles `process.env` before a spawn, so
+ * a harness subprocess always sees the right persona's secrets — but the
+ * daemon's own audio path (STT/TTS) runs in-process, in a listener that may be
+ * one of SEVERAL personas served concurrently by one daemon. Reading
+ * `process.env` there yields whichever persona `loadVaultIntoEnv` happened to
+ * inject at startup: the default one. Before #452 that was harmless, because
+ * the key lived in a single central plaintext file every persona shared; now
+ * it lives in each persona's own vault, so a secondary persona would silently
+ * find no key and go mute.
+ *
+ * Deliberately does NOT mutate `process.env`: two persona listeners can be
+ * mid-turn at the same time, and writing a resolved key into the shared
+ * environment is exactly how one persona's credential ends up on the other's
+ * request. The value is returned to the caller and goes no further.
+ *
+ * The `process.env` fallback keeps pre-vault hosts working: a key exported by
+ * the shell, or one this process injected at startup, is still honoured when
+ * the persona's vault has no row of its own. Never throws — an unopenable
+ * vault degrades to the env fallback.
+ */
+export async function getPersonaSecret(
+  config: Config,
+  name: string,
+  persona?: string,
+): Promise<string | undefined> {
+  return (
+    (await getPersonaSecretStrict(config, name, persona)) ?? process.env[name]
+  );
+}
+
+/**
+ * Read `name` from `persona`'s vault and NOTHING ELSE — undefined when that
+ * persona has no such row.
+ *
+ * The no-fallback half of `getPersonaSecret`, for callers that must not let
+ * the ambient environment stand in. `phantombot tick` is the motivating case:
+ * one process runs tasks for every persona, so a `process.env` hit there is
+ * as likely to be a DIFFERENT persona's vault value (injected at startup) as
+ * a host-wide export, and handing it to this task would be a cross-persona
+ * credential leak. Callers that want the ambient fallback opt into it
+ * explicitly. Never throws.
+ */
+export async function getPersonaSecretStrict(
+  config: Config,
+  name: string,
+  persona?: string,
+): Promise<string | undefined> {
+  const target = persona || config.personaLayer || config.defaultPersona;
+  const dir = personaDir(config, target);
+  // Open-existing-only. This is a pure READ, and both openPersonaVault ->
+  // getOrCreatePersonaIdentity and the vault opener create on demand — so
+  // asking about a persona that has never been provisioned (a typo'd name, the
+  // built-in default on a fresh box) would MINT an identity.json + vault, and
+  // an nsec, that nobody asked for. Same rule as readAllVaultValues (#262):
+  // no vault file means "no value", never "make one".
+  if (!existsSync(vaultPath(dir))) return undefined;
+  try {
+    const vault = await openPersonaVault(dir);
+    try {
+      const value = vault.get(name);
+      if (value !== undefined && value !== "") return value;
+    } finally {
+      vault.close();
+    }
+  } catch (e) {
+    log.warn("vault: read failed", {
+      name,
+      persona: target,
+      error: (e as Error).message,
+    });
+  }
+  return undefined;
 }

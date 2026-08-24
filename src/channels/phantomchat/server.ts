@@ -640,7 +640,7 @@ export async function runPhantomchatServer(
     if (msg.media) {
       const m = msg.media;
       if (m.kind === "voice") {
-        const stt = sttSupport(input.config);
+        const stt = await sttSupport(input.config);
         if (!stt.ok) {
           log.warn("phantomchat: voice note but STT unavailable", {
             persona: input.persona,
@@ -802,6 +802,10 @@ export async function runPhantomchatServer(
           conversation: conversationKey,
           ttlMs: DEFAULT_REPLY_MODE_OVERRIDE_TTL_MS,
         });
+    // Resolved once per turn: the TTS key is now an async persona-vault read
+    // and the provider config cannot change mid-turn, but the closure below is
+    // re-evaluated on every reply-mode override and must stay synchronous.
+    const ttsAvailable = await ttsSupported(input.config);
     const resolveWillReplyWithVoice = (
       override: ReplyMode | undefined,
     ): boolean => {
@@ -812,7 +816,7 @@ export async function runPhantomchatServer(
           : override === "text"
             ? false
             : inputWasVoice;
-      return wantsVoice && ttsSupported(input.config);
+      return wantsVoice && ttsAvailable;
     };
     let willReplyWithVoice = resolveWillReplyWithVoice(modalityOverride);
     // Typing indicator. The PWA shows three-dots on each

@@ -7,7 +7,8 @@
  */
 
 import type { Config } from "../config.ts";
-import type { VoiceProvider } from "./voice.ts";
+import { ENV_KEY_FOR_PROVIDER, type VoiceProvider } from "./voice.ts";
+import { getPersonaSecret } from "./vaultSecrets.ts";
 import { timeoutSignal } from "./fetchTimeout.ts";
 
 /**
@@ -48,8 +49,34 @@ export type AudioSupport =
   | { ok: false; reason: "provider_no_stt"; provider: VoiceProvider }
   | { ok: false; reason: "key_missing"; provider: VoiceProvider; envVar: string };
 
-/** Diagnose whether the configured provider can perform STT. */
-export function sttSupport(config: Config): AudioSupport {
+/**
+ * The API key for this config's voice provider, resolved from the CONFIG'S
+ * PERSONA vault (falling back to process.env).
+ *
+ * Why not `process.env` directly: one daemon serves several personas, and
+ * `loadVaultIntoEnv()` only ever injected the STARTUP persona's secrets into
+ * the shared environment. Since #452 the TTS/STT key lives in each persona's
+ * own vault rather than one central plaintext file, so reading the ambient env
+ * here would hand a secondary persona either the default persona's key or
+ * nothing at all — mute voice replies with no error anyone can see.
+ *
+ * `config.personaLayer` is the persona this Config was loaded for, so the key
+ * follows whichever listener is asking. Returns undefined for providers that
+ * need no key (`azure_edge`, `none`).
+ */
+export async function voiceApiKey(config: Config): Promise<string | undefined> {
+  const provider = config.voice.provider;
+  if (provider !== "openai" && provider !== "elevenlabs") return undefined;
+  return await getPersonaSecret(config, ENV_KEY_FOR_PROVIDER[provider]);
+}
+
+/**
+ * Diagnose whether the configured provider can perform STT.
+ *
+ * Async because the key comes from the persona's vault, not the ambient
+ * environment — see `voiceApiKey`.
+ */
+export async function sttSupport(config: Config): Promise<AudioSupport> {
   const provider = config.voice.provider;
   if (provider === "none") {
     return { ok: false, reason: "provider_none", provider };
@@ -57,39 +84,33 @@ export function sttSupport(config: Config): AudioSupport {
   if (provider === "azure_edge") {
     return { ok: false, reason: "provider_no_stt", provider };
   }
-  const envVar =
-    provider === "openai"
-      ? "PHANTOMBOT_OPENAI_API_KEY"
-      : "PHANTOMBOT_ELEVENLABS_API_KEY";
-  return process.env[envVar]
+  const envVar = ENV_KEY_FOR_PROVIDER[provider];
+  return (await voiceApiKey(config))
     ? { ok: true }
     : { ok: false, reason: "key_missing", provider, envVar };
 }
 
-/** Diagnose whether the configured provider can synthesize TTS. */
-export function ttsSupport(config: Config): AudioSupport {
+/** Diagnose whether the configured provider can synthesize TTS. Async: see sttSupport. */
+export async function ttsSupport(config: Config): Promise<AudioSupport> {
   const provider = config.voice.provider;
   if (provider === "none") {
     return { ok: false, reason: "provider_none", provider };
   }
   if (provider === "azure_edge") return { ok: true }; // free, no key
-  const envVar =
-    provider === "openai"
-      ? "PHANTOMBOT_OPENAI_API_KEY"
-      : "PHANTOMBOT_ELEVENLABS_API_KEY";
-  return process.env[envVar]
+  const envVar = ENV_KEY_FOR_PROVIDER[provider];
+  return (await voiceApiKey(config))
     ? { ok: true }
     : { ok: false, reason: "key_missing", provider, envVar };
 }
 
 /** Boolean wrapper around sttSupport — kept for callers that don't need the reason. */
-export function sttSupported(config: Config): boolean {
-  return sttSupport(config).ok;
+export async function sttSupported(config: Config): Promise<boolean> {
+  return (await sttSupport(config)).ok;
 }
 
 /** Boolean wrapper around ttsSupport — kept for callers that don't need the reason. */
-export function ttsSupported(config: Config): boolean {
-  return ttsSupport(config).ok;
+export async function ttsSupported(config: Config): Promise<boolean> {
+  return (await ttsSupport(config)).ok;
 }
 
 export async function synthesize(
@@ -98,14 +119,13 @@ export async function synthesize(
   fetchImpl: typeof fetch = fetch,
 ): Promise<SynthesizeResult> {
   const p = config.voice.provider;
+  const key = await voiceApiKey(config);
   if (p === "elevenlabs") {
-    const key = process.env.PHANTOMBOT_ELEVENLABS_API_KEY;
-    if (!key) return { ok: false, error: "no ElevenLabs API key in env" };
+    if (!key) return { ok: false, error: "no ElevenLabs API key in the persona vault" };
     return elevenlabsTts(key, text, config.voice.elevenlabs!, fetchImpl);
   }
   if (p === "openai") {
-    const key = process.env.PHANTOMBOT_OPENAI_API_KEY;
-    if (!key) return { ok: false, error: "no OpenAI API key in env" };
+    if (!key) return { ok: false, error: "no OpenAI API key in the persona vault" };
     return openaiTts(key, text, config.voice.openai!, fetchImpl);
   }
   if (p === "azure_edge") {
@@ -125,15 +145,14 @@ export async function transcribe(
   fetchImpl: typeof fetch = fetch,
 ): Promise<TranscribeResult> {
   const p = config.voice.provider;
+  const key = await voiceApiKey(config);
   if (p === "elevenlabs") {
-    const key = process.env.PHANTOMBOT_ELEVENLABS_API_KEY;
     if (!key)
-      return { ok: false, error: "no ElevenLabs API key in env" };
+      return { ok: false, error: "no ElevenLabs API key in the persona vault" };
     return elevenlabsScribe(key, audio, mime, fetchImpl);
   }
   if (p === "openai") {
-    const key = process.env.PHANTOMBOT_OPENAI_API_KEY;
-    if (!key) return { ok: false, error: "no OpenAI API key in env" };
+    if (!key) return { ok: false, error: "no OpenAI API key in the persona vault" };
     return openaiWhisper(key, audio, mime, fetchImpl);
   }
   return {

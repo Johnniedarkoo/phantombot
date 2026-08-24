@@ -22,7 +22,7 @@ import {
   memoryIndexPath,
   personaDir,
   personaEnvSuffix,
-  warnDeprecatedHostConfigKeys,
+  warnDeprecatedConfigKeys,
 } from "../src/config.ts";
 
 const isWindows = process.platform === "win32";
@@ -1210,9 +1210,9 @@ describe("loadConfig — update_channel (release rings, #432)", () => {
 // Deprecated host-config keys (#452)
 // ---------------------------------------------------------------------------
 
-describe("warnDeprecatedHostConfigKeys", () => {
+describe("warnDeprecatedConfigKeys", () => {
   test("names every retired key present in the host file", () => {
-    const warned = warnDeprecatedHostConfigKeys(
+    const warned = warnDeprecatedConfigKeys(
       {
         turn_timeout_s: 300,
         harnesses: { pi: { max_payload_bytes: 1024, bin: "pi" } },
@@ -1227,7 +1227,7 @@ describe("warnDeprecatedHostConfigKeys", () => {
 
   test("says nothing about a clean file", () => {
     expect(
-      warnDeprecatedHostConfigKeys(
+      warnDeprecatedConfigKeys(
         { harnesses: { pi: { bin: "pi" } } },
         "/home/kai/.config/phantombot/config.toml",
       ),
@@ -1239,17 +1239,61 @@ describe("warnDeprecatedHostConfigKeys", () => {
     // daemon that started before the operator opened the file would otherwise
     // have already spent its single warning.
     const toml = { turn_timeout_s: 300 };
-    expect(warnDeprecatedHostConfigKeys(toml, "/c.toml")).toEqual([
+    expect(warnDeprecatedConfigKeys(toml, "/c.toml")).toEqual([
       "turn_timeout_s",
     ]);
-    expect(warnDeprecatedHostConfigKeys(toml, "/c.toml")).toEqual([
+    expect(warnDeprecatedConfigKeys(toml, "/c.toml")).toEqual([
       "turn_timeout_s",
     ]);
   });
 
   test("a key whose PARENT table is absent is not reported", () => {
-    expect(warnDeprecatedHostConfigKeys({ harnesses: {} }, "/c.toml")).toEqual(
+    expect(warnDeprecatedConfigKeys({ harnesses: {} }, "/c.toml")).toEqual(
       [],
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Retired keys in a PERSONA config.toml (#452 review)
+// ---------------------------------------------------------------------------
+
+describe("loadConfig — deprecation warnings cover the persona layer", () => {
+  function captureStderr(): { lines: string[]; restore: () => void } {
+    const lines: string[] = [];
+    const original = process.stderr.write;
+    process.stderr.write = ((chunk: unknown) => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    return {
+      lines,
+      restore: () => {
+        process.stderr.write = original;
+      },
+    };
+  }
+
+  test("a retired key in a PERSONA file is named, with that file's path", async () => {
+    // Since #441 a persona's own config.toml sets the same keys as the host's,
+    // so it is exactly where a silent edit hides: warning only on the global
+    // file leaves the operator editing a file that does nothing, unnamed.
+    const personasDir = join(workdir, "personas");
+    await mkdir(join(personasDir, "kai"), { recursive: true });
+    const personaFile = join(personasDir, "kai", "config.toml");
+    await writeFile(personaFile, `turn_timeout_s = 300\n`, "utf8");
+    process.env.PHANTOMBOT_PERSONAS_DIR = personasDir;
+    process.env.PHANTOMBOT_DEFAULT_PERSONA = "kai";
+
+    const cap = captureStderr();
+    try {
+      await loadConfig("kai");
+    } finally {
+      cap.restore();
+    }
+
+    const warned = cap.lines.join("");
+    expect(warned).toContain("turn_timeout_s");
+    expect(warned).toContain(personaFile);
   });
 });

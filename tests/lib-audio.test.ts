@@ -11,8 +11,13 @@ import {
   transcribe,
   ttsSupport,
   ttsSupported,
+  voiceApiKey,
 } from "../src/lib/audio.ts";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Config } from "../src/config.ts";
+import { openPersonaVault } from "../src/lib/vault.ts";
 
 const SAVED_ENV = {
   PHANTOMBOT_OPENAI_API_KEY: process.env.PHANTOMBOT_OPENAI_API_KEY,
@@ -99,61 +104,61 @@ function fakeJsonFetch(body: unknown, status = 200): typeof fetch {
 }
 
 describe("ttsSupported / sttSupported", () => {
-  test("none → both false", () => {
-    expect(ttsSupported(makeConfig("none"))).toBe(false);
-    expect(sttSupported(makeConfig("none"))).toBe(false);
+  test("none → both false", async () => {
+    expect(await ttsSupported(makeConfig("none"))).toBe(false);
+    expect(await sttSupported(makeConfig("none"))).toBe(false);
   });
-  test("azure_edge → tts true, stt false", () => {
-    expect(ttsSupported(makeConfig("azure_edge"))).toBe(true);
-    expect(sttSupported(makeConfig("azure_edge"))).toBe(false);
+  test("azure_edge → tts true, stt false", async () => {
+    expect(await ttsSupported(makeConfig("azure_edge"))).toBe(true);
+    expect(await sttSupported(makeConfig("azure_edge"))).toBe(false);
   });
-  test("openai with key → both true", () => {
+  test("openai with key → both true", async () => {
     process.env.PHANTOMBOT_OPENAI_API_KEY = "k";
-    expect(ttsSupported(makeConfig("openai"))).toBe(true);
-    expect(sttSupported(makeConfig("openai"))).toBe(true);
+    expect(await ttsSupported(makeConfig("openai"))).toBe(true);
+    expect(await sttSupported(makeConfig("openai"))).toBe(true);
   });
-  test("openai without key → both false", () => {
-    expect(ttsSupported(makeConfig("openai"))).toBe(false);
-    expect(sttSupported(makeConfig("openai"))).toBe(false);
+  test("openai without key → both false", async () => {
+    expect(await ttsSupported(makeConfig("openai"))).toBe(false);
+    expect(await sttSupported(makeConfig("openai"))).toBe(false);
   });
-  test("elevenlabs with key → both true", () => {
+  test("elevenlabs with key → both true", async () => {
     process.env.PHANTOMBOT_ELEVENLABS_API_KEY = "k";
-    expect(ttsSupported(makeConfig("elevenlabs"))).toBe(true);
-    expect(sttSupported(makeConfig("elevenlabs"))).toBe(true);
+    expect(await ttsSupported(makeConfig("elevenlabs"))).toBe(true);
+    expect(await sttSupported(makeConfig("elevenlabs"))).toBe(true);
   });
 });
 
 describe("ttsSupport / sttSupport (diagnostic variants)", () => {
-  test("none → provider_none for both", () => {
-    expect(ttsSupport(makeConfig("none"))).toEqual({
+  test("none → provider_none for both", async () => {
+    expect(await ttsSupport(makeConfig("none"))).toEqual({
       ok: false,
       reason: "provider_none",
       provider: "none",
     });
-    expect(sttSupport(makeConfig("none"))).toEqual({
+    expect(await sttSupport(makeConfig("none"))).toEqual({
       ok: false,
       reason: "provider_none",
       provider: "none",
     });
   });
 
-  test("azure_edge → ok for tts, provider_no_stt for stt", () => {
-    expect(ttsSupport(makeConfig("azure_edge"))).toEqual({ ok: true });
-    expect(sttSupport(makeConfig("azure_edge"))).toEqual({
+  test("azure_edge → ok for tts, provider_no_stt for stt", async () => {
+    expect(await ttsSupport(makeConfig("azure_edge"))).toEqual({ ok: true });
+    expect(await sttSupport(makeConfig("azure_edge"))).toEqual({
       ok: false,
       reason: "provider_no_stt",
       provider: "azure_edge",
     });
   });
 
-  test("openai without key → key_missing names env var for both", () => {
-    expect(ttsSupport(makeConfig("openai"))).toEqual({
+  test("openai without key → key_missing names env var for both", async () => {
+    expect(await ttsSupport(makeConfig("openai"))).toEqual({
       ok: false,
       reason: "key_missing",
       provider: "openai",
       envVar: "PHANTOMBOT_OPENAI_API_KEY",
     });
-    expect(sttSupport(makeConfig("openai"))).toEqual({
+    expect(await sttSupport(makeConfig("openai"))).toEqual({
       ok: false,
       reason: "key_missing",
       provider: "openai",
@@ -161,20 +166,20 @@ describe("ttsSupport / sttSupport (diagnostic variants)", () => {
     });
   });
 
-  test("openai with key → ok for both", () => {
+  test("openai with key → ok for both", async () => {
     process.env.PHANTOMBOT_OPENAI_API_KEY = "k";
-    expect(ttsSupport(makeConfig("openai"))).toEqual({ ok: true });
-    expect(sttSupport(makeConfig("openai"))).toEqual({ ok: true });
+    expect(await ttsSupport(makeConfig("openai"))).toEqual({ ok: true });
+    expect(await sttSupport(makeConfig("openai"))).toEqual({ ok: true });
   });
 
-  test("elevenlabs without key → key_missing names env var for both", () => {
-    expect(ttsSupport(makeConfig("elevenlabs"))).toEqual({
+  test("elevenlabs without key → key_missing names env var for both", async () => {
+    expect(await ttsSupport(makeConfig("elevenlabs"))).toEqual({
       ok: false,
       reason: "key_missing",
       provider: "elevenlabs",
       envVar: "PHANTOMBOT_ELEVENLABS_API_KEY",
     });
-    expect(sttSupport(makeConfig("elevenlabs"))).toEqual({
+    expect(await sttSupport(makeConfig("elevenlabs"))).toEqual({
       ok: false,
       reason: "key_missing",
       provider: "elevenlabs",
@@ -182,10 +187,10 @@ describe("ttsSupport / sttSupport (diagnostic variants)", () => {
     });
   });
 
-  test("elevenlabs with key → ok for both", () => {
+  test("elevenlabs with key → ok for both", async () => {
     process.env.PHANTOMBOT_ELEVENLABS_API_KEY = "k";
-    expect(ttsSupport(makeConfig("elevenlabs"))).toEqual({ ok: true });
-    expect(sttSupport(makeConfig("elevenlabs"))).toEqual({ ok: true });
+    expect(await ttsSupport(makeConfig("elevenlabs"))).toEqual({ ok: true });
+    expect(await sttSupport(makeConfig("elevenlabs"))).toEqual({ ok: true });
   });
 });
 
@@ -302,5 +307,84 @@ describe("transcribe", () => {
       fakeJsonFetch({}),
     );
     expect(r.ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-persona key resolution (#452 review)
+// ---------------------------------------------------------------------------
+
+describe("voiceApiKey — the key follows the persona, not the environment", () => {
+  let workdir: string;
+
+  beforeEach(async () => {
+    workdir = await mkdtemp(join(tmpdir(), "phantombot-audio-"));
+  });
+  afterEach(async () => {
+    await rm(workdir, { recursive: true, force: true });
+  });
+
+  function cfgFor(persona: string): Config {
+    return {
+      ...makeConfig("openai"),
+      personasDir: workdir,
+      defaultPersona: "robbie",
+      personaLayer: persona,
+    };
+  }
+
+  async function seedVault(persona: string, value: string): Promise<void> {
+    await mkdir(join(workdir, persona), { recursive: true });
+    const v = await openPersonaVault(join(workdir, persona));
+    try {
+      v.set("PHANTOMBOT_OPENAI_API_KEY", value);
+    } finally {
+      v.close();
+    }
+  }
+
+  test("a secondary persona gets ITS OWN key, not the startup persona's", async () => {
+    // One daemon serves several personas; only the startup persona's vault was
+    // ever injected into process.env. Reading the ambient env here would hand
+    // kai robbie's key.
+    await seedVault("robbie", "sk-robbie");
+    await seedVault("kai", "sk-kai");
+    process.env.PHANTOMBOT_OPENAI_API_KEY = "sk-robbie"; // as startup left it
+
+    expect(await voiceApiKey(cfgFor("kai"))).toBe("sk-kai");
+    expect(await voiceApiKey(cfgFor("robbie"))).toBe("sk-robbie");
+  });
+
+  test("a persona with no key of its own is NOT silently voiced by another's", async () => {
+    await seedVault("kai", "sk-kai");
+    await mkdir(join(workdir, "lena"), { recursive: true });
+
+    // lena has a persona dir but no vault: no key, so no TTS/STT — reported,
+    // not papered over with whatever happened to be ambient.
+    expect(await voiceApiKey(cfgFor("lena"))).toBeUndefined();
+    expect(await ttsSupport(cfgFor("lena"))).toEqual({
+      ok: false,
+      reason: "key_missing",
+      provider: "openai",
+      envVar: "PHANTOMBOT_OPENAI_API_KEY",
+    });
+    expect(await ttsSupport(cfgFor("kai"))).toEqual({ ok: true });
+  });
+
+  test("resolving one persona's key does not mutate the shared process.env", async () => {
+    // Two persona listeners can be mid-turn at once; writing a resolved key
+    // into the shared environment is exactly how one ends up on the other's
+    // request.
+    await seedVault("kai", "sk-kai");
+    delete process.env.PHANTOMBOT_OPENAI_API_KEY;
+
+    expect(await voiceApiKey(cfgFor("kai"))).toBe("sk-kai");
+    expect(process.env.PHANTOMBOT_OPENAI_API_KEY).toBeUndefined();
+  });
+
+  test("falls back to the ambient env for a persona with no vault at all", async () => {
+    // Pre-vault hosts, and shell/systemd exports, must keep working.
+    process.env.PHANTOMBOT_OPENAI_API_KEY = "sk-ambient";
+    expect(await voiceApiKey(cfgFor("never-provisioned"))).toBe("sk-ambient");
   });
 });

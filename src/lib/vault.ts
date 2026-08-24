@@ -306,6 +306,23 @@ const _vaultTracked = new Set<string>();
 /** The persona dir whose vault we last successfully injected, for transient-fail handling. */
 let _vaultLoadedPersonaDir: string | undefined;
 
+/**
+ * True when `name` in `process.env` was injected there from a VAULT by this
+ * process (rather than inherited from the shell / a systemd `Environment=`).
+ *
+ * The distinction matters wherever code resolves a secret for a persona that
+ * is not the one loaded at startup: an ambient key is host-wide and safe to
+ * fall back to, but a vault-injected one belongs to exactly one persona and
+ * must never stand in for another persona's missing key. See tick's
+ * `--secret` resolution.
+ */
+export function isVaultInjectedEnvKey(
+  name: string,
+  tracked: Set<string> = _vaultTracked,
+): boolean {
+  return tracked.has(name);
+}
+
 /** For tests: reset the module-scope vault env tracking. */
 export function _resetVaultTrackingForTesting(): void {
   _vaultTracked.clear();

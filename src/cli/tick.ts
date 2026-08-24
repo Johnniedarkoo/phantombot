@@ -54,6 +54,8 @@ import {
   isLockHandle,
 } from "../lib/runLock.ts";
 import { openTaskStore, type Task, type TaskStore } from "../lib/tasks.ts";
+import { getPersonaSecretStrict } from "../lib/vaultSecrets.ts";
+import { isVaultInjectedEnvKey } from "../lib/vault.ts";
 import { recordTickFired } from "../lib/timerHealth.ts";
 import { shouldDeferWake } from "../lib/turnRegistry.ts";
 import { openMemoryStore, type MemoryStore } from "../memory/store.ts";
@@ -255,11 +257,15 @@ export async function runTick(input: RunTickInput = {}): Promise<number> {
       }
       try {
         if (isCommandTask) {
+          const taskConfig = await effectiveConfigFor(task.persona);
           const result = await runCommandTask(task.command!, {
-            timeoutMs: (await effectiveConfigFor(task.persona))
-              .harnessHardTimeoutMs,
+            timeoutMs: taskConfig.harnessHardTimeoutMs,
             cwd: agentDir,
-            env: buildCommandEnv(task.commandSecrets),
+            env: await buildCommandEnv(
+              taskConfig,
+              task.persona,
+              task.commandSecrets,
+            ),
           });
           finalText = result.output;
           exitCode = result.exitCode;
@@ -487,7 +493,26 @@ async function runCommandTask(
   });
 }
 
-function buildCommandEnv(secretNames: string[]): NodeJS.ProcessEnv {
+/**
+ * Build the minimal environment for a command-backed task, resolving each
+ * `--secret NAME` from the TASK'S OWN persona vault (#452).
+ *
+ * `process.env` is the wrong source here. One tick process runs tasks for
+ * EVERY persona, but only the startup persona's vault was injected into the
+ * ambient environment — so reading `process.env[name]` hands persona B's
+ * poller either persona A's credential or nothing. Both are wrong, and the
+ * first is worse: it is a silent cross-persona credential leak.
+ *
+ * The `process.env` fallback survives, but narrowed: only for names that were
+ * NOT vault-injected by this process. Those are genuinely host-wide (a shell
+ * export, a systemd `Environment=`) and belong to no persona; a vault-injected
+ * name belongs to exactly one, and must not stand in for another's.
+ */
+async function buildCommandEnv(
+  config: Config,
+  persona: string,
+  secretNames: string[],
+): Promise<NodeJS.ProcessEnv> {
   const allowlist = [
     "HOME",
     "PATH",
@@ -531,7 +556,17 @@ function buildCommandEnv(secretNames: string[]): NodeJS.ProcessEnv {
     env.PATH = "/usr/local/bin:/usr/bin:/bin";
   }
   for (const name of secretNames) {
-    if (process.env[name] !== undefined) env[name] = process.env[name];
+    const fromVault = await getPersonaSecretStrict(config, name, persona);
+    if (fromVault !== undefined) {
+      env[name] = fromVault;
+      continue;
+    }
+    // Not in this persona's vault. Ambient host values are still fair game;
+    // another persona's vault value, injected into our env at startup, is not.
+    const ambient = process.env[name];
+    if (ambient !== undefined && !isVaultInjectedEnvKey(name)) {
+      env[name] = ambient;
+    }
   }
   return env;
 }

@@ -925,7 +925,7 @@ async function processChatMessage(
   // For voice messages: download → transcribe → use the transcript as
   // the user message before invoking the harness.
   if (isVoice && msg.voice) {
-    const stt = sttSupport(input.config);
+    const stt = await sttSupport(input.config);
     if (!stt.ok) {
       await input.transport.sendMessage(
         msg.conversationId,
@@ -1069,10 +1069,15 @@ async function processChatMessage(
     conversation: conversationKey,
     ttlMs: DEFAULT_REPLY_MODE_OVERRIDE_TTL_MS,
   });
+  // Resolved ONCE per turn, not per call: the key now comes from the persona's
+  // vault (an async read), and the provider config cannot change mid-turn. The
+  // closure below is re-evaluated whenever the reply-mode override changes, so
+  // it must stay synchronous.
+  const ttsAvailable = await ttsSupported(input.config);
   const resolveWillReplyWithVoice = (override: ReplyMode | undefined) => {
     const wantsVoiceReply =
       override === "voice" ? true : override === "text" ? false : isVoice;
-    return wantsVoiceReply && ttsSupported(input.config);
+    return wantsVoiceReply && ttsAvailable;
   };
   let willReplyWithVoice = resolveWillReplyWithVoice(modalityOverride);
 
