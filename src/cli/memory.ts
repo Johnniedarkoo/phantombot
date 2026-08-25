@@ -48,11 +48,13 @@ import {
 } from "../config.ts";
 import {
   defaultEmbedderWithFetch,
+  runEmbeddingPreflight,
   runEmbedJob,
   runTurnEmbedJob,
   type Embedder,
 } from "../lib/embedJob.ts";
 import { resolveEmbedders } from "../lib/embedder.ts";
+import { embeddingSpaceForConfig } from "../lib/embeddingSpace.ts";
 import { TAG_TO_DRAWER } from "../lib/heartbeat.ts";
 import type { WriteSink } from "../lib/io.ts";
 import { log } from "../lib/logger.ts";
@@ -145,7 +147,8 @@ export async function runMemorySearch(
     const queryEmbedder = resolveEmbedders(config, {
       fetchImpl: input.fetchImpl,
     }).query;
-    if (queryEmbedder && ix.embeddingCount() > 0) {
+    const embeddingSpace = embeddingSpaceForConfig(config.embeddings);
+    if (queryEmbedder && embeddingSpace && ix.embeddingCount(embeddingSpace) > 0) {
       const r = await queryEmbedder(input.query);
       if (r.ok) queryVec = r.values;
       else err.write(`(query embed failed: ${r.error}; falling back to FTS-only)\n`);
@@ -158,6 +161,7 @@ export async function runMemorySearch(
       ? ix.hybridSearch(input.query, queryVec, {
           scope: input.scope,
           limit: input.limit,
+          embeddingSpace,
         })
       : ge?.enabled
         ? ix.searchExpanded(input.query, {
@@ -349,38 +353,74 @@ export async function runMemoryIndex(
       input.embedder ?? defaultEmbedderWithFetch(config, input.fetchImpl);
     if (input.reembed) {
       if (!reembedder) {
-        out.write(
+        err.write(
           `(embeddings provider is "${config.embeddings.provider}"; ` +
             "configure an embedding provider before --reembed)\n",
         );
-        return 0;
+        return 1;
+      }
+      const space =
+        reembedder.space ?? embeddingSpaceForConfig(config.embeddings);
+      if (!space) {
+        err.write(
+          "cannot reembed: the configured provider has no known embedding dimensions; " +
+            "validate the provider first\n",
+        );
+        return 1;
+      }
+      const maxChunkChars =
+        documentChunkChars(config) ?? DEFAULT_GEMINI_MAX_CHUNK_CHARS;
+      const before = ix.allEmbeddings();
+      // Refresh first so newly-created notes and changed FTS content are part
+      // of the same bounded migration. Restore the snapshot if the endpoint
+      // cannot pass a real document request.
+      await ix.refreshStale(dir);
+      const preflight = await runEmbeddingPreflight({
+        personaDir: dir,
+        index: ix,
+        embedder: reembedder,
+        maxChunkChars,
+      });
+      if (!preflight.ok) {
+        ix.restoreEmbeddings(before);
+        err.write(
+          `reembed preflight failed${preflight.path ? ` for ${preflight.path}` : ""}: ` +
+            `${preflight.error ?? "unknown embedding failure"}\n`,
+        );
+        return 1;
       }
       out.write(
         `rebuilding derived vectors for '${persona}' ` +
           "(source files, raw turns, and FTS are preserved)…\n",
       );
-      ix.clearEmbeddings();
       const notes = await runEmbedJob({
         personaDir: dir,
         index: ix,
         embedder: reembedder,
-        maxChunkChars:
-          documentChunkChars(config) ?? DEFAULT_GEMINI_MAX_CHUNK_CHARS,
+        maxChunkChars,
         force: true,
+        space,
       });
-      const turns = await runTurnEmbedJob({ index: ix, embedder: reembedder });
+      const turns = await runTurnEmbedJob({
+        index: ix,
+        embedder: reembedder,
+        space,
+      });
+      const failures = notes.failedChunks + turns.failed;
+      if (failures === 0) ix.removeObsoleteEmbeddingSpaces(space);
       out.write(
-        `re-embedded ${notes.embedded}/${notes.totalNotes} notes and ` +
+        `re-embedded ${notes.embeddedChunks}/${notes.totalChunks} note chunks ` +
+          `across ${notes.totalFiles} files and ` +
           `${turns.embedded}/${turns.totalTurns} turns` +
-          (notes.failed + turns.failed > 0
-            ? `; failed ${notes.failed + turns.failed}`
+          (failures > 0
+            ? `; failed ${failures}`
             : "") +
           `\n`,
       );
       for (const e of [...notes.errors.map((x) => ({ ...x, kind: "note" })), ...turns.errors.map((x) => ({ ...x, kind: "turn", chunkIdx: undefined }))].slice(0, 5)) {
         err.write(`  ${e.kind} ${e.path}: ${e.error}\n`);
       }
-      return 0;
+      return failures > 0 ? 1 : 0;
     }
     const ftsResult = input.rebuild
       ? { ...(await ix.rebuild(dir)), removed: 0 }
@@ -416,8 +456,8 @@ export async function runMemoryIndex(
       force: input.rebuild,
     });
     out.write(
-      `embedded ${r.embedded}, skipped ${r.skipped} (sha match), ` +
-        `failed ${r.failed} of ${r.totalNotes} notes\n`,
+      `embedded ${r.embeddedChunks} chunks across ${r.totalFiles} note files, ` +
+      `skipped ${r.skippedChunks} (sha match), failed ${r.failedChunks}\n`,
     );
     if (r.failed > 0) {
       for (const e of r.errors.slice(0, 5)) {
@@ -951,7 +991,7 @@ export async function runMemoryRestore(input: {
 // ---------------------------------------------------------------------------
 
 const searchCmd = defineCommand({
-  meta: { name: "search", description: "Search memory/ and kb/: hybrid BM25+vector when Gemini embeddings are set, else OKF field-weighted BM25 with link-graph expansion." },
+  meta: { name: "search", description: "Search memory/ and kb/: hybrid BM25+vector when an embedding provider is set, else OKF field-weighted BM25 with link-graph expansion." },
   args: {
     query: {
       type: "positional",

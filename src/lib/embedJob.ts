@@ -14,9 +14,16 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "../config.ts";
 import { resolveEmbedders, type Embedder } from "./embedder.ts";
+import type { EmbeddingSpace } from "./embeddingSpace.ts";
 import type { MemoryIndex } from "./memoryIndex.ts";
 
 export interface EmbedJobResult {
+  totalFiles: number;
+  totalChunks: number;
+  embeddedChunks: number;
+  skippedChunks: number;
+  failedChunks: number;
+  /** Compatibility aliases for callers from before chunk accounting. */
   totalNotes: number;
   embedded: number;
   skipped: number;
@@ -45,12 +52,18 @@ export interface RunEmbedJobInput {
   maxChunkChars: number;
   /** If true, re-embed every chunk regardless of sha match. */
   force?: boolean;
+  space?: EmbeddingSpace;
 }
 
 export async function runEmbedJob(
   input: RunEmbedJobInput,
 ): Promise<EmbedJobResult> {
   const result: EmbedJobResult = {
+    totalFiles: 0,
+    totalChunks: 0,
+    embeddedChunks: 0,
+    skippedChunks: 0,
+    failedChunks: 0,
     totalNotes: 0,
     embedded: 0,
     skipped: 0,
@@ -60,15 +73,11 @@ export async function runEmbedJob(
 
   // Pull the full file list straight from the FTS index (which has been
   // populated by refreshStale before we get here).
-  const files = (
-    input.index as unknown as {
-      db: import("bun:sqlite").Database;
-    }
-  ).db
-    .query("SELECT path FROM files ORDER BY path")
-    .all() as Array<{ path: string }>;
+  const files = input.index.allNotePaths().map((path) => ({ path }));
+  const space = input.space ?? input.embedder.space;
 
   for (const { path } of files) {
+    result.totalFiles++;
     result.totalNotes++;
     let content: string;
     try {
@@ -80,23 +89,28 @@ export async function runEmbedJob(
     }
 
     const chunks = chunkText(content, input.maxChunkChars);
+    result.totalChunks += chunks.length;
+    input.index.pruneNoteEmbeddingChunks(path, chunks.length);
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i]!;
       const sha = sha256(chunk);
       if (!input.force) {
-        const recorded = input.index.embeddingSha(path, i);
+        const recorded = input.index.embeddingSha(path, i, space);
         if (recorded === sha) {
+          result.skippedChunks++;
           result.skipped++;
           continue;
         }
       }
       const r = await input.embedder(chunk);
       if (!r.ok) {
+        result.failedChunks++;
         result.failed++;
         result.errors.push({ path, chunkIdx: i, error: r.error });
         continue;
       }
-      input.index.upsertEmbedding(path, i, r.values, sha);
+      input.index.upsertEmbedding(path, i, r.values, sha, space);
+      result.embeddedChunks++;
       result.embedded++;
     }
   }
@@ -115,6 +129,7 @@ export interface TurnEmbedJobResult {
 export async function runTurnEmbedJob(input: {
   index: MemoryIndex;
   embedder: Embedder;
+  space?: EmbeddingSpace;
 }): Promise<TurnEmbedJobResult> {
   const result: TurnEmbedJobResult = {
     totalTurns: 0,
@@ -122,6 +137,7 @@ export async function runTurnEmbedJob(input: {
     failed: 0,
     errors: [],
   };
+  const space = input.space ?? input.embedder.space;
   for (const row of input.index.allTurnDocuments()) {
     result.totalTurns++;
     const r = await input.embedder(row.content);
@@ -130,10 +146,49 @@ export async function runTurnEmbedJob(input: {
       result.errors.push({ path: row.path, error: r.error });
       continue;
     }
-    input.index.upsertTurnEmbedding(row.path, r.values, sha256(row.content));
+    input.index.upsertTurnEmbedding(
+      row.path,
+      r.values,
+      sha256(row.content),
+      space,
+    );
     result.embedded++;
   }
   return result;
+}
+
+export interface EmbeddingPreflightResult {
+  ok: boolean;
+  error?: string;
+  path?: string;
+}
+
+/** Make one bounded real document request before a destructive vector pass. */
+export async function runEmbeddingPreflight(input: {
+  personaDir: string;
+  index: MemoryIndex;
+  embedder: Embedder;
+  maxChunkChars: number;
+}): Promise<EmbeddingPreflightResult> {
+  for (const path of input.index.allNotePaths()) {
+    try {
+      const content = await readFile(join(input.personaDir, path), "utf8");
+      const chunk = chunkText(content, input.maxChunkChars)[0];
+      if (chunk === undefined) continue;
+      const r = await input.embedder(chunk);
+      return r.ok
+        ? { ok: true, path }
+        : { ok: false, path, error: r.error };
+    } catch (e) {
+      return { ok: false, path, error: (e as Error).message };
+    }
+  }
+  const turn = input.index.allTurnDocuments()[0];
+  if (!turn) return { ok: true };
+  const r = await input.embedder(turn.content);
+  return r.ok
+    ? { ok: true, path: turn.path }
+    : { ok: false, path: turn.path, error: r.error };
 }
 
 export function chunkText(text: string, maxChars: number): string[] {
