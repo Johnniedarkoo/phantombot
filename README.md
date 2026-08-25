@@ -2079,8 +2079,8 @@ phantombot memory index --rebuild
 ```
 
 **Privacy boundary:** local SQLite and markdown memory remain local storage,
-but the configured embedding endpoint receives the plaintext submitted for
-embedding. That includes note/KB chunks, indexed conversation-turn text, and
+PhantomBot sends the plaintext being embedded to the configured endpoint, which
+receives it. That includes note/KB chunks, indexed conversation-turn text, and
 retrieval queries. Gemini sends that text to Google's Generative Language API;
 an OpenAI-compatible endpoint may be remote or may be localhost. A localhost
 endpoint keeps those embedding calls on the local machine. This is separate
