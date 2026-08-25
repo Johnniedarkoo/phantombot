@@ -370,11 +370,9 @@ export async function runMemoryIndex(
       }
       const maxChunkChars =
         documentChunkChars(config) ?? DEFAULT_GEMINI_MAX_CHUNK_CHARS;
-      const before = ix.allEmbeddings();
-      // Refresh first so newly-created notes and changed FTS content are part
-      // of the same bounded migration. Restore the snapshot if the endpoint
-      // cannot pass a real document request.
-      await ix.refreshStale(dir);
+      // Probe the real endpoint before touching FTS or embedding rows. A
+      // failed preflight must leave both the searchable index and vectors
+      // exactly as they were when the command started.
       const preflight = await runEmbeddingPreflight({
         personaDir: dir,
         index: ix,
@@ -382,13 +380,13 @@ export async function runMemoryIndex(
         maxChunkChars,
       });
       if (!preflight.ok) {
-        ix.restoreEmbeddings(before);
         err.write(
           `reembed preflight failed${preflight.path ? ` for ${preflight.path}` : ""}: ` +
             `${preflight.error ?? "unknown embedding failure"}\n`,
         );
         return 1;
       }
+      await ix.refreshStale(dir);
       out.write(
         `rebuilding derived vectors for '${persona}' ` +
           "(source files, raw turns, and FTS are preserved)…\n",

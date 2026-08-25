@@ -73,8 +73,40 @@ export function embeddingSpaceForConfig(
   return undefined;
 }
 
-/** Untagged rows can only have come from upstream's Gemini-only provider. */
+/**
+ * Untagged rows predate per-row provenance. The only defensible inference is
+ * the historical upstream Gemini default; a configurable Gemini model or
+ * dimension could have produced a different vector space, so it must be
+ * reembedded rather than guessed.
+ */
 export function acceptsLegacyGeminiRows(space: EmbeddingSpace): boolean {
-  return space.provider === "gemini";
+  return (
+    space.provider === "gemini" &&
+    space.model === "gemini-embedding-001" &&
+    space.dimensions === 1536
+  );
 }
 
+/** Shared row-level compatibility predicate for tagged and legacy vectors. */
+export function embeddingRowMatchesSpace(
+  rowFingerprint: string | null | undefined,
+  space: EmbeddingSpace,
+): boolean {
+  return (
+    rowFingerprint === space.fingerprint ||
+    (rowFingerprint == null && acceptsLegacyGeminiRows(space))
+  );
+}
+
+/** Build the SQLite equivalent of embeddingRowMatchesSpace. */
+export function embeddingSpaceSqlPredicate(
+  space: EmbeddingSpace,
+  column = "space_fingerprint",
+): { sql: string; params: [string] } {
+  return acceptsLegacyGeminiRows(space)
+    ? {
+        sql: `(${column} = ? OR ${column} IS NULL)`,
+        params: [space.fingerprint],
+      }
+    : { sql: `${column} = ?`, params: [space.fingerprint] };
+}

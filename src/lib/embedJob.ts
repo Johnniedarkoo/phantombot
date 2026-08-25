@@ -15,7 +15,7 @@ import { join } from "node:path";
 import type { Config } from "../config.ts";
 import { resolveEmbedders, type Embedder } from "./embedder.ts";
 import type { EmbeddingSpace } from "./embeddingSpace.ts";
-import type { MemoryIndex } from "./memoryIndex.ts";
+import { walkMarkdown, type MemoryIndex } from "./memoryIndex.ts";
 
 export interface EmbedJobResult {
   totalFiles: number;
@@ -170,7 +170,14 @@ export async function runEmbeddingPreflight(input: {
   embedder: Embedder;
   maxChunkChars: number;
 }): Promise<EmbeddingPreflightResult> {
-  for (const path of input.index.allNotePaths()) {
+  // Include safe disk-backed notes that are not indexed yet. Reembed must
+  // probe before refreshStale, so a freshly-created or changed note may be
+  // the only practical bounded real-document request available.
+  const paths = new Set([
+    ...input.index.allNotePaths(),
+    ...walkMarkdown(input.personaDir).map((file) => file.path),
+  ]);
+  for (const path of paths) {
     try {
       const content = await readFile(join(input.personaDir, path), "utf8");
       const chunk = chunkText(content, input.maxChunkChars)[0];

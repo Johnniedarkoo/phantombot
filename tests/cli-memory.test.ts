@@ -351,7 +351,7 @@ describe("runMemoryIndex", () => {
     }
   });
 
-  test("reembed preflight failure restores the old vector", async () => {
+  test("reembed preflight failure preserves old FTS state and vectors", async () => {
     await note("kb/concepts/A.md", "old content");
     const seeded = await MemoryIndex.open(indexPath);
     await seeded.refreshStale(join(workdir, "personas", "phantom"));
@@ -375,6 +375,8 @@ describe("runMemoryIndex", () => {
       expect(Array.from(row.vec)).toEqual([3, 4]);
       expect(row.textSha).toBe("old-sha");
       expect(row.spaceFingerprint).toBe(space.fingerprint);
+      expect(check.search("old content")).toHaveLength(1);
+      expect(check.search("edited content")).toHaveLength(0);
     } finally {
       check.close();
     }

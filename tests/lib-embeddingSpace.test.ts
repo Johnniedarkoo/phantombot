@@ -12,6 +12,16 @@ const geminiA = makeEmbeddingSpace({
   model: "model-a",
   dimensions: 4,
 });
+const legacyGemini = makeEmbeddingSpace({
+  provider: "gemini",
+  model: "gemini-embedding-001",
+  dimensions: 1536,
+});
+const legacyGeminiWrongModel = makeEmbeddingSpace({
+  provider: "gemini",
+  model: "model-a",
+  dimensions: 1536,
+});
 const geminiB = makeEmbeddingSpace({
   provider: "gemini",
   model: "model-b",
@@ -83,17 +93,51 @@ describe("embedding-space identity", () => {
     index.close();
   });
 
-  test("legacy untagged rows remain usable only for Gemini and dimensions remain a guard", () => {
+  test("legacy untagged rows are accepted only by the canonical Gemini default", () => {
     const ix = new Database(":memory:");
     const index = new MemoryIndex(ix);
     index.upsertEmbedding("kb/legacy.md", 0, new Float32Array([1, 0, 0, 0]), "sha");
-    expect(index.allEmbeddings(geminiA)).toHaveLength(1);
+    expect(index.allEmbeddings(legacyGemini)).toHaveLength(1);
+    expect(index.allEmbeddings(legacyGeminiWrongModel)).toHaveLength(0);
     expect(index.allEmbeddings(openA)).toHaveLength(0);
+    index.upsertTurn(turn, new Float32Array([1, 0, 0, 0]), "turn-sha");
+    expect(index.turnEmbeddingSha(turnPath(turn), legacyGemini)).toBe("turn-sha");
+    expect(index.turnEmbeddingSha(turnPath(turn), legacyGeminiWrongModel)).toBeUndefined();
+    expect(index.turnsMissingEmbeddings("phantom", 10, legacyGeminiWrongModel)).toHaveLength(1);
     expect(
       index.hybridSearch("legacy", new Float32Array([1, 0]), {
-        embeddingSpace: geminiA,
+        embeddingSpace: legacyGemini,
       }),
     ).toHaveLength(0);
+    index.close();
+  });
+
+  test("tagged Gemini rows match only by exact fingerprint", () => {
+    const ix = new Database(":memory:");
+    const index = new MemoryIndex(ix);
+    index.upsertEmbedding(
+      "kb/tagged.md",
+      0,
+      new Float32Array([1, 0]),
+      "sha",
+      legacyGemini,
+    );
+    expect(index.allEmbeddings(legacyGemini)).toHaveLength(1);
+    expect(index.allEmbeddings(legacyGeminiWrongModel)).toHaveLength(0);
+    index.close();
+  });
+
+  test("compatible embedding count applies the same space predicate without counting foreign rows", () => {
+    const ix = new Database(":memory:");
+    const index = new MemoryIndex(ix);
+    index.upsertEmbedding("kb/current.md", 0, new Float32Array([1, 0]), "a", legacyGemini);
+    index.upsertEmbedding("kb/legacy.md", 0, new Float32Array([1, 0]), "b");
+    index.upsertEmbedding("kb/foreign.md", 0, new Float32Array([1, 0]), "c", legacyGeminiWrongModel);
+    index.upsertEmbedding("kb/open-current.md", 0, new Float32Array([1, 0]), "e", openA);
+    index.upsertTurn(turn, new Float32Array([1, 0]), "d", legacyGemini);
+    expect(index.embeddingCount(legacyGemini)).toBe(3);
+    expect(index.embeddingCount(legacyGeminiWrongModel)).toBe(1);
+    expect(index.embeddingCount(openA)).toBe(1);
     index.close();
   });
 

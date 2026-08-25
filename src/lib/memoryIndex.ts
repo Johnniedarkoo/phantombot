@@ -30,7 +30,8 @@ import type { Turn, TurnOrigin } from "../memory/store.ts";
 import { log } from "./logger.ts";
 import { normaliseOkfType, parseOkf } from "./okf.ts";
 import {
-  acceptsLegacyGeminiRows,
+  embeddingSpaceSqlPredicate,
+  embeddingRowMatchesSpace,
   type EmbeddingSpace,
 } from "./embeddingSpace.ts";
 
@@ -888,10 +889,7 @@ export class MemoryIndex {
       space_fingerprint?: string | null;
     } | null;
     if (!row || !space) return row?.text_sha;
-    if (
-      row.space_fingerprint !== space.fingerprint &&
-      !(row.space_fingerprint == null && acceptsLegacyGeminiRows(space))
-    ) return undefined;
+    if (!embeddingRowMatchesSpace(row.space_fingerprint, space)) return undefined;
     return row?.text_sha;
   }
 
@@ -945,10 +943,13 @@ export class MemoryIndex {
     space?: EmbeddingSpace,
   ): Array<{ path: string; content: string }> {
     if (limit <= 0) return [];
-    const join = space
-      ? "LEFT JOIN turn_embeddings e ON e.path = d.path AND (e.space_fingerprint = ? OR (e.space_fingerprint IS NULL AND ? = 'gemini'))"
+    const compatibility = space
+      ? embeddingSpaceSqlPredicate(space, "e.space_fingerprint")
+      : undefined;
+    const join = compatibility
+      ? `LEFT JOIN turn_embeddings e ON e.path = d.path AND ${compatibility.sql}`
       : "LEFT JOIN turn_embeddings e ON e.path = d.path";
-    const params = space ? [space.fingerprint, space.provider] : [];
+    const params = compatibility?.params ?? [];
     return this.db
       .prepare(
         `SELECT d.path AS path, d.content AS content
@@ -1047,28 +1048,34 @@ export class MemoryIndex {
     } | null;
     if (!row || !space) return row?.text_sha;
     if (
-      row.space_fingerprint !== space.fingerprint &&
-      !(row.space_fingerprint == null && acceptsLegacyGeminiRows(space))
+      !embeddingRowMatchesSpace(row.space_fingerprint, space)
     ) return undefined;
     return row?.text_sha;
   }
 
   /** Walk every stored embedding. Loads all into memory — fine up to ~50K rows. */
   allEmbeddings(space?: EmbeddingSpace): StoredEmbedding[] {
+    const compatibility = space
+      ? embeddingSpaceSqlPredicate(space)
+      : undefined;
+    const notePredicate = compatibility ? ` WHERE ${compatibility.sql}` : "";
     const noteRows = this.db
-      .query(
-        "SELECT path, chunk_idx, vec, text_sha, space_fingerprint FROM note_embeddings",
+      .prepare(
+        `SELECT path, chunk_idx, vec, text_sha, space_fingerprint FROM note_embeddings${notePredicate}`,
       )
-      .all() as Array<{
+      .all(...(compatibility?.params ?? [])) as Array<{
       path: string;
       chunk_idx: number;
       vec: Buffer | Uint8Array;
       text_sha: string;
       space_fingerprint: string | null;
     }>;
+    const turnPredicate = compatibility ? ` WHERE ${compatibility.sql}` : "";
     const turnRows = this.db
-      .query("SELECT path, vec, text_sha, space_fingerprint FROM turn_embeddings")
-      .all() as Array<{
+      .prepare(
+        `SELECT path, vec, text_sha, space_fingerprint FROM turn_embeddings${turnPredicate}`,
+      )
+      .all(...(compatibility?.params ?? [])) as Array<{
       path: string;
       vec: Buffer | Uint8Array;
       text_sha: string;
@@ -1090,16 +1097,26 @@ export class MemoryIndex {
         spaceFingerprint: r.space_fingerprint ?? undefined,
       })),
     ];
-    if (!space) return rows;
-    return rows.filter(
-      (r) =>
-        r.spaceFingerprint === space.fingerprint ||
-        (r.spaceFingerprint === undefined && acceptsLegacyGeminiRows(space)),
-    );
+    return space
+      ? rows.filter((r) => embeddingRowMatchesSpace(r.spaceFingerprint, space))
+      : rows;
   }
 
   embeddingCount(space?: EmbeddingSpace): number {
-    if (space) return this.allEmbeddings(space).length;
+    if (space) {
+      const predicate = embeddingSpaceSqlPredicate(space);
+      const notes = (
+        this.db
+          .prepare(`SELECT COUNT(*) AS c FROM note_embeddings WHERE ${predicate.sql}`)
+          .get(...predicate.params) as { c: number }
+      ).c;
+      const turns = (
+        this.db
+          .prepare(`SELECT COUNT(*) AS c FROM turn_embeddings WHERE ${predicate.sql}`)
+          .get(...predicate.params) as { c: number }
+      ).c;
+      return notes + turns;
+    }
     const notes = (
       this.db
         .prepare("SELECT COUNT(*) AS c FROM note_embeddings")
@@ -1139,32 +1156,6 @@ export class MemoryIndex {
         "DELETE FROM note_embeddings WHERE path = ? AND chunk_idx >= ?",
       )
       .run(path, Math.max(0, Math.floor(currentChunkCount)));
-  }
-
-  /** Snapshot/restore used only to make reembed preflight non-destructive. */
-  restoreEmbeddings(rows: StoredEmbedding[]): void {
-    const note = this.db.prepare(
-      "INSERT OR REPLACE INTO note_embeddings (path, chunk_idx, vec, text_sha, space_fingerprint, embedded_at) VALUES (?, ?, ?, ?, ?, ?)",
-    );
-    const turn = this.db.prepare(
-      "INSERT OR REPLACE INTO turn_embeddings (path, vec, text_sha, space_fingerprint, embedded_at) VALUES (?, ?, ?, ?, ?)",
-    );
-    const now = new Date().toISOString();
-    for (const row of rows) {
-      const buf = Buffer.from(row.vec.buffer, row.vec.byteOffset, row.vec.byteLength);
-      if (row.path.startsWith("turns/")) {
-        turn.run(row.path, buf, row.textSha, row.spaceFingerprint ?? null, now);
-      } else {
-        note.run(
-          row.path,
-          row.chunkIdx,
-          buf,
-          row.textSha,
-          row.spaceFingerprint ?? null,
-          now,
-        );
-      }
-    }
   }
 
   allNotePaths(): string[] {
