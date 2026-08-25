@@ -39,6 +39,7 @@ import {
   type RetrievalSettings,
 } from "../config.ts";
 import { resolveEmbedders } from "../lib/embedder.ts";
+import { embeddingSpaceForConfig } from "../lib/embeddingSpace.ts";
 import { log } from "../lib/logger.ts";
 import {
   allowedAudiencesForRoom,
@@ -74,7 +75,7 @@ export interface RetrieveContextOptions {
    */
   conversation?: string;
   signal?: AbortSignal;
-  /** Injectable fetch for tests (passed through to geminiEmbed). */
+  /** Injectable fetch for tests (passed through to the configured embedder). */
   fetchImpl?: typeof fetch;
 }
 
@@ -104,7 +105,8 @@ export async function retrieveContext(
     const queryEmbedder = resolveEmbedders(opts.embeddings, {
       fetchImpl: opts.fetchImpl,
     }).query;
-    if (queryEmbedder && ix.embeddingCount() > 0) {
+    const embeddingSpace = embeddingSpaceForConfig(opts.embeddings);
+    if (queryEmbedder && embeddingSpace && ix.embeddingCount(embeddingSpace) > 0) {
       const r = await queryEmbedder(query, opts.signal);
       if (r.ok) queryVec = r.values;
       else
@@ -132,6 +134,7 @@ export async function retrieveContext(
           limit: opts.settings.limit,
           conversation: opts.conversation,
           decay,
+          embeddingSpace,
         })
       : ge?.enabled
         ? ix.searchExpanded(query, {
@@ -226,6 +229,7 @@ export async function retrieveContext(
         limit: CROSS_CANDIDATE_POOL,
         decay,
         turnFilter,
+        embeddingSpace,
       });
       crossHits = selectCrossConversationHits(candidates, {
         currentConversation: opts.conversation!,

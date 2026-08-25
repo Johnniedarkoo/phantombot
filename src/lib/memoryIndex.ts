@@ -29,6 +29,10 @@ import type { FactSource } from "../config.ts";
 import type { Turn, TurnOrigin } from "../memory/store.ts";
 import { log } from "./logger.ts";
 import { normaliseOkfType, parseOkf } from "./okf.ts";
+import {
+  acceptsLegacyGeminiRows,
+  type EmbeddingSpace,
+} from "./embeddingSpace.ts";
 
 export type Scope = "memory" | "kb" | "turns";
 
@@ -318,6 +322,7 @@ export interface StoredEmbedding {
   chunkIdx: number;
   vec: Float32Array;
   textSha: string;
+  spaceFingerprint?: string;
 }
 
 export interface TurnIndexState {
@@ -456,6 +461,7 @@ CREATE TABLE IF NOT EXISTS note_embeddings (
   chunk_idx    INTEGER NOT NULL,
   vec          BLOB NOT NULL,
   text_sha     TEXT NOT NULL,
+  space_fingerprint TEXT,
   embedded_at  TEXT NOT NULL,
   PRIMARY KEY (path, chunk_idx)
 );
@@ -478,6 +484,7 @@ CREATE TABLE IF NOT EXISTS turn_embeddings (
   path         TEXT PRIMARY KEY,
   vec          BLOB NOT NULL,
   text_sha     TEXT NOT NULL,
+  space_fingerprint TEXT,
   embedded_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_turn_embeddings_sha ON turn_embeddings(text_sha);
@@ -499,8 +506,25 @@ export class MemoryIndex {
     // statement, or schema setup itself can throw SQLITE_BUSY when another
     // process touches the index DB concurrently.
     db.exec(SCHEMA);
+    this.selfHealEmbeddingSchema();
     this.selfHealNotesSchema();
     this.selfHealTurnSchema();
+  }
+
+  /** Add per-row space provenance without dropping legacy vectors. */
+  private selfHealEmbeddingSchema(): void {
+    for (const table of ["note_embeddings", "turn_embeddings"] as const) {
+      const cols = this.db
+        .query(`PRAGMA table_info(${table})`)
+        .all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === "space_fingerprint")) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN space_fingerprint TEXT;`);
+      }
+    }
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_note_embeddings_space ON note_embeddings(space_fingerprint);" +
+        "CREATE INDEX IF NOT EXISTS idx_turn_embeddings_space ON turn_embeddings(space_fingerprint);",
+    );
   }
 
   /**
@@ -787,18 +811,31 @@ export class MemoryIndex {
     chunkIdx: number,
     vec: Float32Array,
     textSha: string,
+    space?: EmbeddingSpace,
   ): void {
     const buf = Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength);
     this.db
       .prepare(
         "INSERT OR REPLACE INTO note_embeddings " +
-          "(path, chunk_idx, vec, text_sha, embedded_at) " +
-          "VALUES (?, ?, ?, ?, ?)",
+          "(path, chunk_idx, vec, text_sha, space_fingerprint, embedded_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?)",
       )
-      .run(path, chunkIdx, buf, textSha, new Date().toISOString());
+      .run(
+        path,
+        chunkIdx,
+        buf,
+        textSha,
+        space?.fingerprint ?? null,
+        new Date().toISOString(),
+      );
   }
 
-  upsertTurn(turn: Turn, vec?: Float32Array, textSha?: string): void {
+  upsertTurn(
+    turn: Turn,
+    vec?: Float32Array,
+    textSha?: string,
+    space?: EmbeddingSpace,
+  ): void {
     const path = turnPath(turn);
     // Delete ONLY the turn_docs row. Turn paths are id-keyed and turn text
     // is immutable, so a surviving turn_embeddings row for this path always
@@ -829,16 +866,32 @@ export class MemoryIndex {
       this.db
         .prepare(
           "INSERT OR REPLACE INTO turn_embeddings " +
-            "(path, vec, text_sha, embedded_at) VALUES (?, ?, ?, ?)",
+            "(path, vec, text_sha, space_fingerprint, embedded_at) VALUES (?, ?, ?, ?, ?)",
         )
-        .run(path, buf, textSha, new Date().toISOString());
+        .run(
+          path,
+          buf,
+          textSha,
+          space?.fingerprint ?? null,
+          new Date().toISOString(),
+        );
     }
   }
 
-  turnEmbeddingSha(path: string): string | undefined {
+  turnEmbeddingSha(path: string, space?: EmbeddingSpace): string | undefined {
     const row = this.db
-      .prepare("SELECT text_sha FROM turn_embeddings WHERE path = ?")
-      .get(path) as { text_sha?: string } | null;
+      .prepare(
+        "SELECT text_sha, space_fingerprint FROM turn_embeddings WHERE path = ?",
+      )
+      .get(path) as {
+      text_sha?: string;
+      space_fingerprint?: string | null;
+    } | null;
+    if (!row || !space) return row?.text_sha;
+    if (
+      row.space_fingerprint !== space.fingerprint &&
+      !(row.space_fingerprint == null && acceptsLegacyGeminiRows(space))
+    ) return undefined;
     return row?.text_sha;
   }
 
@@ -848,14 +901,25 @@ export class MemoryIndex {
    * missing vector without rewriting (or accidentally duplicating) the FTS
    * row that is already there and correct.
    */
-  upsertTurnEmbedding(path: string, vec: Float32Array, textSha: string): void {
+  upsertTurnEmbedding(
+    path: string,
+    vec: Float32Array,
+    textSha: string,
+    space?: EmbeddingSpace,
+  ): void {
     const buf = Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength);
     this.db
       .prepare(
         "INSERT OR REPLACE INTO turn_embeddings " +
-          "(path, vec, text_sha, embedded_at) VALUES (?, ?, ?, ?)",
+          "(path, vec, text_sha, space_fingerprint, embedded_at) VALUES (?, ?, ?, ?, ?)",
       )
-      .run(path, buf, textSha, new Date().toISOString());
+      .run(
+        path,
+        buf,
+        textSha,
+        space?.fingerprint ?? null,
+        new Date().toISOString(),
+      );
   }
 
   /**
@@ -878,17 +942,22 @@ export class MemoryIndex {
   turnsMissingEmbeddings(
     persona: string,
     limit: number,
+    space?: EmbeddingSpace,
   ): Array<{ path: string; content: string }> {
     if (limit <= 0) return [];
+    const join = space
+      ? "LEFT JOIN turn_embeddings e ON e.path = d.path AND (e.space_fingerprint = ? OR (e.space_fingerprint IS NULL AND ? = 'gemini'))"
+      : "LEFT JOIN turn_embeddings e ON e.path = d.path";
+    const params = space ? [space.fingerprint, space.provider] : [];
     return this.db
       .prepare(
         `SELECT d.path AS path, d.content AS content
            FROM turn_docs d
-           LEFT JOIN turn_embeddings e ON e.path = d.path
+           ${join}
           WHERE d.persona = ? AND e.path IS NULL
           LIMIT ?`,
       )
-      .all(persona, Math.floor(limit)) as Array<{
+      .all(...params, persona, Math.floor(limit)) as Array<{
       path: string;
       content: string;
     }>;
@@ -963,51 +1032,74 @@ export class MemoryIndex {
   }
 
   /** Return the recorded text_sha for a (path, chunk_idx) or undefined. */
-  embeddingSha(path: string, chunkIdx: number): string | undefined {
+  embeddingSha(
+    path: string,
+    chunkIdx: number,
+    space?: EmbeddingSpace,
+  ): string | undefined {
     const row = this.db
       .prepare(
-        "SELECT text_sha FROM note_embeddings WHERE path = ? AND chunk_idx = ?",
+        "SELECT text_sha, space_fingerprint FROM note_embeddings WHERE path = ? AND chunk_idx = ?",
       )
-      .get(path, chunkIdx) as { text_sha?: string } | null;
+      .get(path, chunkIdx) as {
+      text_sha?: string;
+      space_fingerprint?: string | null;
+    } | null;
+    if (!row || !space) return row?.text_sha;
+    if (
+      row.space_fingerprint !== space.fingerprint &&
+      !(row.space_fingerprint == null && acceptsLegacyGeminiRows(space))
+    ) return undefined;
     return row?.text_sha;
   }
 
   /** Walk every stored embedding. Loads all into memory — fine up to ~50K rows. */
-  allEmbeddings(): StoredEmbedding[] {
+  allEmbeddings(space?: EmbeddingSpace): StoredEmbedding[] {
     const noteRows = this.db
       .query(
-        "SELECT path, chunk_idx, vec, text_sha FROM note_embeddings",
+        "SELECT path, chunk_idx, vec, text_sha, space_fingerprint FROM note_embeddings",
       )
       .all() as Array<{
       path: string;
       chunk_idx: number;
       vec: Buffer | Uint8Array;
       text_sha: string;
+      space_fingerprint: string | null;
     }>;
     const turnRows = this.db
-      .query("SELECT path, vec, text_sha FROM turn_embeddings")
+      .query("SELECT path, vec, text_sha, space_fingerprint FROM turn_embeddings")
       .all() as Array<{
       path: string;
       vec: Buffer | Uint8Array;
       text_sha: string;
+      space_fingerprint: string | null;
     }>;
-    return [
+    const rows: StoredEmbedding[] = [
       ...noteRows.map((r) => ({
       path: r.path,
       chunkIdx: r.chunk_idx,
       vec: blobToFloat32(r.vec),
       textSha: r.text_sha,
+      spaceFingerprint: r.space_fingerprint ?? undefined,
       })),
       ...turnRows.map((r) => ({
         path: r.path,
         chunkIdx: 0,
         vec: blobToFloat32(r.vec),
         textSha: r.text_sha,
+        spaceFingerprint: r.space_fingerprint ?? undefined,
       })),
     ];
+    if (!space) return rows;
+    return rows.filter(
+      (r) =>
+        r.spaceFingerprint === space.fingerprint ||
+        (r.spaceFingerprint === undefined && acceptsLegacyGeminiRows(space)),
+    );
   }
 
-  embeddingCount(): number {
+  embeddingCount(space?: EmbeddingSpace): number {
+    if (space) return this.allEmbeddings(space).length;
     const notes = (
       this.db
         .prepare("SELECT COUNT(*) AS c FROM note_embeddings")
@@ -1024,6 +1116,63 @@ export class MemoryIndex {
   /** Remove only derived vectors; FTS, turn docs, and index cursors survive. */
   clearEmbeddings(): void {
     this.db.exec("DELETE FROM note_embeddings; DELETE FROM turn_embeddings;");
+  }
+
+  /** Delete only rows that cannot belong to the completed current rebuild. */
+  removeObsoleteEmbeddingSpaces(space: EmbeddingSpace): void {
+    this.db
+      .prepare(
+        "DELETE FROM note_embeddings WHERE space_fingerprint IS NULL OR space_fingerprint <> ?",
+      )
+      .run(space.fingerprint);
+    this.db
+      .prepare(
+        "DELETE FROM turn_embeddings WHERE space_fingerprint IS NULL OR space_fingerprint <> ?",
+      )
+      .run(space.fingerprint);
+  }
+
+  /** Remove tail chunks after the current chunk list has been computed. */
+  pruneNoteEmbeddingChunks(path: string, currentChunkCount: number): void {
+    this.db
+      .prepare(
+        "DELETE FROM note_embeddings WHERE path = ? AND chunk_idx >= ?",
+      )
+      .run(path, Math.max(0, Math.floor(currentChunkCount)));
+  }
+
+  /** Snapshot/restore used only to make reembed preflight non-destructive. */
+  restoreEmbeddings(rows: StoredEmbedding[]): void {
+    const note = this.db.prepare(
+      "INSERT OR REPLACE INTO note_embeddings (path, chunk_idx, vec, text_sha, space_fingerprint, embedded_at) VALUES (?, ?, ?, ?, ?, ?)",
+    );
+    const turn = this.db.prepare(
+      "INSERT OR REPLACE INTO turn_embeddings (path, vec, text_sha, space_fingerprint, embedded_at) VALUES (?, ?, ?, ?, ?)",
+    );
+    const now = new Date().toISOString();
+    for (const row of rows) {
+      const buf = Buffer.from(row.vec.buffer, row.vec.byteOffset, row.vec.byteLength);
+      if (row.path.startsWith("turns/")) {
+        turn.run(row.path, buf, row.textSha, row.spaceFingerprint ?? null, now);
+      } else {
+        note.run(
+          row.path,
+          row.chunkIdx,
+          buf,
+          row.textSha,
+          row.spaceFingerprint ?? null,
+          now,
+        );
+      }
+    }
+  }
+
+  allNotePaths(): string[] {
+    return (
+      this.db.query("SELECT path FROM files ORDER BY path").all() as Array<{
+        path: string;
+      }>
+    ).map((r) => r.path);
   }
 
   /** Every already-indexed eligible historical turn, independent of cursors. */
@@ -1378,9 +1527,10 @@ export class MemoryIndex {
       /**
        * SQL-side turn candidate filter (see TurnFilter). Applied to BOTH the
        * inner FTS search and the vector allowed-paths set, so ineligible
-       * turns never occupy a candidate slot on either ranking.
-       */
+      * turns never occupy a candidate slot on either ranking.
+      */
       turnFilter?: TurnFilter;
+      embeddingSpace?: EmbeddingSpace;
     } = {},
   ): SearchHit[] {
     const limit = Math.max(1, Math.min(opts.limit ?? 5, 50));
@@ -1411,7 +1561,7 @@ export class MemoryIndex {
     }
 
     // Vector search. Brute-force cosine over all embeddings.
-    const all = this.allEmbeddings();
+    const all = this.allEmbeddings(opts.embeddingSpace);
     const vecScores = new Map<string, number>(); // path → max chunk score
     let incompatible = 0;
     for (const emb of all) {

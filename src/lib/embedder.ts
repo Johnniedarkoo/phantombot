@@ -3,11 +3,15 @@
 import type { Config } from "../config.ts";
 import { geminiEmbed, type EmbedResult } from "./geminiEmbed.ts";
 import { openaiCompatibleEmbed } from "./openaiCompatibleEmbed.ts";
+import {
+  embeddingSpaceForConfig,
+  type EmbeddingSpace,
+} from "./embeddingSpace.ts";
 
-export type Embedder = (
+export type Embedder = ((
   text: string,
   signal?: AbortSignal,
-) => Promise<EmbedResult>;
+) => Promise<EmbedResult>) & { space?: EmbeddingSpace };
 
 export interface ResolvedEmbedders {
   query?: Embedder;
@@ -32,27 +36,32 @@ export function resolveEmbedders(
   if (embeddings.provider === "gemini") {
     const g = embeddings.gemini;
     if (!g?.apiKey) return {};
-    const embed: Embedder = (text, signal) =>
+    const embed = Object.assign(((text: string, signal?: AbortSignal) =>
       geminiEmbed(g.apiKey, text, {
         model: g.model,
         dims: g.dims,
         signal,
         fetchImpl: opts.fetchImpl,
-      });
+      })) as Embedder, {
+      space: embeddingSpaceForConfig(embeddings),
+    });
     return { query: embed, document: embed };
   }
 
   const o = embeddings.openaiCompatible;
   if (!o?.baseUrl || !o.model) return {};
-  const make = (prefix: string): Embedder => (text, signal) =>
-    openaiCompatibleEmbed(`${prefix}${text}`, {
-      baseUrl: o.baseUrl,
-      model: o.model,
-      apiKey: o.apiKey,
-      dims: o.dims,
-      fetchImpl: opts.fetchImpl,
-      signal,
-    });
+  const space = embeddingSpaceForConfig(embeddings);
+  const make = (prefix: string): Embedder => Object.assign((
+    (text: string, signal?: AbortSignal) =>
+      openaiCompatibleEmbed(`${prefix}${text}`, {
+        baseUrl: o.baseUrl,
+        model: o.model,
+        apiKey: o.apiKey,
+        dims: o.dims,
+        fetchImpl: opts.fetchImpl,
+        signal,
+      })
+  ) as Embedder, { space });
   return {
     query: make(o.queryPrefix),
     document: make(o.documentPrefix),

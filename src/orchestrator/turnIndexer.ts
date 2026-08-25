@@ -4,7 +4,7 @@
  * Runs after successful interactive turns, on a predictable user-turn cadence.
  * It backfills all raw turns since the last successful index point into the
  * same MemoryIndex database used by turn-time retrieval. FTS rows are always
- * written; Gemini embeddings are added when configured.
+ * written; document embeddings are added when configured.
  *
  * Hot-path invariant: never throw back into runTurn. Indexing improves recall,
  * but a failure must not break chat.
@@ -16,6 +16,7 @@ import {
   type TurnIndexingSettings,
 } from "../config.ts";
 import { defaultEmbedder, type Embedder, sha256 } from "../lib/embedJob.ts";
+import { embeddingSpaceForConfig } from "../lib/embeddingSpace.ts";
 import { log } from "../lib/logger.ts";
 import {
   MemoryIndex,
@@ -115,6 +116,8 @@ export async function indexConversationTurnsIfDue(
     }
 
     const embedder = input.embedder ?? defaultEmbedder(input.config);
+    const space =
+      input.embedder?.space ?? embeddingSpaceForConfig(input.config.embeddings);
     let afterId = state?.lastTurnId ?? 0;
     let indexed = 0;
     let embedded = 0;
@@ -150,7 +153,7 @@ export async function indexConversationTurnsIfDue(
         // this is what makes a turn-schema rebuild (turn_docs dropped,
         // turn_embeddings kept) cost zero embed API calls.
         const path = turnPath(turn);
-        const haveSha = ix.turnEmbeddingSha(path);
+        const haveSha = ix.turnEmbeddingSha(path, space);
         const vec =
           embedder && haveSha !== textSha
             ? await embedTurn(embedder, turn, text)
@@ -162,7 +165,7 @@ export async function indexConversationTurnsIfDue(
         // API calls) doesn't log embedded: 0 and look like the embedder
         // is down.
         else if (embedder && haveSha === textSha) reused++;
-        ix.upsertTurn(turn, vec, vec ? textSha : undefined);
+        ix.upsertTurn(turn, vec, vec ? textSha : undefined, space);
         indexed++;
         afterId = turn.id;
       }
@@ -313,6 +316,7 @@ export async function repairMissingTurnEmbeddings(
     const stale = ix.turnsMissingEmbeddings(
       input.persona,
       input.settings.repairBatchSize,
+      input.embedder?.space ?? embeddingSpaceForConfig(input.config.embeddings),
     );
     if (stale.length === 0) return result;
 
@@ -320,7 +324,12 @@ export async function repairMissingTurnEmbeddings(
     for (const row of stale) {
       const r = await embedder(row.content);
       if (r.ok) {
-        ix.upsertTurnEmbedding(row.path, r.values, sha256(row.content));
+        ix.upsertTurnEmbedding(
+          row.path,
+          r.values,
+          sha256(row.content),
+          input.embedder?.space ?? embeddingSpaceForConfig(input.config.embeddings),
+        );
         result.repaired++;
         consecutiveFailures = 0;
         continue;
