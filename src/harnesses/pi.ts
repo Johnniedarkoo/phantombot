@@ -61,6 +61,12 @@ import {
   runHarnessProcess,
 } from "../lib/harnessRunner.ts";
 import { log } from "../lib/logger.ts";
+import {
+  elapsedMs,
+  perfNow,
+  perfTrace,
+  perfTraceEnabled,
+} from "../lib/perfTrace.ts";
 import { spawnInNewSession } from "../lib/processGroup.ts";
 import { createHarnessTempDir } from "../lib/harnessArgvFiles.ts";
 
@@ -81,6 +87,55 @@ export interface PiHarnessConfig {
    * Absent = no per-capability routing (Pi uses its configured default model).
    */
   routing?: PiRoutingConfig;
+}
+
+export interface PiEventTimings {
+  firstRawAt?: number;
+  agentStartAt?: number;
+  firstModelDeltaAt?: number;
+  firstTextDeltaAt?: number;
+  turnEndAt?: number;
+}
+
+/** Observe lifecycle event types without copying any Pi event payload. */
+export function observePiEvent(
+  parsed: unknown,
+  timings: PiEventTimings,
+  now = perfNow(),
+): void {
+  if (timings.firstRawAt === undefined) timings.firstRawAt = now;
+  if (typeof parsed !== "object" || parsed === null) return;
+  const obj = parsed as Record<string, unknown>;
+  if (obj.type === "agent_start" && timings.agentStartAt === undefined) {
+    timings.agentStartAt = now;
+  }
+  if (obj.type === "turn_end" && timings.turnEndAt === undefined) {
+    timings.turnEndAt = now;
+  }
+  if (obj.type !== "message_update") return;
+  const ame = obj.assistantMessageEvent;
+  if (typeof ame !== "object" || ame === null) return;
+  const event = ame as Record<string, unknown>;
+  if (
+    timings.firstModelDeltaAt === undefined &&
+    (event.type === "thinking_delta" || event.type === "text_delta")
+  ) {
+    timings.firstModelDeltaAt = now;
+  }
+  if (timings.firstTextDeltaAt === undefined && event.type === "text_delta") {
+    if (typeof event.delta === "string" && event.delta.length > 0) {
+      timings.firstTextDeltaAt = now;
+    }
+  }
+}
+
+export function timedParsePiEvent(
+  timings: PiEventTimings,
+): (parsed: unknown) => HarnessChunk | undefined {
+  return (parsed: unknown) => {
+    observePiEvent(parsed, timings);
+    return parsePiEvent(parsed);
+  };
 }
 
 export class PiHarness implements Harness {
@@ -110,6 +165,9 @@ export class PiHarness implements Harness {
   }
 
   async *invoke(req: HarnessRequest): AsyncGenerator<HarnessChunk> {
+    const perf = perfTraceEnabled()
+      ? { invokeStartedAt: perfNow(), attempt: 0 }
+      : undefined;
     const payload = renderPayload(req);
     const totalBytes =
       Buffer.byteLength(req.systemPrompt, "utf8") +
@@ -323,7 +381,11 @@ export class PiHarness implements Harness {
     const runAttempt = async function* (
       this: PiHarness,
       model: string | undefined,
+      attemptKind: "primary" | "coder",
     ): AsyncGenerator<HarnessChunk> {
+      const attempt = perf ? ++perf.attempt : undefined;
+      const attemptTimings: PiEventTimings | undefined = perf ? {} : undefined;
+      const spawnRequestedAt = perf ? perfNow() : undefined;
       const proc = spawnInNewSession([this.config.bin, ...buildArgs(model)], {
         cwd: req.workingDir,
         env: childEnv,
@@ -331,42 +393,98 @@ export class PiHarness implements Harness {
         stdout: "pipe",
         stderr: "pipe",
       });
+      const spawnReturnedAt = perf ? perfNow() : undefined;
 
       // Shared engine. Pi delivers its payload via argv (stdin ignored, so no
       // stdinPayload), and the terminal `done` meta records the argv byte count.
-      yield* runHarnessProcess({
-        proc,
-        req,
-        harnessId: this.id,
-        parseEvent: parsePiEvent,
-        activity: piActivity,
-        buildDoneMeta: () => ({ harnessId: this.id, payloadBytes: totalBytes }),
-        // pi is the only harness with no native terminal `done` in its stream —
-        // it derives completion from turn_end (mapped to a `done` marker in
-        // parsePiEvent). Require that marker before accepting an exit-0 run as a
-        // finished answer, so a narration-only mid-task exit falls through to the
-        // next harness rather than being stored as the reply (issue #352).
-        requireCompletion: true,
-        // Bound how long a single contiguous tool-run may keep the idle watchdog
-        // alive via tool_execution_* activity alone, with no user-facing text. pi
-        // only emits tool_execution_update on genuine new output (bash streams
-        // stdout, the coder delegate forwards its child's progress) so a healthy
-        // turn is rarely affected — but a tool that trickles output forever (a
-        // stalled auto-router, a hung network retry that keeps logging) could
-        // otherwise reset the idle timer up to the 60-min hard cap with no
-        // fallback (issue #351). This is a GENEROUS last-resort net: comfortably
-        // above any realistic tool-run yet well under the hard cap, so a
-        // wedged-but-chattery turn fails over in minutes, not an hour. Derived
-        // from the idle window, floored at 20 min, and never above the hard cap.
-        toolTimeoutMs: Math.min(
-          req.hardTimeoutMs ?? Number.POSITIVE_INFINITY,
-          Math.max(req.idleTimeoutMs * 4, 1_200_000),
-        ),
-      });
+      try {
+        yield* runHarnessProcess({
+          proc,
+          req,
+          harnessId: this.id,
+          parseEvent: attemptTimings
+            ? timedParsePiEvent(attemptTimings)
+            : parsePiEvent,
+          activity: piActivity,
+          buildDoneMeta: () => ({ harnessId: this.id, payloadBytes: totalBytes }),
+          // pi is the only harness with no native terminal `done` in its stream —
+          // it derives completion from turn_end (mapped to a `done` marker in
+          // parsePiEvent). Require that marker before accepting an exit-0 run as a
+          // finished answer, so a narration-only mid-task exit falls through to the
+          // next harness rather than being stored as the reply (issue #352).
+          requireCompletion: true,
+          // Bound how long a single contiguous tool-run may keep the idle watchdog
+          // alive via tool_execution_* activity alone, with no user-facing text. pi
+          // only emits tool_execution_update on genuine new output (bash streams
+          // stdout, the coder delegate forwards its child's progress) so a healthy
+          // turn is rarely affected — but a tool that trickles output forever (a
+          // stalled auto-router, a hung network retry that keeps logging) could
+          // otherwise reset the idle timer up to the 60-min hard cap with no
+          // fallback (issue #351). This is a GENEROUS last-resort net: comfortably
+          // above any realistic tool-run yet well under the hard cap, so a
+          // wedged-but-chattery turn fails over in minutes, not an hour. Derived
+          // from the idle window, floored at 20 min, and never above the hard cap.
+          toolTimeoutMs: Math.min(
+            req.hardTimeoutMs ?? Number.POSITIVE_INFINITY,
+            Math.max(req.idleTimeoutMs * 4, 1_200_000),
+          ),
+        });
+      } finally {
+        if (perf && attemptTimings && attempt !== undefined) {
+          perfTrace("perf.pi_attempt", {
+            turnId: req.turnId,
+            attempt,
+            attempt_kind: attemptKind,
+            model: model ?? "(pi default)",
+            pi_invoke_prepare_ms:
+              attempt === 1
+                ? elapsedMs(perf.invokeStartedAt, spawnRequestedAt!)
+                : undefined,
+            pi_spawn_call_ms: elapsedMs(spawnRequestedAt!, spawnReturnedAt!),
+            pi_spawn_to_first_raw_ms:
+              attemptTimings.firstRawAt === undefined
+                ? undefined
+                : elapsedMs(spawnReturnedAt!, attemptTimings.firstRawAt),
+            pi_first_raw_to_agent_start_ms:
+              attemptTimings.firstRawAt === undefined ||
+              attemptTimings.agentStartAt === undefined
+                ? undefined
+                : elapsedMs(
+                    attemptTimings.firstRawAt,
+                    attemptTimings.agentStartAt,
+                  ),
+            pi_agent_start_to_first_model_delta_ms:
+              attemptTimings.agentStartAt === undefined ||
+              attemptTimings.firstModelDeltaAt === undefined
+                ? undefined
+                : elapsedMs(
+                    attemptTimings.agentStartAt,
+                    attemptTimings.firstModelDeltaAt,
+                  ),
+            pi_spawn_to_first_model_delta_ms:
+              attemptTimings.firstModelDeltaAt === undefined
+                ? undefined
+                : elapsedMs(
+                    spawnReturnedAt!,
+                    attemptTimings.firstModelDeltaAt,
+                  ),
+            pi_spawn_to_first_text_ms:
+              attemptTimings.firstTextDeltaAt === undefined
+                ? undefined
+                : elapsedMs(spawnReturnedAt!, attemptTimings.firstTextDeltaAt),
+            pi_attempt_total_ms:
+              attemptTimings.turnEndAt === undefined
+                ? undefined
+                : elapsedMs(spawnReturnedAt!, attemptTimings.turnEndAt),
+            payload_bytes: totalBytes,
+            history_turns: req.history.length,
+          });
+        }
+      }
     }.bind(this);
 
     if (!swapped) {
-      yield* runAttempt(swapModel);
+      yield* runAttempt(swapModel, "primary");
     } else {
       // ─────────────────────────────────────────────────────────────────
       // Coder-swap retry ladder (the "brain swap" fix).
@@ -419,7 +537,7 @@ export class PiHarness implements Harness {
         let failure:
           | (HarnessChunk & { type: "error"; error: string })
           | undefined;
-        for await (const chunk of runAttempt(swapModel)) {
+        for await (const chunk of runAttempt(swapModel, "coder")) {
           if (chunk.type === "error") {
             // Terminal in the shared engine: yielded last, generator returns
             // right after. Hold it back while a retry is still possible.
@@ -470,7 +588,7 @@ export class PiHarness implements Harness {
         fallbackModel: primaryModel ?? "(pi default)",
         error: lastFailure?.error,
       });
-      yield* runAttempt(primaryModel);
+      yield* runAttempt(primaryModel, "primary");
     }
 
     } finally {

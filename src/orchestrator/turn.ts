@@ -27,6 +27,12 @@ import { runWithFallback } from "./fallback.ts";
 import { createAuditSink } from "../lib/auditLog.ts";
 import { log } from "../lib/logger.ts";
 import {
+  elapsedMs,
+  perfNow,
+  perfTrace,
+  perfTraceEnabled,
+} from "../lib/perfTrace.ts";
+import {
   registerTurn,
   siblingNotice,
   siblingTurns,
@@ -347,10 +353,62 @@ async function* runTurnBody(
   input: TurnInput,
   turnId: string,
 ): AsyncGenerator<HarnessChunk> {
+  const perf = perfTraceEnabled()
+    ? {
+        startedAt: perfNow(),
+        personaLoadMs: undefined as number | undefined,
+        historyLoadMs: undefined as number | undefined,
+        screenMs: undefined as number | undefined,
+        retrievalMs: undefined as number | undefined,
+        durableFactsMs: undefined as number | undefined,
+        dailyRecallMs: undefined as number | undefined,
+        promptBuildMs: undefined as number | undefined,
+        prepareEndedAt: undefined as number | undefined,
+        firstTextAt: undefined as number | undefined,
+        succeededAt: undefined as number | undefined,
+        historyTurns: 0,
+        historyBytes: 0,
+        systemPromptBytes: 0,
+        userMessageBytes: 0,
+      }
+    : undefined;
+  const emitTurnPerf = (): void => {
+    if (!perf) return;
+    perfTrace("perf.turn", {
+      turnId,
+      turn_total_ms:
+        perf.succeededAt === undefined
+          ? undefined
+          : elapsedMs(perf.startedAt, perf.succeededAt),
+      turn_prepare_ms:
+        perf.prepareEndedAt === undefined
+          ? undefined
+          : elapsedMs(perf.startedAt, perf.prepareEndedAt),
+      persona_load_ms: perf.personaLoadMs,
+      history_load_ms: perf.historyLoadMs,
+      screen_ms: perf.screenMs,
+      retrieval_ms: perf.retrievalMs,
+      durable_facts_ms: perf.durableFactsMs,
+      daily_recall_ms: perf.dailyRecallMs,
+      prompt_build_ms: perf.promptBuildMs,
+      history_turns: perf.historyTurns,
+      history_bytes: perf.historyBytes,
+      system_prompt_bytes: perf.systemPromptBytes,
+      user_message_bytes: perf.userMessageBytes,
+      turn_to_first_text_ms:
+        perf.firstTextAt === undefined
+          ? undefined
+          : elapsedMs(perf.startedAt, perf.firstTextAt),
+    });
+  };
   const origin: TurnOrigin = input.origin ?? "channel";
   const startedAt = new Date();
+  let measureStart: number | undefined;
+  measureStart = perf ? perfNow() : undefined;
   const persona = await loadPersona(input.agentDir);
+  if (perf) perf.personaLoadMs = elapsedMs(measureStart!);
 
+  measureStart = perf ? perfNow() : undefined;
   const history = input.noHistory
     ? []
     : await input.memory.recentTurns(
@@ -358,6 +416,15 @@ async function* runTurnBody(
         input.conversation,
         input.historyLimit ?? DEFAULT_HISTORY_LIMIT,
       );
+  if (perf) {
+    perf.historyLoadMs = elapsedMs(measureStart!);
+    perf.historyTurns = history.length;
+    perf.historyBytes = Buffer.byteLength(
+      history.map((turn) => turn.text).join("\n\n"),
+      "utf8",
+    );
+    perf.userMessageBytes = Buffer.byteLength(input.userMessage, "utf8");
+  }
 
   // Threat screen — runs BEFORE retrieval (Blocker B). For an UNTRUSTED turn,
   // the tool-less judge sees the content first; only a `pass` lets the turn go
@@ -372,12 +439,14 @@ async function* runTurnBody(
   // the catch is belt-and-suspenders and fails OPEN so a judge outage degrades
   // to "unscreened", never "app down".
   if (input.trusted !== true && input.screen) {
+    measureStart = perf ? perfNow() : undefined;
     let verdict: ScreenVerdict | undefined;
     try {
       verdict = await input.screen(input.userMessage, input.signal);
     } catch {
       verdict = undefined;
     }
+    if (perf) perf.screenMs = elapsedMs(measureStart!);
     if (verdict?.action === "hold") {
       // NOTE: the screener already did the grounding write — it wrote the
       // held episode (quarantined payload) into the PRINCIPAL'S
@@ -391,6 +460,7 @@ async function* runTurnBody(
         "🔒 This request touched something sensitive, so I've paused it and asked the owner to confirm. Nothing was done.";
       yield { type: "text", text: held };
       yield { type: "done", finalText: held, meta: { screenedHold: true } };
+      emitTurnPerf();
       return;
     }
   }
@@ -402,11 +472,13 @@ async function* runTurnBody(
   // PASSED the screen above.
   let retrievedMemory: string | undefined;
   if (input.retrieve) {
+    measureStart = perf ? perfNow() : undefined;
     try {
       retrievedMemory = await input.retrieve(input.userMessage, input.signal);
     } catch {
       retrievedMemory = undefined;
     }
+    if (perf) perf.retrievalMs = elapsedMs(measureStart!);
   }
 
   // Durable facts: a plain SQL pull of the top standing facts for this
@@ -416,11 +488,13 @@ async function* runTurnBody(
   // turn must never die on the fact read.
   let durableFacts: string | undefined;
   if (input.pullFacts) {
+    measureStart = perf ? perfNow() : undefined;
     try {
       durableFacts = await input.pullFacts(input.signal);
     } catch {
       durableFacts = undefined;
     }
+    if (perf) perf.durableFactsMs = elapsedMs(measureStart!);
   }
 
   // Daily journal: today's file always, yesterday's only when the nightly
@@ -432,13 +506,16 @@ async function* runTurnBody(
   // read the same content twice. Pure disk + JSON, no LLM, never throws.
   let dailyRecall: string | undefined;
   if (!input.skipDailyRecall && !isNightlyConversation(input.conversation)) {
+    measureStart = perf ? perfNow() : undefined;
     try {
       dailyRecall = (await buildDailyRecall(input.agentDir)).block;
     } catch {
       dailyRecall = undefined;
     }
+    if (perf) perf.dailyRecallMs = elapsedMs(measureStart!);
   }
 
+  measureStart = perf ? perfNow() : undefined;
   const baseSystemPrompt = buildSystemPrompt(
     persona,
     {
@@ -557,6 +634,10 @@ async function* runTurnBody(
     overlays.length > 0
       ? baseSystemPrompt + "\n\n" + overlays.join("\n\n")
       : baseSystemPrompt;
+  if (perf) {
+    perf.promptBuildMs = elapsedMs(measureStart!);
+    perf.systemPromptBytes = Buffer.byteLength(systemPrompt, "utf8");
+  }
 
   let finalText = "";
   let succeeded = false;
@@ -611,6 +692,7 @@ async function* runTurnBody(
   };
 
   try {
+    if (perf) perf.prepareEndedAt = perfNow();
     for await (const chunk of runWithFallback(
       input.harnesses,
       {
@@ -636,11 +718,15 @@ async function* runTurnBody(
       { onToolCall: toolSink },
     )) {
       if (chunk.type === "text") finalText += chunk.text;
+      if (perf && chunk.type === "text" && perf.firstTextAt === undefined) {
+        perf.firstTextAt = perfNow();
+      }
       if (chunk.type === "done") {
         // The done chunk carries the authoritative finalText — prefer it
         // over our running accumulation in case the harness reformatted.
         finalText = chunk.finalText;
         succeeded = true;
+        if (perf) perf.succeededAt = perfNow();
       }
       yield chunk;
     }
@@ -742,4 +828,6 @@ async function* runTurnBody(
         });
     }
   }
+
+  emitTurnPerf();
 }
