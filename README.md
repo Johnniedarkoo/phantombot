@@ -2120,13 +2120,19 @@ model = "your-embedding-model"
 api_key = ""                 # optional for localhost
 query_prefix = ""            # optional model-specific instruction
 document_prefix = ""         # optional model-specific instruction
+max_chunk_chars = 5000        # optional character-based note/KB request guard
 # dims is detected and written by `phantombot embedding`
 ```
 
 Prefixes are applied only at the provider boundary: `query_prefix` is used
 for retrieval queries, while `document_prefix` is used for notes, KB files,
 and conversation turns. PhantomBot does not start, stop, download, or manage
-the embedding server. Ollama, Qdrant, and MCP are not required.
+the embedding server. OpenAI-compatible note/KB documents default to 5,000
+characters per embedding request; `max_chunk_chars` can be raised or lowered
+to suit the configured endpoint. This is a conservative character-based
+transport/runtime guard, not an exact token limit or a llama.cpp protocol
+limit. Gemini retains its existing 18,000-character note/KB chunking.
+Ollama, Qdrant, and MCP are not required.
 
 When changing the embedding provider, model, or prefixes, run:
 

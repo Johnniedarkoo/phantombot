@@ -13,11 +13,14 @@ import { rmrf } from "./fixtures/rmrf.ts";
 import {
   DEFAULT_CROSS_CONVERSATION,
   DEFAULT_DURABLE_FACTS,
+  DEFAULT_GEMINI_MAX_CHUNK_CHARS,
+  DEFAULT_OPENAI_COMPATIBLE_MAX_CHUNK_CHARS,
   DEFAULT_GRAPH_EXPANSION,
   DEFAULT_RETRIEVAL,
   DEFAULT_RETRIEVAL_DECAY,
   DEFAULT_TELEGRAM_STREAMING,
   DEFAULT_TURN_INDEXING,
+  documentChunkChars,
   loadConfig,
   memoryIndexPath,
   personaDir,
@@ -1311,7 +1314,37 @@ describe("loadConfig — deprecation warnings cover the persona layer", () => {
 });
 
 describe("loadConfig — OpenAI-compatible embeddings", () => {
-  test("loads endpoint settings and query/document prefixes", async () => {
+  test("uses the provider defaults for note chunking", async () => {
+    const cfgDir = join(workdir, "config", "phantombot");
+    await mkdir(cfgDir, { recursive: true });
+    await writeFile(
+      join(cfgDir, "config.toml"),
+      `[embeddings]
+provider = "openai-compatible"
+
+[embeddings.openai_compatible]
+base_url = "http://127.0.0.1:8082/v1"
+model = "embed"
+`,
+      "utf8",
+    );
+    const c = await loadConfig();
+    expect(c.embeddings.openaiCompatible?.maxChunkChars).toBe(
+      DEFAULT_OPENAI_COMPATIBLE_MAX_CHUNK_CHARS,
+    );
+    expect(documentChunkChars(c)).toBe(5_000);
+
+    const gemini = {
+      ...c,
+      embeddings: {
+        provider: "gemini" as const,
+        gemini: { apiKey: "key", model: "embed", dims: 1536 },
+      },
+    };
+    expect(documentChunkChars(gemini)).toBe(DEFAULT_GEMINI_MAX_CHUNK_CHARS);
+  });
+
+  test("loads endpoint settings, prefixes, and a configured chunk limit", async () => {
     const cfgDir = join(workdir, "config", "phantombot");
     await mkdir(cfgDir, { recursive: true });
     await writeFile(
@@ -1326,6 +1359,7 @@ api_key = ""
 dims = 1024
 query_prefix = "query: "
 document_prefix = "passage: "
+max_chunk_chars = 7200
 `,
       "utf8",
     );
@@ -1338,6 +1372,8 @@ document_prefix = "passage: "
       dims: 1024,
       queryPrefix: "query: ",
       documentPrefix: "passage: ",
+      maxChunkChars: 7200,
     });
+    expect(documentChunkChars(c)).toBe(7_200);
   });
 });

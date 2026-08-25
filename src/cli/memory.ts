@@ -39,6 +39,8 @@ import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 import {
+  DEFAULT_GEMINI_MAX_CHUNK_CHARS,
+  documentChunkChars,
   type Config,
   loadConfig,
   memoryIndexPath,
@@ -362,6 +364,8 @@ export async function runMemoryIndex(
         personaDir: dir,
         index: ix,
         embedder: reembedder,
+        maxChunkChars:
+          documentChunkChars(config) ?? DEFAULT_GEMINI_MAX_CHUNK_CHARS,
         force: true,
       });
       const turns = await runTurnEmbedJob({ index: ix, embedder: reembedder });
@@ -407,6 +411,8 @@ export async function runMemoryIndex(
       personaDir: dir,
       index: ix,
       embedder,
+      maxChunkChars:
+        documentChunkChars(config) ?? DEFAULT_GEMINI_MAX_CHUNK_CHARS,
       force: input.rebuild,
     });
     out.write(
@@ -566,7 +572,13 @@ export async function indexAfterCapture(
     // FTS-only recall until the heartbeat runs the full job.
     const embedder = defaultEmbedderWithFetch(config);
     if (embedder) {
-      await runEmbedJob({ personaDir: dir, index: ix, embedder });
+      await runEmbedJob({
+        personaDir: dir,
+        index: ix,
+        embedder,
+        maxChunkChars:
+          documentChunkChars(config) ?? DEFAULT_GEMINI_MAX_CHUNK_CHARS,
+      });
     }
   } catch (e) {
     log.warn(`memory capture: index-on-write failed (non-fatal): ${(e as Error).message}`);

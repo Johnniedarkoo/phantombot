@@ -14,6 +14,7 @@ import { defineCommand } from "citty";
 import { existsSync } from "node:fs";
 
 import {
+  documentChunkChars,
   type Config,
   memoryIndexPath,
   personaDir,
@@ -320,7 +321,12 @@ async function defaultEmbedNotes(
   if (!embedder) return null;
   const ix = await MemoryIndex.open(indexPath(persona));
   try {
-    const e = await runEmbedJob({ personaDir: dir, index: ix, embedder });
+    const e = await runEmbedJob({
+      personaDir: dir,
+      index: ix,
+      embedder,
+      maxChunkChars: documentChunkChars(config)!,
+    });
     return { embedded: e.embedded, skipped: e.skipped, failed: e.failed };
   } finally {
     ix.close();

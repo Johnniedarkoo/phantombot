@@ -14,13 +14,17 @@
 import { defineCommand } from "citty";
 import * as p from "@clack/prompts";
 
-import { type Config, loadConfig } from "../config.ts";
+import {
+  DEFAULT_OPENAI_COMPATIBLE_MAX_CHUNK_CHARS,
+  type Config,
+  loadConfig,
+} from "../config.ts";
 import {
   geminiEmbed,
   type EmbedResult,
 } from "../lib/geminiEmbed.ts";
 import { openaiCompatibleEmbed } from "../lib/openaiCompatibleEmbed.ts";
-import { setIn, updateConfigToml } from "../lib/configWriter.ts";
+import { getIn, setIn, updateConfigToml } from "../lib/configWriter.ts";
 import { defaultServiceControl, type ServiceControl } from "../lib/platform.ts";
 import { maybePromptRestart } from "./harness.ts";
 
@@ -34,6 +38,7 @@ export interface OpenAICompatibleConfigUpdate {
   dims?: number;
   queryPrefix?: string;
   documentPrefix?: string;
+  maxChunkChars?: number;
 }
 
 export interface EmbeddingConfigUpdate {
@@ -78,6 +83,13 @@ export async function applyEmbeddingConfig(
         toml,
         ["embeddings", "openai_compatible", "document_prefix"],
         o.documentPrefix ?? "",
+      );
+      setIn(
+        toml,
+        ["embeddings", "openai_compatible", "max_chunk_chars"],
+        o.maxChunkChars ??
+          getIn(toml, ["embeddings", "openai_compatible", "max_chunk_chars"]) ??
+          DEFAULT_OPENAI_COMPATIBLE_MAX_CHUNK_CHARS,
       );
     } else {
       // Leave the [embeddings.gemini] block alone if present — preserves
@@ -140,6 +152,7 @@ export async function runEmbedding(input: RunInput = {}): Promise<number> {
         `base URL:  ${o.baseUrl}\n` +
         `model:     ${o.model}\n` +
         `dims:      ${o.dims || "detected on validation"}\n` +
+        `max chars: ${o.maxChunkChars ?? DEFAULT_OPENAI_COMPATIBLE_MAX_CHUNK_CHARS}\n` +
         `api key:   ${o.apiKey ? maskKey(o.apiKey) : "none"}`,
       "Existing config",
     );
@@ -295,6 +308,9 @@ export async function runEmbedding(input: RunInput = {}): Promise<number> {
       apiKey: optionalPromptText(apiKey),
       queryPrefix: optionalPromptText(queryPrefix),
       documentPrefix: optionalPromptText(documentPrefix),
+      maxChunkChars:
+        existingOpenAI?.maxChunkChars ??
+        DEFAULT_OPENAI_COMPATIBLE_MAX_CHUNK_CHARS,
     };
     const spinner = p.spinner();
     spinner.start("validating with a one-token embed…");

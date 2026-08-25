@@ -431,7 +431,12 @@ stored vector dimensions and tell the operator to reembed; it must never
 compare truncated vectors or let a bad vector break a turn. The
 OpenAI-compatible server is separately managed: PhantomBot does not own its
 lifecycle, and this feature does not add Ollama, Qdrant, or MCP embedding
-clients.
+clients. Note/KB chunking is provider-aware: Gemini keeps its existing
+18,000-character guard, while OpenAI-compatible endpoints default to the
+configurable `max_chunk_chars = 5000`. The value is character-based rather
+than an exact token guarantee, and must not be described as a llama.cpp
+protocol limit. Chunking preserves source text exactly and prefers nearby
+paragraph/newline boundaries without changing one-vector-per-turn storage.
 
 ## Process for updating this file
 

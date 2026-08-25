@@ -65,15 +65,36 @@ function fakeEmbedder() {
 
 describe("chunkText", () => {
   test("returns single chunk for short text", () => {
-    expect(chunkText("hello")).toEqual(["hello"]);
+    expect(chunkText("hello", 18_000)).toEqual(["hello"]);
   });
 
-  test("splits long text into ~18000 char chunks", () => {
+  test("splits long text without exceeding the requested limit", () => {
     const long = "x".repeat(40_000);
-    const chunks = chunkText(long);
+    const chunks = chunkText(long, 18_000);
     expect(chunks.length).toBeGreaterThan(1);
     expect(chunks.every((c) => c.length <= 18_000)).toBe(true);
     expect(chunks.join("")).toBe(long);
+  });
+
+  test("prefers a nearby paragraph boundary", () => {
+    const text = "a".repeat(14) + "\n\n" + "b".repeat(20);
+    const chunks = chunkText(text, 20);
+    expect(chunks[0]).toBe("a".repeat(14) + "\n\n");
+    expect(chunks.join("")).toBe(text);
+  });
+
+  test("falls back to a nearby newline", () => {
+    const text = "a".repeat(14) + "\n" + "b".repeat(20);
+    const chunks = chunkText(text, 20);
+    expect(chunks[0]).toBe("a".repeat(14) + "\n");
+    expect(chunks.join("")).toBe(text);
+  });
+
+  test("hard-splits when no useful boundary exists", () => {
+    const text = "x".repeat(45);
+    const chunks = chunkText(text, 20);
+    expect(chunks.map((c) => c.length)).toEqual([20, 20, 5]);
+    expect(chunks.join("")).toBe(text);
   });
 });
 
@@ -216,6 +237,7 @@ describe("runEmbedJob", () => {
       personaDir,
       index: ix,
       embedder: fakeEmbedder(),
+      maxChunkChars: 18_000,
     });
     expect(r1.totalNotes).toBe(2);
     expect(r1.embedded).toBe(2);
@@ -226,6 +248,7 @@ describe("runEmbedJob", () => {
       personaDir,
       index: ix,
       embedder: fakeEmbedder(),
+      maxChunkChars: 18_000,
     });
     expect(r2.skipped).toBe(2);
     expect(r2.embedded).toBe(0);
@@ -234,11 +257,17 @@ describe("runEmbedJob", () => {
   test("force=true re-embeds everything", async () => {
     await note("kb/concepts/A.md", "alpha");
     await ix.refreshStale(personaDir);
-    await runEmbedJob({ personaDir, index: ix, embedder: fakeEmbedder() });
+    await runEmbedJob({
+      personaDir,
+      index: ix,
+      embedder: fakeEmbedder(),
+      maxChunkChars: 18_000,
+    });
     const r = await runEmbedJob({
       personaDir,
       index: ix,
       embedder: fakeEmbedder(),
+      maxChunkChars: 18_000,
       force: true,
     });
     expect(r.embedded).toBe(1);
@@ -253,11 +282,44 @@ describe("runEmbedJob", () => {
       text.startsWith("alpha")
         ? { ok: false as const, error: "rate limited" }
         : { ok: true as const, values: new Float32Array([0.5, 0.5, 0.5, 0.5]), dims: 4 };
-    const r = await runEmbedJob({ personaDir, index: ix, embedder: flaky });
+    const r = await runEmbedJob({
+      personaDir,
+      index: ix,
+      embedder: flaky,
+      maxChunkChars: 18_000,
+    });
     expect(r.embedded).toBe(1);
     expect(r.failed).toBe(1);
     expect(r.errors).toHaveLength(1);
     expect(r.errors[0]?.path).toBe("kb/concepts/A.md");
+  });
+
+  test("uses the supplied limit to split an oversized note into successful calls", async () => {
+    await note("kb/concepts/oversized.md", "x".repeat(25));
+    await ix.refreshStale(personaDir);
+    const calls: string[] = [];
+    const guardedEmbedder = async (text: string) => {
+      calls.push(text);
+      if (text.length > 10) {
+        return { ok: false as const, error: "request too large" };
+      }
+      return {
+        ok: true as const,
+        values: new Float32Array([1, 0, 0, 0]),
+        dims: 4,
+      };
+    };
+
+    const r = await runEmbedJob({
+      personaDir,
+      index: ix,
+      embedder: guardedEmbedder,
+      maxChunkChars: 10,
+    });
+    expect(r.embedded).toBe(3);
+    expect(r.failed).toBe(0);
+    expect(calls).toEqual(["x".repeat(10), "x".repeat(10), "x".repeat(5)]);
+    expect(ix.embeddingCount()).toBe(3);
   });
 });
 
@@ -277,7 +339,12 @@ describe("MemoryIndex.hybridSearch", () => {
     await note("kb/concepts/B.md", "beta note about something else");
     await note("kb/concepts/C.md", "gamma totally unrelated");
     await ix.refreshStale(personaDir);
-    await runEmbedJob({ personaDir, index: ix, embedder: fakeEmbedder() });
+    await runEmbedJob({
+      personaDir,
+      index: ix,
+      embedder: fakeEmbedder(),
+      maxChunkChars: 18_000,
+    });
 
     // Build a query vector that matches A's embedding (same first char)
     const queryEmbed = await fakeEmbedder()("alpha query");
@@ -297,7 +364,12 @@ describe("MemoryIndex.hybridSearch", () => {
     await note("memory/decisions.md", "elevenlabs choice");
     await note("kb/concepts/Voice.md", "elevenlabs voice config");
     await ix.refreshStale(personaDir);
-    await runEmbedJob({ personaDir, index: ix, embedder: fakeEmbedder() });
+    await runEmbedJob({
+      personaDir,
+      index: ix,
+      embedder: fakeEmbedder(),
+      maxChunkChars: 18_000,
+    });
     const queryEmbed = await fakeEmbedder()("elevenlabs anything");
     if (!queryEmbed.ok) throw new Error("embed failed");
     const memOnly = ix.hybridSearch("elevenlabs", queryEmbed.values, {

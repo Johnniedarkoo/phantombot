@@ -114,6 +114,7 @@ describe("applyEmbeddingConfig — openai-compatible", () => {
       dims: 1024,
       queryPrefix: "query: ",
       documentPrefix: "passage: ",
+      maxChunkChars: 5000,
     });
   });
 

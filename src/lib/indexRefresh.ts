@@ -19,7 +19,7 @@
  *     re-embedding hundreds of unchanged daily files every single night.
  */
 
-import type { Config } from "../config.ts";
+import { documentChunkChars, type Config } from "../config.ts";
 import { defaultEmbedder, runEmbedJob } from "./embedJob.ts";
 import { log } from "./logger.ts";
 import { MemoryIndex } from "./memoryIndex.ts";
@@ -70,6 +70,7 @@ export async function refreshPersonaIndex(
       personaDir: input.personaDir,
       index: ix,
       embedder,
+      maxChunkChars: documentChunkChars(input.config)!,
     });
     result.embedded = r.embedded;
     result.embedFailed = r.failed;

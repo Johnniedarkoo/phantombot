@@ -632,6 +632,12 @@ export interface TelegramStreamingSettings {
  */
 export const DEFAULT_CHATTINESS = true;
 
+/** Existing Gemini note/KB chunking guard, retained for compatibility. */
+export const DEFAULT_GEMINI_MAX_CHUNK_CHARS = 18_000;
+
+/** Conservative default for providers whose tokenizer/runtime is external. */
+export const DEFAULT_OPENAI_COMPATIBLE_MAX_CHUNK_CHARS = 5_000;
+
 export const DEFAULT_TELEGRAM_STREAMING: TelegramStreamingSettings = {
   narrationFlushMs: 4500,
   bubbleMaxSentences: 4,
@@ -803,6 +809,8 @@ export interface Config {
       dims: number;
       queryPrefix: string;
       documentPrefix: string;
+      /** Character-based guard for note/KB embedding requests. */
+      maxChunkChars?: number;
     };
   };
 
@@ -2005,6 +2013,28 @@ function buildHarnessPersonasConfig(
   return Object.keys(personas).length > 0 ? personas : undefined;
 }
 
+/**
+ * Resolve the note/KB chunking guard for the configured embedding transport.
+ * This is character-based and intentionally does not claim to be a token
+ * limit: PhantomBot does not own the tokenizer or runtime capacity of an
+ * OpenAI-compatible endpoint.
+ */
+export function documentChunkChars(
+  config: Pick<Config, "embeddings">,
+): number | undefined {
+  if (config.embeddings.provider === "gemini") {
+    return DEFAULT_GEMINI_MAX_CHUNK_CHARS;
+  }
+  if (config.embeddings.provider === "openai-compatible") {
+    const configured = config.embeddings.openaiCompatible?.maxChunkChars;
+    const limit = configured === undefined ? 0 : Math.floor(configured);
+    return Number.isFinite(limit) && limit > 0
+      ? limit
+      : DEFAULT_OPENAI_COMPATIBLE_MAX_CHUNK_CHARS;
+  }
+  return undefined;
+}
+
 function buildEmbeddingsConfig(
   tomlEmbeddings: Record<string, unknown>,
   tomlGemini: Record<string, unknown>,
@@ -2055,6 +2085,9 @@ function buildEmbeddingsConfig(
           env("PHANTOMBOT_OPENAI_COMPATIBLE_DOCUMENT_PREFIX") ??
           asString(tomlOpenAI.document_prefix) ??
           "",
+        maxChunkChars:
+          asInt(tomlOpenAI.max_chunk_chars) ??
+          DEFAULT_OPENAI_COMPATIBLE_MAX_CHUNK_CHARS,
       },
     };
   }

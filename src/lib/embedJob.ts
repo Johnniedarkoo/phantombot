@@ -16,9 +16,6 @@ import type { Config } from "../config.ts";
 import { resolveEmbedders, type Embedder } from "./embedder.ts";
 import type { MemoryIndex } from "./memoryIndex.ts";
 
-/** Roughly 6000 tokens of slack-padded room for Gemini's 8192 limit. */
-const MAX_CHARS_PER_CHUNK = 18_000;
-
 export interface EmbedJobResult {
   totalNotes: number;
   embedded: number;
@@ -44,6 +41,8 @@ export interface RunEmbedJobInput {
   personaDir: string;
   index: MemoryIndex;
   embedder: Embedder;
+  /** Character-based note/KB request guard resolved for the provider. */
+  maxChunkChars: number;
   /** If true, re-embed every chunk regardless of sha match. */
   force?: boolean;
 }
@@ -80,7 +79,7 @@ export async function runEmbedJob(
       continue;
     }
 
-    const chunks = chunkText(content);
+    const chunks = chunkText(content, input.maxChunkChars);
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i]!;
       const sha = sha256(chunk);
@@ -137,11 +136,44 @@ export async function runTurnEmbedJob(input: {
   return result;
 }
 
-export function chunkText(text: string): string[] {
-  if (text.length <= MAX_CHARS_PER_CHUNK) return [text];
+export function chunkText(text: string, maxChars: number): string[] {
+  maxChars = Math.floor(maxChars);
+  if (!Number.isFinite(maxChars) || maxChars <= 0) {
+    throw new Error("chunkText: maxChars must be a positive finite number");
+  }
+  if (text.length <= maxChars) return [text];
+
   const out: string[] = [];
-  for (let i = 0; i < text.length; i += MAX_CHARS_PER_CHUNK) {
-    out.push(text.slice(i, i + MAX_CHARS_PER_CHUNK));
+  let start = 0;
+  while (start < text.length) {
+    const targetEnd = Math.min(start + maxChars, text.length);
+    if (targetEnd === text.length) {
+      out.push(text.slice(start));
+      break;
+    }
+
+    // A boundary in the first half of the candidate window would create a
+    // pathological tiny chunk. Search backwards only in the latter half,
+    // preferring a paragraph boundary before a single newline.
+    const earliestUseful = start + Math.max(1, Math.floor(maxChars / 2));
+    const paragraph = text.lastIndexOf("\n\n", targetEnd);
+    if (paragraph >= earliestUseful && paragraph + 2 <= targetEnd) {
+      const end = paragraph + 2;
+      out.push(text.slice(start, end));
+      start = end;
+      continue;
+    }
+
+    const newline = text.lastIndexOf("\n", targetEnd - 1);
+    if (newline >= earliestUseful) {
+      const end = newline + 1;
+      out.push(text.slice(start, end));
+      start = end;
+      continue;
+    }
+
+    out.push(text.slice(start, targetEnd));
+    start = targetEnd;
   }
   return out;
 }
