@@ -473,9 +473,7 @@ export class PiHarness implements Harness {
                 ? undefined
                 : elapsedMs(spawnReturnedAt!, attemptTimings.firstTextDeltaAt),
             pi_attempt_total_ms:
-              attemptTimings.turnEndAt === undefined
-                ? undefined
-                : elapsedMs(spawnReturnedAt!, attemptTimings.turnEndAt),
+              elapsedMs(spawnReturnedAt!, perfNow()),
             payload_bytes: totalBytes,
             history_turns: req.history.length,
           });
