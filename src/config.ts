@@ -2074,8 +2074,8 @@ function buildEmbeddingsConfig(
           asString(tomlOpenAI.api_key) ??
           "",
         dims:
-          asInt(tomlOpenAI.dims) ??
           asInt(env("PHANTOMBOT_OPENAI_COMPATIBLE_DIMS")) ??
+          asInt(tomlOpenAI.dims) ??
           0,
         queryPrefix:
           env("PHANTOMBOT_OPENAI_COMPATIBLE_QUERY_PREFIX") ??

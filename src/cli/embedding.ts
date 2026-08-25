@@ -158,21 +158,13 @@ export async function runEmbedding(input: RunInput = {}): Promise<number> {
     );
   }
 
-  // The Gemini key powers semantic memory search AND the threat judge's
-  // semantic BRIEFING recall — the decisions/people/norms priors it reads to
-  // remember how you've ruled, who's legitimate, and what's routine. It does
-  // NOT power threat screening itself: the judge runs on your PRIMARY harness
-  // (whichever of claude/pi/gemini/codex) and is always active. Surface that
-  // so operators understand a "none" choice degrades recall to keyword-only,
-  // but never turns screening off.
+  // Embeddings improve long-term memory retrieval. Threat screening is a
+  // separate path and remains active regardless of the embedding provider.
   p.note(
-    `A Gemini key powers two things:\n` +
-      `  • semantic (vector) memory search\n` +
-      `  • semantic recall of the threat judge's briefing\n` +
-      `    (prior rulings, known contacts, and norms)\n\n` +
-      `Recommended for production environments and additional security.\n` +
-      `Threat screening of untrusted input runs on your primary harness either\n` +
-      `way; without a key, the judge just recalls its briefing by keyword only.`,
+    `Embeddings add semantic retrieval to long-term memory.\n` +
+      `Without an embedding provider, OKF field-weighted BM25 + graph\n` +
+      `expansion remains available. Threat screening remains active\n` +
+      `independently of the embedding provider.`,
     "Why configure this",
   );
 
@@ -182,7 +174,7 @@ export async function runEmbedding(input: RunInput = {}): Promise<number> {
       {
         value: "gemini",
         label: `Gemini (${DEFAULT_MODEL}, ${DEFAULT_DIMS} dims)`,
-        hint: "semantic search + judge briefing recall · free tier 1500 req/day",
+        hint: "semantic search · free tier 1500 req/day",
       },
       {
         value: "openai-compatible",
@@ -213,7 +205,7 @@ export async function runEmbedding(input: RunInput = {}): Promise<number> {
         `search uses OKF field-weighted BM25 + link-graph expansion\n` +
         `(frontmatter weighting, tag/alias vocabulary, concept-graph walk)\n` +
         `threat screening stays ACTIVE (runs on your primary harness); judge ` +
-        `briefing recall is lexical-only — Gemini semantic recall recommended for production`,
+        `briefing recall is lexical-only`,
       "Saved",
     );
     if (!embedded) {
@@ -255,7 +247,10 @@ export async function runEmbedding(input: RunInput = {}): Promise<number> {
         `dims:      ${r.dims}\n` +
         `saved to ${config.configPath}\n\n` +
         `cost note: free up to 1500 req/day on the Gemini free tier;\n` +
-        `phantombot's nightly cycle re-embeds changed notes only.`,
+        `phantombot's nightly cycle re-embeds changed notes only.\n` +
+        `After changing provider, model, or document prefix, backfill with:\n` +
+        `  phantombot memory index --reembed\n` +
+        `Changing query prefix alone does not require rebuilding stored vectors.`,
       "Saved",
     );
   } else {
@@ -332,7 +327,10 @@ export async function runEmbedding(input: RunInput = {}): Promise<number> {
         `base URL:  ${settings.baseUrl}\n` +
         `model:     ${settings.model}\n` +
         `dims:      ${r.dims}\n` +
-        `saved to ${config.configPath}`,
+        `saved to ${config.configPath}\n\n` +
+        `After changing provider, model, or document prefix, backfill with:\n` +
+        `  phantombot memory index --reembed\n` +
+        `Changing query prefix alone does not require rebuilding stored vectors.`,
       "Saved",
     );
   }

@@ -95,4 +95,15 @@ describe("openaiCompatibleEmbed", () => {
     });
     expect(seen).toBe(signal);
   });
+
+  test("rejects a finite JS number that overflows Float32", async () => {
+    const r = await openaiCompatibleEmbed("x", {
+      baseUrl: "http://localhost/v1",
+      model: "m",
+      fetchImpl: (async () =>
+        response({ data: [{ embedding: [1e100] }] })) as unknown as typeof fetch,
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("overflows Float32");
+  });
 });

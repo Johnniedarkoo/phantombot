@@ -1866,11 +1866,11 @@ screening outage degrades to "unscreened", never "app down". (This is distinct
 from the **fail-closed hold** above, which governs an escalated-but-unanswered
 request: that simply never runs.)
 
-> **Recommended for production environments.** Threat screening needs no
-> embedding key or separate model configuration: it runs on the primary
-> harness and reads the ranked drawer briefing directly. Gemini embeddings
-> affect normal memory retrieval, not whether screening runs or which drawer
-> rows the judge receives. Screening is **not** a wall —
+> **Recommended for production environments.** Threat screening itself needs no
+> extra configuration — it runs on your primary harness, which is always
+> present. Embeddings improve long-term memory retrieval; without an embedding
+> provider, OKF field-weighted BM25 (lexical) remains available. Screening is
+> **not a wall** —
 > a sufficiently clever injection can still fool an LLM judge, just as it can
 > fool a human — but it filters the obvious majority and puts a human beat in
 > front of the rest.
@@ -2133,6 +2133,14 @@ to suit the configured endpoint. This is a conservative character-based
 transport/runtime guard, not an exact token limit or a llama.cpp protocol
 limit. Gemini retains its existing 18,000-character note/KB chunking.
 Ollama, Qdrant, and MCP are not required.
+
+An OpenAI-compatible endpoint may be remote. A remote endpoint receives the
+text PhantomBot sends for embedding: note/KB chunks, indexed conversation-turn
+text, and retrieval queries. A localhost endpoint keeps those embedding
+requests local. Provider, model, or `document_prefix` changes require (or are
+strongly recommended to receive) a full reembed; `query_prefix` alone does not
+invalidate stored document vectors. `max_chunk_chars` controls chunk lifecycle,
+not embedding-space identity.
 
 When changing the embedding provider, model, or prefixes, run:
 

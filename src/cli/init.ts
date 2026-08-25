@@ -228,10 +228,12 @@ export default defineCommand({
       "Phantombot's memory search works out of the box on OKF field-weighted\n" +
       "BM25 with link-graph expansion — the Open Knowledge Format superpowers\n" +
       "(frontmatter field weighting, tag/alias vocabulary, concept-graph walk).\n" +
-      "Adding a Gemini embeddings provider layers SEMANTIC search on top — finding\n" +
+      "Adding an embedding provider layers SEMANTIC search on top — finding\n" +
       "memories by meaning, not just words (e.g. \"how do I pay tax\" matches a note\n" +
-      "titled \"VAT filing steps\"). It's optional and free for typical use on\n" +
-      "Gemini's free tier. You can always enable it later with `phantombot embedding`.",
+      "titled \"VAT filing steps\"). It's optional. You can always enable it later\n" +
+      "with `phantombot embedding`; after changing provider, model, or document\n" +
+      "prefix, backfill immediately with `phantombot memory index --reembed`.\n" +
+      "Threat screening remains active independently of the embedding provider.",
       "What this improves"
     );
     const wantEmbeddings = await p.confirm({

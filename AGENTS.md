@@ -421,22 +421,28 @@ version string can't carry that information.
 31. **There is ONE harness detector, and a persisted bin is a CACHE that must be platform-checked (issue #450).** `resolveHarnessAvailability()` (`src/lib/harnessAvailability.ts`) is the single resolver: absolute path with `PATHEXT` suffixes, then `PATH`, then the `harnessSearchPath()` sweep (`%APPDATA%\npm`, `~/.bun/bin`, nvm/fnm node dirs), then an absolute -> bare-name retry for a stale configured path. `checkConfiguredHarnesses` and `detectAvailability` (`src/cli/harness.ts`) both go through it, and nothing may reintroduce a second one. The bug this closes: the `phantombot harness` wizard and `init` called a bare `whichBinary()` on the configured bin, skipping the sweep AND the retry, so `doctor`/`run` resolved claude while the wizard reported NOT FOUND on the same config — **the wizard must never be a weaker detector than the daemon it configures**, because it is the tool an operator reaches for precisely when detection is already suspect, and a false NOT FOUND there sends them to reinstall a harness that was working. Separately, `loadConfig` reads `state.harness_bins.<id>` AHEAD of the bare-name default, and `state.json` lives in the DATA DIR, not beside `config.toml` — so a once-resolved absolute path survives editing or deleting the config file entirely and there is no obvious knob that clears it. A path written by a WSL/Git-Bash run and read back natively on Windows is the live case: `path.win32.isAbsolute("/bin/claude")` is `true`, so it looks well-formed, never resolves, and reads to the user exactly like a bad hardcoded default — which is why #450 was reported against `config.ts` where the default is in fact already the correct bare `"claude"`. `usablePersistedBin` (`src/lib/harnessBinPath.ts`) therefore drops a persisted value whose path FLAVOUR cannot belong to this platform (POSIX-rooted on win32; drive-letter or UNC on POSIX) so the chain falls through to the default the sweep can find. Two properties to keep: it is a **pure string test, never a filesystem check** — a well-formed path that merely does not exist right now is KEPT, because reporting a missing install against the configured path is the honest diagnostic and silently rewriting it would hide an uninstalled harness; and it is applied at the READ in `loadConfig`, not at the write in `saveHarnessBins`, so an already-poisoned `state.json` on a live box is neutralised without a migration. Documented in `docs/harness-detection.md`; if you change the precedence chain or the sweep, update it.
 
 32. Embedding providers are interchangeable transports, not interchangeable
-vector spaces. src/lib/embedder.ts resolves none, Gemini, and the
-OpenAI-compatible /embeddings client; provider-specific prefixes stay in that
-resolver. The memory index --reembed command clears and rebuilds only
-note_embeddings and turn_embeddings, then backfills every existing eligible
-turn_docs row directly. A provider, model, or prefix change requires reembed
-even when dimensions happen to match. Hybrid search must skip incompatible
-stored vector dimensions and tell the operator to reembed; it must never
-compare truncated vectors or let a bad vector break a turn. The
-OpenAI-compatible server is separately managed: PhantomBot does not own its
-lifecycle, and this feature does not add Ollama, Qdrant, or MCP embedding
+vector spaces. `src/lib/embedder.ts` resolves none, Gemini, and the
+OpenAI-compatible `/embeddings` client; provider-specific prefixes stay in that
+resolver. Every note/turn vector carries a deterministic per-row space
+fingerprint: provider/model/dimensions, plus the OpenAI-compatible document
+prefix. Query prefixes and credentials are excluded. Untagged pre-existing rows
+are eligible only for Gemini (the provider upstream shipped), never inferred as
+OpenAI-compatible; a successful full reembed tags and cleans them up. Mixed old
+and new rows are therefore safe during an interrupted migration. `--reembed`
+refreshes FTS first, performs a real document preflight, then force-writes the
+current space without clearing the old rows up front; failures return nonzero
+and obsolete spaces are removed only after a complete success. A provider,
+model, or document-prefix change requires reembed even when dimensions happen
+to match. Hybrid search filters by space before applying its independent
+dimension guard; when no compatible rows exist it stays on lexical/OKF recall.
+The OpenAI-compatible server is separately managed: PhantomBot does not own
+its lifecycle, and this feature does not add Ollama, Qdrant, or MCP embedding
 clients. Note/KB chunking is provider-aware: Gemini keeps its existing
 18,000-character guard, while OpenAI-compatible endpoints default to the
 configurable `max_chunk_chars = 5000`. The value is character-based rather
 than an exact token guarantee, and must not be described as a llama.cpp
-protocol limit. Chunking preserves source text exactly and prefers nearby
-paragraph/newline boundaries without changing one-vector-per-turn storage.
+protocol limit. Chunking preserves source text exactly, prunes obsolete tail
+chunks, and uses explicit chunk/file accounting.
 
 ## Process for updating this file
 

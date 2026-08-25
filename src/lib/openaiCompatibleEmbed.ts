@@ -86,6 +86,9 @@ export async function openaiCompatibleEmbed(
       return { ok: false, error: "non-numeric value in embedding" };
     }
     out[i] = value;
+    if (!Number.isFinite(out[i]!)) {
+      return { ok: false, error: "embedding value overflows Float32" };
+    }
   }
   if (opts.dims !== undefined && opts.dims > 0 && out.length !== opts.dims) {
     return {

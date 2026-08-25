@@ -1314,6 +1314,19 @@ describe("loadConfig — deprecation warnings cover the persona layer", () => {
 });
 
 describe("loadConfig — OpenAI-compatible embeddings", () => {
+  test("environment dimensions take precedence over TOML dimensions", async () => {
+    const cfgDir = join(workdir, "config", "phantombot");
+    await mkdir(cfgDir, { recursive: true });
+    await writeFile(
+      join(cfgDir, "config.toml"),
+      `[embeddings]\nprovider = "openai-compatible"\n\n[embeddings.openai_compatible]\nmodel = "embed"\ndims = 1024\n`,
+      "utf8",
+    );
+    process.env.PHANTOMBOT_OPENAI_COMPATIBLE_DIMS = "768";
+    const c = await loadConfig();
+    expect(c.embeddings.openaiCompatible?.dims).toBe(768);
+  });
+
   test("uses the provider defaults for note chunking", async () => {
     const cfgDir = join(workdir, "config", "phantombot");
     await mkdir(cfgDir, { recursive: true });
