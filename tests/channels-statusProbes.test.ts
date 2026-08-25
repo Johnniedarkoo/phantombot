@@ -41,6 +41,11 @@ function stubDeps(over: Partial<StatusProbeDeps> = {}): StatusProbeDeps {
       values: new Float32Array([0.1]),
       dims: 1,
     }),
+    openaiCompatibleEmbed: async () => ({
+      ok: true,
+      values: new Float32Array([0.1]),
+      dims: 1,
+    }),
     reconcileEditorConnectors: () => [],
     isPhantombotBinary: () => false,
     nightlyHealth: async () => ({
@@ -163,6 +168,60 @@ describe("gatherStatusProbes — memory", () => {
     );
     expect(r.memory).toBe("gemini embeddings — no key");
     expect(called).toBe(false);
+  });
+
+  test("probes an OpenAI-compatible endpoint and reports OK", async () => {
+    let called = false;
+    const r = await gatherStatusProbes(
+      cfg({
+        embeddings: {
+          provider: "openai-compatible",
+          openaiCompatible: {
+            baseUrl: "http://localhost:8082/v1",
+            model: "embed",
+            apiKey: "",
+            dims: 1,
+            queryPrefix: "",
+            documentPrefix: "",
+          },
+        },
+      }),
+      "phantom",
+      stubDeps({
+        openaiCompatibleEmbed: async () => {
+          called = true;
+          return { ok: true, values: new Float32Array([0]), dims: 1 };
+        },
+      }),
+    );
+    expect(r.memory).toBe("openai-compatible embeddings OK");
+    expect(called).toBe(true);
+  });
+
+  test("reports an OpenAI-compatible endpoint error", async () => {
+    const r = await gatherStatusProbes(
+      cfg({
+        embeddings: {
+          provider: "openai-compatible",
+          openaiCompatible: {
+            baseUrl: "http://localhost:8082/v1",
+            model: "embed",
+            apiKey: "",
+            dims: 1,
+            queryPrefix: "",
+            documentPrefix: "",
+          },
+        },
+      }),
+      "phantom",
+      stubDeps({
+        openaiCompatibleEmbed: async () => ({
+          ok: false,
+          error: "network: refused",
+        }),
+      }),
+    );
+    expect(r.memory).toBe("openai-compatible embeddings ERR (network: refused)");
   });
 });
 

@@ -1,8 +1,8 @@
 /**
  * `phantombot embedding` — interactive TUI to configure semantic search.
  *
- * Picks a provider (Gemini or None), validates the API key by calling
- * /embedContent once, writes the result to [embeddings] in config.toml.
+ * Picks a provider, validates one embedding request, and writes the result to
+ * [embeddings] in config.toml.
  *
  * No-key (provider=none) is a real choice: phantombot's memory search
  * still works on OKF field-weighted BM25 with link-graph expansion — the
@@ -19,6 +19,7 @@ import {
   geminiEmbed,
   type EmbedResult,
 } from "../lib/geminiEmbed.ts";
+import { openaiCompatibleEmbed } from "../lib/openaiCompatibleEmbed.ts";
 import { setIn, updateConfigToml } from "../lib/configWriter.ts";
 import { defaultServiceControl, type ServiceControl } from "../lib/platform.ts";
 import { maybePromptRestart } from "./harness.ts";
@@ -26,11 +27,21 @@ import { maybePromptRestart } from "./harness.ts";
 const DEFAULT_MODEL = "gemini-embedding-001";
 const DEFAULT_DIMS = 1536;
 
+export interface OpenAICompatibleConfigUpdate {
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
+  dims?: number;
+  queryPrefix?: string;
+  documentPrefix?: string;
+}
+
 export interface EmbeddingConfigUpdate {
-  provider: "gemini" | "none";
+  provider: "gemini" | "openai-compatible" | "none";
   apiKey?: string;
   model?: string;
   dims?: number;
+  openaiCompatible?: OpenAICompatibleConfigUpdate;
 }
 
 export async function applyEmbeddingConfig(
@@ -51,6 +62,23 @@ export async function applyEmbeddingConfig(
         ["embeddings", "gemini", "dims"],
         update.dims ?? DEFAULT_DIMS,
       );
+    } else if (update.provider === "openai-compatible") {
+      const o = update.openaiCompatible;
+      if (!o) throw new Error("OpenAI-compatible embedding settings are missing");
+      setIn(toml, ["embeddings", "openai_compatible", "base_url"], o.baseUrl);
+      setIn(toml, ["embeddings", "openai_compatible", "model"], o.model);
+      setIn(toml, ["embeddings", "openai_compatible", "api_key"], o.apiKey ?? "");
+      setIn(toml, ["embeddings", "openai_compatible", "dims"], o.dims ?? 0);
+      setIn(
+        toml,
+        ["embeddings", "openai_compatible", "query_prefix"],
+        o.queryPrefix ?? "",
+      );
+      setIn(
+        toml,
+        ["embeddings", "openai_compatible", "document_prefix"],
+        o.documentPrefix ?? "",
+      );
     } else {
       // Leave the [embeddings.gemini] block alone if present — preserves
       // the user's key for re-enabling later. Just flip provider to "none".
@@ -61,6 +89,9 @@ export async function applyEmbeddingConfig(
 interface RunInput {
   config?: Config;
   validate?: (key: string) => Promise<EmbedResult>;
+  validateOpenAI?: (
+    settings: OpenAICompatibleConfigUpdate,
+  ) => Promise<EmbedResult>;
   serviceControl?: ServiceControl;
   /**
    * When true, this runs as a sub-step of another wizard (e.g.
@@ -102,6 +133,16 @@ export async function runEmbedding(input: RunInput = {}): Promise<number> {
       `provider:  none (OKF field-weighted BM25 + link-graph expansion)`,
       "Existing config",
     );
+  } else if (!embedded && existing.provider === "openai-compatible" && existing.openaiCompatible) {
+    const o = existing.openaiCompatible;
+    p.note(
+      `provider:  openai-compatible\n` +
+        `base URL:  ${o.baseUrl}\n` +
+        `model:     ${o.model}\n` +
+        `dims:      ${o.dims || "detected on validation"}\n` +
+        `api key:   ${o.apiKey ? maskKey(o.apiKey) : "none"}`,
+      "Existing config",
+    );
   }
 
   // The Gemini key powers semantic memory search AND the threat judge's
@@ -122,7 +163,7 @@ export async function runEmbedding(input: RunInput = {}): Promise<number> {
     "Why configure this",
   );
 
-  const provider = await p.select<"gemini" | "none" | "cancel">({
+  const provider = await p.select<"gemini" | "openai-compatible" | "none" | "cancel">({
     message: "Provider",
     options: [
       {
@@ -131,13 +172,21 @@ export async function runEmbedding(input: RunInput = {}): Promise<number> {
         hint: "semantic search + judge briefing recall · free tier 1500 req/day",
       },
       {
+        value: "openai-compatible",
+        label: "OpenAI-compatible (local or remote /embeddings)",
+        hint: "llama-server and other standard-compatible endpoints",
+      },
+      {
         value: "none",
         label: "None — OKF field-weighted BM25 + link-graph expansion",
         hint: "no API key · Open Knowledge Format superpowers, lexical only",
       },
       { value: "cancel", label: "Cancel" },
     ],
-    initialValue: existing.provider === "gemini" ? "gemini" : "none",
+    initialValue:
+      existing.provider === "gemini" || existing.provider === "openai-compatible"
+        ? existing.provider
+        : "none",
   });
   if (p.isCancel(provider) || provider === "cancel") {
     p.cancel("cancelled");
@@ -161,43 +210,116 @@ export async function runEmbedding(input: RunInput = {}): Promise<number> {
     return 0;
   }
 
-  const key = await p.password({
-    message: "Gemini API key (https://aistudio.google.com/app/apikey)",
-    validate: (v) => {
-      if (!v || v.length === 0) return "key is required";
-      return undefined;
-    },
-  });
-  if (p.isCancel(key)) {
-    p.cancel("cancelled");
-    return 0;
-  }
+  if (provider === "gemini") {
+    const key = await p.password({
+      message: "Gemini API key (https://aistudio.google.com/app/apikey)",
+      validate: (v) => (!v ? "key is required" : undefined),
+    });
+    if (p.isCancel(key)) {
+      p.cancel("cancelled");
+      return 0;
+    }
 
-  const spinner = p.spinner();
-  spinner.start("validating with a one-token embed…");
-  const r = await validate(key as string);
-  if (!r.ok) {
-    spinner.stop(`key rejected: ${r.error}`);
-    p.cancel("aborting — key did not validate");
-    return 1;
-  }
-  spinner.stop(`key validated (got ${r.dims} dims)`);
+    const spinner = p.spinner();
+    spinner.start("validating with a one-token embed…");
+    const r = await validate(key as string);
+    if (!r.ok) {
+      spinner.stop(`key rejected: ${r.error}`);
+      p.cancel("aborting — key did not validate");
+      return 1;
+    }
+    spinner.stop(`key validated (got ${r.dims} dims)`);
 
-  await applyEmbeddingConfig(config.configPath, {
-    provider: "gemini",
-    apiKey: key as string,
-    model: DEFAULT_MODEL,
-    dims: DEFAULT_DIMS,
-  });
-  p.note(
-    `provider:  gemini\n` +
-      `model:     ${DEFAULT_MODEL}\n` +
-      `dims:      ${DEFAULT_DIMS}\n` +
-      `saved to ${config.configPath}\n\n` +
-      `cost note: free up to 1500 req/day on the Gemini free tier;\n` +
-      `phantombot's nightly cycle re-embeds changed notes only.`,
-    "Saved",
-  );
+    await applyEmbeddingConfig(config.configPath, {
+      provider: "gemini",
+      apiKey: key as string,
+      model: DEFAULT_MODEL,
+      dims: r.dims,
+    });
+    p.note(
+      `provider:  gemini\n` +
+        `model:     ${DEFAULT_MODEL}\n` +
+        `dims:      ${r.dims}\n` +
+        `saved to ${config.configPath}\n\n` +
+        `cost note: free up to 1500 req/day on the Gemini free tier;\n` +
+        `phantombot's nightly cycle re-embeds changed notes only.`,
+      "Saved",
+    );
+  } else {
+    const existingOpenAI = existing.openaiCompatible;
+    const baseUrl = await p.text({
+      message: "OpenAI-compatible base URL (the /v1 part, without /embeddings)",
+      initialValue: existingOpenAI?.baseUrl ?? "http://127.0.0.1:8082/v1",
+      validate: (v) => (!v?.trim() ? "base URL is required" : undefined),
+    });
+    if (p.isCancel(baseUrl)) {
+      p.cancel("cancelled");
+      return 0;
+    }
+    const model = await p.text({
+      message: "Embedding model",
+      initialValue: existingOpenAI?.model ?? "",
+      validate: (v) => (!v?.trim() ? "model is required" : undefined),
+    });
+    if (p.isCancel(model)) {
+      p.cancel("cancelled");
+      return 0;
+    }
+    const apiKey = await p.password({
+      message: "API key (optional; leave empty for local llama-server)",
+    });
+    if (p.isCancel(apiKey)) {
+      p.cancel("cancelled");
+      return 0;
+    }
+    const queryPrefix = await p.text({
+      message: "Query prefix (optional)",
+      initialValue: existingOpenAI?.queryPrefix ?? "",
+    });
+    if (p.isCancel(queryPrefix)) {
+      p.cancel("cancelled");
+      return 0;
+    }
+    const documentPrefix = await p.text({
+      message: "Document prefix (optional)",
+      initialValue: existingOpenAI?.documentPrefix ?? "",
+    });
+    if (p.isCancel(documentPrefix)) {
+      p.cancel("cancelled");
+      return 0;
+    }
+
+    const settings: OpenAICompatibleConfigUpdate = {
+      baseUrl: String(baseUrl).trim(),
+      model: String(model).trim(),
+      apiKey: String(apiKey),
+      queryPrefix: String(queryPrefix),
+      documentPrefix: String(documentPrefix),
+    };
+    const spinner = p.spinner();
+    spinner.start("validating with a one-token embed…");
+    const r = await (input.validateOpenAI
+      ? input.validateOpenAI(settings)
+      : openaiCompatibleEmbed("phantombot embedding validation test", settings));
+    if (!r.ok) {
+      spinner.stop(`endpoint rejected: ${r.error}`);
+      p.cancel("aborting — endpoint did not validate");
+      return 1;
+    }
+    spinner.stop(`endpoint validated (got ${r.dims} dims)`);
+    await applyEmbeddingConfig(config.configPath, {
+      provider: "openai-compatible",
+      openaiCompatible: { ...settings, dims: r.dims },
+    });
+    p.note(
+      `provider:  openai-compatible\n` +
+        `base URL:  ${settings.baseUrl}\n` +
+        `model:     ${settings.model}\n` +
+        `dims:      ${r.dims}\n` +
+        `saved to ${config.configPath}`,
+      "Saved",
+    );
+  }
 
   if (!embedded) {
     await maybePromptRestart(svc);
@@ -215,7 +337,7 @@ export default defineCommand({
   meta: {
     name: "embedding",
     description:
-      "Configure the embeddings provider (Gemini or none). Validates the API key before saving.",
+      "Configure semantic-memory embeddings (Gemini, OpenAI-compatible, or none).",
   },
   async run() {
     const code = await runEmbedding();

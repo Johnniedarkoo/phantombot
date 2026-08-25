@@ -36,6 +36,7 @@ import {
   ENV_KEY_FOR_PROVIDER,
 } from "../lib/voice.ts";
 import { geminiEmbed as realGeminiEmbed } from "../lib/geminiEmbed.ts";
+import { openaiCompatibleEmbed as realOpenAICompatibleEmbed } from "../lib/openaiCompatibleEmbed.ts";
 import {
   reconcileEditorConnectors as realReconcileEditorConnectors,
   type EditorConnectorResult,
@@ -83,6 +84,7 @@ export interface StatusProbeDeps {
   validateElevenLabsKey?: typeof realValidateElevenLabsKey;
   validateOpenAIKey?: typeof realValidateOpenAIKey;
   geminiEmbed?: typeof realGeminiEmbed;
+  openaiCompatibleEmbed?: typeof realOpenAICompatibleEmbed;
   reconcileEditorConnectors?: typeof realReconcileEditorConnectors;
   isPhantombotBinary?: typeof realIsPhantombotBinary;
   nightlyHealth?: typeof realNightlyHealth;
@@ -132,19 +134,36 @@ function probeAcp(
     .join(", ");
 }
 
-/** Which retrieval backend is live: Gemini embeddings (probed) or OKF/FTS. */
+/** Which retrieval backend is live: a configured embedding service or OKF/FTS. */
 async function probeMemory(
   config: Config | undefined,
   embed: typeof realGeminiEmbed,
+  openaiEmbed: typeof realOpenAICompatibleEmbed,
   signal?: AbortSignal,
 ): Promise<string | undefined> {
   const provider = config?.embeddings.provider;
   if (!provider) return undefined;
-  if (provider !== "gemini") {
+  if (provider === "none") {
     // "none" = Open Knowledge Format mode: local BM25/FTS keyword search +
     // link-graph expansion. No external service to probe — it's live as long
     // as the process is (the same index /status already reads for context %).
     return "okf active (local keyword + link-graph)";
+  }
+  if (provider === "openai-compatible") {
+    const o = config?.embeddings.openaiCompatible;
+    if (!o?.baseUrl || !o.model) {
+      return "openai-compatible embeddings ERR (incomplete config)";
+    }
+    const r = await openaiEmbed("phantombot status probe", {
+      baseUrl: o.baseUrl,
+      model: o.model,
+      apiKey: o.apiKey,
+      dims: o.dims,
+      signal,
+    });
+    return r.ok
+      ? "openai-compatible embeddings OK"
+      : `openai-compatible embeddings ERR (${shortErr(r.error)})`;
   }
   const g = config?.embeddings.gemini;
   if (!g?.apiKey) return "gemini embeddings — no key";
@@ -231,6 +250,8 @@ export async function gatherStatusProbes(
 ): Promise<StatusProbeLines> {
   const getMe = deps.telegramGetMe ?? realTelegramGetMe;
   const embed = deps.geminiEmbed ?? realGeminiEmbed;
+  const openaiEmbed =
+    deps.openaiCompatibleEmbed ?? realOpenAICompatibleEmbed;
   const reconcile =
     deps.reconcileEditorConnectors ?? realReconcileEditorConnectors;
   const isBinary = deps.isPhantombotBinary ?? realIsPhantombotBinary;
@@ -262,7 +283,7 @@ export async function gatherStatusProbes(
 
   const [telegram, memory, voice, dreaming] = await Promise.all([
     settle(probeTelegram(config, persona, getMe, deadline)),
-    settle(probeMemory(config, embed, deadline)),
+    settle(probeMemory(config, embed, openaiEmbed, deadline)),
     settle(
       probeVoice(config, {
         validateElevenLabsKey: validateEl,

@@ -180,8 +180,8 @@ export interface DoctorReport {
    * looking like a fault.
    */
   embeddings: {
-    provider: "gemini" | "none";
-    /** gemini provider AND a key present = vector/semantic search is live. */
+    provider: "gemini" | "openai-compatible" | "none";
+    /** Configured provider has enough settings for vector/semantic search. */
     semantic_search: boolean;
   };
   /**
@@ -536,13 +536,15 @@ export async function runDoctor(input: RunDoctorInput = {}): Promise<number> {
   const telegramReport = telegramHealthReport(config, personaConfigs);
 
   // Embeddings status — informational only. Vector search is live only when
-  // the provider is gemini AND a key is actually present; everything else
-  // (provider "none", or "gemini" with an empty key) means keyword-only.
+  // the selected provider has enough configuration to make a request.
   const updateChannel = config.updateChannel ?? DEFAULT_UPDATE_CHANNEL;
 
   const embProvider = config.embeddings.provider;
   const semanticSearch =
-    embProvider === "gemini" && !!config.embeddings.gemini?.apiKey;
+    (embProvider === "gemini" && !!config.embeddings.gemini?.apiKey) ||
+    (embProvider === "openai-compatible" &&
+      !!config.embeddings.openaiCompatible?.baseUrl &&
+      !!config.embeddings.openaiCompatible.model);
 
   // Timer "last fired" check — catches the long-uptime failure mode
   // where systemd thinks a timer is active but it hasn't fired in
@@ -919,7 +921,7 @@ export async function runDoctor(input: RunDoctorInput = {}): Promise<number> {
     semanticSearch
       ? `  embeddings: semantic (vector) search ON — provider '${embProvider}'\n`
       : "  embeddings: semantic (vector) search off — OKF field-weighted BM25 " +
-        "+ link-graph expansion active. Optional: add Gemini with `phantombot embedding`\n",
+        "+ link-graph expansion active. Optional: run `phantombot embedding`\n",
   );
   // Same neutrality as the embeddings line: a ring is a choice, not a fault.
   out.write(

@@ -86,6 +86,35 @@ describe("applyEmbeddingConfig — none", () => {
   });
 });
 
+describe("applyEmbeddingConfig — openai-compatible", () => {
+  test("writes endpoint settings and detected dimensions", async () => {
+    await applyEmbeddingConfig(configPath, {
+      provider: "openai-compatible",
+      openaiCompatible: {
+        baseUrl: "http://127.0.0.1:8082/v1",
+        model: "Qwen3-Embedding-0.6B-Q8_0.gguf",
+        apiKey: "",
+        dims: 1024,
+        queryPrefix: "query: ",
+        documentPrefix: "passage: ",
+      },
+    });
+    const text = await readFile(configPath, "utf8");
+    expect(text).toContain('provider = "openai-compatible"');
+    expect(text).toContain("[embeddings.openai_compatible]");
+    expect(text).toContain("dims = 1024");
+    const c = await loadConfig();
+    expect(c.embeddings.openaiCompatible).toEqual({
+      baseUrl: "http://127.0.0.1:8082/v1",
+      model: "Qwen3-Embedding-0.6B-Q8_0.gguf",
+      apiKey: "",
+      dims: 1024,
+      queryPrefix: "query: ",
+      documentPrefix: "passage: ",
+    });
+  });
+});
+
 describe("config inference", () => {
   test("if api_key is set via env but no provider in toml, infers gemini", async () => {
     const SAVED_KEY = process.env.PHANTOMBOT_GEMINI_API_KEY;

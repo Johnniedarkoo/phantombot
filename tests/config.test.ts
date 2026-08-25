@@ -50,6 +50,12 @@ const ENV_KEYS = [
   // api_key, so a real key in a developer's shell silently overrides the
   // fixture and breaks the embedding assertions below.
   "PHANTOMBOT_GEMINI_API_KEY",
+  "PHANTOMBOT_OPENAI_COMPATIBLE_BASE_URL",
+  "PHANTOMBOT_OPENAI_COMPATIBLE_MODEL",
+  "PHANTOMBOT_OPENAI_COMPATIBLE_API_KEY",
+  "PHANTOMBOT_OPENAI_COMPATIBLE_DIMS",
+  "PHANTOMBOT_OPENAI_COMPATIBLE_QUERY_PREFIX",
+  "PHANTOMBOT_OPENAI_COMPATIBLE_DOCUMENT_PREFIX",
   "PHANTOMBOT_RETRIEVAL_ENABLED",
   "PHANTOMBOT_RETRIEVAL_LIMIT",
   "PHANTOMBOT_RETRIEVAL_MAX_TOKENS",
@@ -1301,5 +1307,37 @@ describe("loadConfig — deprecation warnings cover the persona layer", () => {
       .filter((l) => l.trim().length > 0)
       .map((l) => JSON.parse(l).msg as string);
     expect(msgs.some((m) => m.includes("turn_timeout_s") && m.includes(personaFile))).toBe(true);
+  });
+});
+
+describe("loadConfig — OpenAI-compatible embeddings", () => {
+  test("loads endpoint settings and query/document prefixes", async () => {
+    const cfgDir = join(workdir, "config", "phantombot");
+    await mkdir(cfgDir, { recursive: true });
+    await writeFile(
+      join(cfgDir, "config.toml"),
+      `[embeddings]
+provider = "openai-compatible"
+
+[embeddings.openai_compatible]
+base_url = "http://127.0.0.1:8082/v1"
+model = "embed"
+api_key = ""
+dims = 1024
+query_prefix = "query: "
+document_prefix = "passage: "
+`,
+      "utf8",
+    );
+    const c = await loadConfig();
+    expect(c.embeddings.provider).toBe("openai-compatible");
+    expect(c.embeddings.openaiCompatible).toEqual({
+      baseUrl: "http://127.0.0.1:8082/v1",
+      model: "embed",
+      apiKey: "",
+      dims: 1024,
+      queryPrefix: "query: ",
+      documentPrefix: "passage: ",
+    });
   });
 });
