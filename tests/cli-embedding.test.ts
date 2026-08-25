@@ -7,7 +7,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applyEmbeddingConfig } from "../src/cli/embedding.ts";
+import {
+  applyEmbeddingConfig,
+  optionalPromptText,
+} from "../src/cli/embedding.ts";
 import { loadConfig } from "../src/config.ts";
 
 let workdir: string;
@@ -112,6 +115,12 @@ describe("applyEmbeddingConfig — openai-compatible", () => {
       queryPrefix: "query: ",
       documentPrefix: "passage: ",
     });
+  });
+
+  test("empty optional prompt values remain empty", () => {
+    expect(optionalPromptText(undefined)).toBe("");
+    expect(optionalPromptText("")).toBe("");
+    expect(optionalPromptText("local-key")).toBe("local-key");
   });
 });
 

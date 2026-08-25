@@ -292,9 +292,9 @@ export async function runEmbedding(input: RunInput = {}): Promise<number> {
     const settings: OpenAICompatibleConfigUpdate = {
       baseUrl: String(baseUrl).trim(),
       model: String(model).trim(),
-      apiKey: String(apiKey),
-      queryPrefix: String(queryPrefix),
-      documentPrefix: String(documentPrefix),
+      apiKey: optionalPromptText(apiKey),
+      queryPrefix: optionalPromptText(queryPrefix),
+      documentPrefix: optionalPromptText(documentPrefix),
     };
     const spinner = p.spinner();
     spinner.start("validating with a one-token embed…");
@@ -326,6 +326,11 @@ export async function runEmbedding(input: RunInput = {}): Promise<number> {
     p.outro("done");
   }
   return 0;
+}
+
+/** Empty optional prompts must stay empty, never become the string "undefined". */
+export function optionalPromptText(value: unknown): string {
+  return typeof value === "string" ? value : "";
 }
 
 function maskKey(k: string): string {
