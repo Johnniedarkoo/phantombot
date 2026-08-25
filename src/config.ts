@@ -291,10 +291,10 @@ export interface RetrievalSettings {
   turnIndexing: TurnIndexingSettings;
   /**
    * OKF link-graph expansion for the no-embeddings (BM25-only) path. When a
-   * persona has no Gemini key, fielded BM25 hits are augmented with concepts
+   * persona has no embedding provider, fielded BM25 hits are augmented with concepts
    * reachable via markdown links from those hits — the keyword-only stand-in
    * for semantic spread. Ignored when embeddings are configured (the hybrid
-   * vector path is used instead, so Gemini users are unaffected).
+   * vector path is used instead, so embedding-provider users are unaffected).
    */
   graphExpansion: GraphExpansionSettings;
   /**

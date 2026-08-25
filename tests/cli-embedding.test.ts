@@ -95,7 +95,7 @@ describe("applyEmbeddingConfig — openai-compatible", () => {
       provider: "openai-compatible",
       openaiCompatible: {
         baseUrl: "http://127.0.0.1:8082/v1",
-        model: "Qwen3-Embedding-0.6B-Q8_0.gguf",
+        model: "example-embedding-model",
         apiKey: "",
         dims: 1024,
         queryPrefix: "query: ",
@@ -109,7 +109,7 @@ describe("applyEmbeddingConfig — openai-compatible", () => {
     const c = await loadConfig();
     expect(c.embeddings.openaiCompatible).toEqual({
       baseUrl: "http://127.0.0.1:8082/v1",
-      model: "Qwen3-Embedding-0.6B-Q8_0.gguf",
+      model: "example-embedding-model",
       apiKey: "",
       dims: 1024,
       queryPrefix: "query: ",

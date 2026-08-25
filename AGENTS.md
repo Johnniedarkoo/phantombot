@@ -426,7 +426,8 @@ OpenAI-compatible `/embeddings` client; provider-specific prefixes stay in that
 resolver. Every note/turn vector carries a deterministic per-row space
 fingerprint: provider/model/dimensions, plus the OpenAI-compatible document
 prefix. Query prefixes and credentials are excluded. Untagged pre-existing rows
-are eligible only for Gemini (the provider upstream shipped), never inferred as
+are eligible only for the canonical historical Gemini default
+`gemini-embedding-001` at 1536 dimensions, never inferred as
 OpenAI-compatible; a successful full reembed tags and cleans them up. Mixed old
 and new rows are therefore safe during an interrupted migration. `--reembed`
 refreshes FTS first, performs a real document preflight, then force-writes the

@@ -240,7 +240,7 @@ phantombot phantomchat # encrypted Nostr DMs
 phantombot telegram    # BotFather token + allowed Telegram user IDs
 
 phantombot voice       # optional TTS/STT setup
-phantombot embedding   # optional Gemini semantic-memory setup
+phantombot embedding   # optional semantic-memory provider setup
 
 phantombot run         # foreground host runtime for configured chat channels + P2P
 phantombot run --if-not-running  # supervisor keep-alive; quiet success if already running
@@ -590,7 +590,7 @@ Setup and channels:
 | `phantombot telegram [--persona <name>]` | Configure a Telegram bot and allowlist |
 | `phantombot phantomchat [--persona <name>]` | Configure PhantomChat identity, relays, and allowlist |
 | `phantombot voice [--persona <name>]` | Configure TTS/STT |
-| `phantombot embedding` | Configure optional Gemini embeddings |
+| `phantombot embedding` | Configure optional Gemini/OpenAI-compatible embeddings, or none |
 | `phantombot acp install zed|jetbrains|vscode` | Register the ACP agent with an editor |
 
 `phantombot persona <name>` switches the daemon-wide default persona.
@@ -2078,13 +2078,15 @@ phantombot embedding
 phantombot memory index --rebuild
 ```
 
-**Privacy boundary:** enabling Gemini sends the plaintext being embedded to
-Google's Generative Language API. That includes daily-journal and KB content,
-indexed conversation turns, and each semantic search query. The local
-SQLite database remains local, but the text submitted for vector generation
-does not. Leave embeddings disabled to keep recall entirely on-host with
-BM25F + link-graph expansion; your configured model harness still receives
-normal turn prompts under that provider's own terms.
+**Privacy boundary:** local SQLite and markdown memory remain local storage,
+but the configured embedding endpoint receives the plaintext submitted for
+embedding. That includes note/KB chunks, indexed conversation-turn text, and
+retrieval queries. Gemini sends that text to Google's Generative Language API;
+an OpenAI-compatible endpoint may be remote or may be localhost. A localhost
+endpoint keeps those embedding calls on the local machine. This is separate
+from normal model-provider/harness privacy: turn prompts and tool calls still
+follow the terms of the model provider you configure. Leave embeddings
+disabled to keep recall entirely on-host with BM25F + link-graph expansion.
 
 Equivalent TOML:
 
@@ -2148,11 +2150,12 @@ When changing the embedding provider, model, or prefixes, run:
 phantombot memory index --reembed
 ```
 
-This clears and rebuilds only derived vectors; source files, raw conversation
-turns, and FTS content/index data are preserved. Run it even when the old and
-new providers report the same dimension: equal dimensions do not imply the
-same vector space. If an embedding request fails, the interactive turn and
-memory search continue with lexical/OKF retrieval.
+This rebuilds only derived vectors; source files, raw conversation turns, and
+FTS content/index data are preserved. Existing vector rows are removed only
+after the full replacement succeeds. Run it even when the old and new
+providers report the same dimension: equal dimensions do not imply the same
+vector space. If an embedding request fails, the interactive turn and memory
+search continue with lexical/OKF retrieval.
 
 Without embeddings, search degrades cleanly to OKF field-weighted BM25 with
 link-graph expansion — never to plain keyword.
