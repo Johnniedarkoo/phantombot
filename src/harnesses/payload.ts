@@ -1,0 +1,52 @@
+import type { HistoryTurn } from "./types.ts";
+
+/**
+ * Minimal input required to render the user-side payload shared by stateless
+ * harnesses. The critical ordering is deliberate:
+ *
+ *   stable system prompt (owned by the harness) -> historical turns ->
+ *   volatile per-turn context -> current user message
+ *
+ * Keeping volatile context after historical turns maximizes the exact common
+ * prefix available to downstream KV/prompt caches while leaving PhantomBot as
+ * the authoritative owner of conversation state.
+ */
+export interface ConversationPayloadInput {
+  history: readonly HistoryTurn[];
+  /**
+   * Volatile PhantomBot-provided context for this request only: retrieved
+   * memory, durable facts, daily recall, timestamp/channel metadata, etc.
+   * It MUST be rendered after history and before the current user message.
+   */
+  turnContext?: string;
+  userMessage: string;
+}
+
+/**
+ * Render prior conversation in the legacy PhantomBot format, then append the
+ * volatile turn context and finally the current user message.
+ *
+ * This helper intentionally knows nothing about system prompts. Pi/Claude keep
+ * their native system-prompt channel; Codex may prepend its system prompt in
+ * its own adapter because its exec interface currently carries everything via
+ * stdin.
+ */
+export function renderConversationPayload(
+  input: ConversationPayloadInput,
+): string {
+  const parts: string[] = [];
+
+  for (const turn of input.history) {
+    if (turn.role === "user") {
+      parts.push(turn.text);
+    } else {
+      parts.push(`<previous_response>\n${turn.text}\n</previous_response>`);
+    }
+  }
+
+  const turnContext = input.turnContext?.trim();
+  if (turnContext) parts.push(turnContext);
+
+  parts.push(input.userMessage);
+  return parts.join("\n\n");
+}
