@@ -45,7 +45,7 @@ import {
   personaDir,
 } from "../config.ts";
 import { defaultEmbedder, runEmbedJob } from "../lib/embedJob.ts";
-import { geminiEmbed } from "../lib/geminiEmbed.ts";
+import { resolveEmbedders } from "../lib/embedder.ts";
 import { TAG_TO_DRAWER } from "../lib/heartbeat.ts";
 import type { WriteSink } from "../lib/io.ts";
 import { log } from "../lib/logger.ts";
@@ -111,6 +111,8 @@ export interface RunSearchInput extends RunMemoryInput {
   limit?: number;
   /** Override the index path for testing. */
   indexPath?: string;
+  /** Override embedding HTTP for tests. */
+  fetchImpl?: typeof fetch;
 }
 
 export async function runMemorySearch(
@@ -130,28 +132,20 @@ export async function runMemorySearch(
   try {
     await ix.refreshStale(dir);
 
-    // If embeddings are configured AND there are stored vectors, do a
+    // If a query embedder is configured AND there are stored vectors, do a
     // hybrid search. Otherwise fall back to FTS-only.
     let queryVec: Float32Array | undefined;
-    if (
-      config.embeddings.provider === "gemini" &&
-      config.embeddings.gemini?.apiKey &&
-      ix.embeddingCount() > 0
-    ) {
-      const r = await geminiEmbed(
-        config.embeddings.gemini.apiKey,
-        input.query,
-        {
-          model: config.embeddings.gemini.model,
-          dims: config.embeddings.gemini.dims,
-        },
-      );
+    const queryEmbedder = resolveEmbedders(config, {
+      fetchImpl: input.fetchImpl,
+    }).query;
+    if (queryEmbedder && ix.embeddingCount() > 0) {
+      const r = await queryEmbedder(input.query);
       if (r.ok) queryVec = r.values;
       else err.write(`(query embed failed: ${r.error}; falling back to FTS-only)\n`);
     }
 
     // No-embeddings path gets OKF link-graph expansion when enabled, matching
-    // turn-time auto-retrieval; the hybrid (Gemini) path is unchanged.
+    // turn-time auto-retrieval; the hybrid path is provider-neutral.
     const ge = config.retrieval?.graphExpansion;
     const hits = queryVec
       ? ix.hybridSearch(input.query, queryVec, {

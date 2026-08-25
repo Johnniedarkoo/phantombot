@@ -313,6 +313,45 @@ describe("retrieveContext", () => {
     expect(out!).toContain("Inverter.md");
   });
 
+  test("openai-compatible provider uses the generic hybrid path", async () => {
+    const ix = await MemoryIndex.open(indexPath);
+    await ix.refreshStale(personaDir);
+    const vec = new Float32Array(2);
+    vec[0] = 1;
+    ix.upsertEmbedding("kb/infra/Inverter.md", 0, vec, "sha-test");
+    ix.close();
+
+    const fetchImpl = (async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      expect(body.input).toBe("query: deye inverter");
+      return new Response(
+        JSON.stringify({ data: [{ embedding: [1, 0] }] }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const out = await retrieveContext({
+      query: "deye inverter",
+      personaDir,
+      indexPath,
+      embeddings: {
+        provider: "openai-compatible",
+        openaiCompatible: {
+          baseUrl: "http://localhost:8082/v1",
+          model: "embed",
+          apiKey: "",
+          dims: 2,
+          queryPrefix: "query: ",
+          documentPrefix: "passage: ",
+        },
+      },
+      settings: { ...DEFAULT_RETRIEVAL },
+      fetchImpl,
+    });
+    expect(out).toBeDefined();
+    expect(out!).toContain("Inverter.md");
+  });
+
   test("opt-out restores strict per-conversation scoping (PR #132 behaviour)", async () => {
     // Seed two conversations' turns into the on-disk index, then retrieve
     // for conversation AAA with cross-conversation retrieval explicitly

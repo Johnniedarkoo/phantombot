@@ -118,6 +118,44 @@ describe("runMemorySearch", () => {
     expect(parsed.results).toHaveLength(1);
     expect(parsed.results[0].scope).toBe("memory");
   });
+
+  test("uses the OpenAI-compatible query embedder for hybrid search", async () => {
+    await note("kb/concepts/Foo.md", "deye inverter facts");
+    const ix = await MemoryIndex.open(indexPath);
+    await ix.refreshStale(join(workdir, "personas", "phantom"));
+    ix.upsertEmbedding("kb/concepts/Foo.md", 0, new Float32Array([1, 0]), "sha");
+    ix.close();
+    const out = new CaptureStream();
+    const code = await runMemorySearch({
+      query: "different wording",
+      config: {
+        ...config,
+        embeddings: {
+          provider: "openai-compatible",
+          openaiCompatible: {
+            baseUrl: "http://localhost:8082/v1",
+            model: "embed",
+            apiKey: "",
+            dims: 2,
+            queryPrefix: "query: ",
+            documentPrefix: "passage: ",
+          },
+        },
+      },
+      indexPath,
+      out,
+      err: new CaptureStream(),
+      fetchImpl: (async (_url, init) => {
+        expect(JSON.parse(String(init?.body)).input).toBe("query: different wording");
+        return new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch,
+    });
+    expect(code).toBe(0);
+    expect(JSON.parse(out.text).results[0].path).toBe("kb/concepts/Foo.md");
+  });
 });
 
 describe("runMemoryGet", () => {
