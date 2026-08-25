@@ -330,6 +330,7 @@ export interface TurnIndexState {
 
 /** Brute-force cosine similarity. Both vectors must be the same length. */
 export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+  if (a.length !== b.length) return 0;
   const len = Math.min(a.length, b.length);
   let dot = 0;
   let na = 0;
@@ -1020,6 +1021,18 @@ export class MemoryIndex {
     return notes + turns;
   }
 
+  /** Remove only derived vectors; FTS, turn docs, and index cursors survive. */
+  clearEmbeddings(): void {
+    this.db.exec("DELETE FROM note_embeddings; DELETE FROM turn_embeddings;");
+  }
+
+  /** Every already-indexed eligible historical turn, independent of cursors. */
+  allTurnDocuments(): Array<{ path: string; content: string }> {
+    return this.db
+      .query("SELECT path, content FROM turn_docs ORDER BY path")
+      .all() as Array<{ path: string; content: string }>;
+  }
+
   // -------------------------------------------------------------
   // Search
   // -------------------------------------------------------------
@@ -1400,10 +1413,21 @@ export class MemoryIndex {
     // Vector search. Brute-force cosine over all embeddings.
     const all = this.allEmbeddings();
     const vecScores = new Map<string, number>(); // path → max chunk score
+    let incompatible = 0;
     for (const emb of all) {
+      if (emb.vec.length !== queryVec.length) {
+        incompatible++;
+        continue;
+      }
       const s = cosineSimilarity(queryVec, emb.vec);
       const cur = vecScores.get(emb.path);
       if (cur === undefined || s > cur) vecScores.set(emb.path, s);
+    }
+    if (incompatible > 0) {
+      log.warn(
+        "memory index contains incompatible embedding dimensions; run `phantombot memory index --reembed`",
+        { queryDims: queryVec.length, incompatible },
+      );
     }
 
     // Filter vector hits by scope by joining with the metadata tables —

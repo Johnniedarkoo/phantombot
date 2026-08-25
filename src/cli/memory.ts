@@ -14,8 +14,8 @@
  *                              print today's daily-file path (creates the
  *                              directory if missing — returns the path
  *                              unconditionally so the harness can write to it)
- *   phantombot memory index [--rebuild]
- *                              rebuild the FTS5 index (incremental by default)
+ *   phantombot memory index [--rebuild] [--reembed]
+ *                              rebuild FTS5 or only derived vectors
  *   phantombot memory capture "<text>" --tag <tag> [--tag <tag> ...]
  *                              append a tagged line to today's daily file
  *                              and record the capture in capture_log
@@ -44,7 +44,12 @@ import {
   memoryIndexPath,
   personaDir,
 } from "../config.ts";
-import { defaultEmbedder, runEmbedJob } from "../lib/embedJob.ts";
+import {
+  defaultEmbedderWithFetch,
+  runEmbedJob,
+  runTurnEmbedJob,
+  type Embedder,
+} from "../lib/embedJob.ts";
 import { resolveEmbedders } from "../lib/embedder.ts";
 import { TAG_TO_DRAWER } from "../lib/heartbeat.ts";
 import type { WriteSink } from "../lib/io.ts";
@@ -269,6 +274,12 @@ export interface RunIndexInputV2 extends RunIndexInput {
    * below the turn-index batch and haven't aged into the heartbeat window yet.
    */
   flushTurns?: boolean;
+  /** Clear and fully rebuild only note/turn vectors. */
+  reembed?: boolean;
+  /** Override embedding HTTP for tests. */
+  fetchImpl?: typeof fetch;
+  /** Test seam for the derived-vector rebuild. */
+  embedder?: Embedder;
 }
 
 export async function runMemoryIndex(
@@ -281,6 +292,11 @@ export async function runMemoryIndex(
 
   if (!existsSync(dir)) {
     err.write(`persona '${persona}' not found at ${dir}\n`);
+    return 2;
+  }
+
+  if (input.reembed && input.flushTurns) {
+    err.write("--reembed and --turns cannot be used together\n");
     return 2;
   }
 
@@ -327,6 +343,41 @@ export async function runMemoryIndex(
 
   const ix = await MemoryIndex.open(input.indexPath ?? memoryIndexPath(persona));
   try {
+    const reembedder =
+      input.embedder ?? defaultEmbedderWithFetch(config, input.fetchImpl);
+    if (input.reembed) {
+      if (!reembedder) {
+        out.write(
+          `(embeddings provider is "${config.embeddings.provider}"; ` +
+            "configure an embedding provider before --reembed)\n",
+        );
+        return 0;
+      }
+      out.write(
+        `rebuilding derived vectors for '${persona}' ` +
+          "(source files, raw turns, and FTS are preserved)…\n",
+      );
+      ix.clearEmbeddings();
+      const notes = await runEmbedJob({
+        personaDir: dir,
+        index: ix,
+        embedder: reembedder,
+        force: true,
+      });
+      const turns = await runTurnEmbedJob({ index: ix, embedder: reembedder });
+      out.write(
+        `re-embedded ${notes.embedded}/${notes.totalNotes} notes and ` +
+          `${turns.embedded}/${turns.totalTurns} turns` +
+          (notes.failed + turns.failed > 0
+            ? `; failed ${notes.failed + turns.failed}`
+            : "") +
+          `\n`,
+      );
+      for (const e of [...notes.errors.map((x) => ({ ...x, kind: "note" })), ...turns.errors.map((x) => ({ ...x, kind: "turn", chunkIdx: undefined }))].slice(0, 5)) {
+        err.write(`  ${e.kind} ${e.path}: ${e.error}\n`);
+      }
+      return 0;
+    }
     const ftsResult = input.rebuild
       ? { ...(await ix.rebuild(dir)), removed: 0 }
       : await ix.refreshStale(dir);
@@ -341,11 +392,12 @@ export async function runMemoryIndex(
       out.write(`(skipping embedding pass; --no-embed)\n`);
       return 0;
     }
-    const embedder = defaultEmbedder(config);
+    const embedder =
+      input.embedder ?? defaultEmbedderWithFetch(config, input.fetchImpl);
     if (!embedder) {
       out.write(
         `(embeddings provider is "${config.embeddings.provider}"; ` +
-          `run \`phantombot embedding\` to set up Gemini)\n`,
+          "run `phantombot embedding` to configure it)\n",
       );
       return 0;
     }
@@ -512,7 +564,7 @@ export async function indexAfterCapture(
     // Then the vector embed for the new chunk(s), if embeddings are set up.
     // sha-skip means unchanged chunks cost nothing; a missing key just means
     // FTS-only recall until the heartbeat runs the full job.
-    const embedder = defaultEmbedder(config);
+    const embedder = defaultEmbedderWithFetch(config);
     if (embedder) {
       await runEmbedJob({ personaDir: dir, index: ix, embedder });
     }
@@ -954,12 +1006,13 @@ const todayCmd = defineCommand({
 });
 
 const indexCmd = defineCommand({
-  meta: { name: "index", description: "Refresh FTS5 + embeddings (incremental by default; --rebuild for from-scratch; --no-embed to skip the vector pass)." },
+  meta: { name: "index", description: "Refresh FTS5 + embeddings (incremental by default; --rebuild for from-scratch; --reembed for a full derived-vector rebuild; --no-embed to skip vectors)." },
   args: {
     persona: { type: "string", description: "Persona name." },
     rebuild: { type: "boolean", description: "Drop and re-index from scratch.", default: false },
     "no-embed": { type: "boolean", description: "Skip embedding pass (FTS only).", default: false },
     turns: { type: "boolean", description: "Force-flush unindexed conversation turn tails (all conversations) instead of the notes/KB index.", default: false },
+    reembed: { type: "boolean", description: "Clear and rebuild only note/turn embeddings; preserve source files, raw turns, and FTS.", default: false },
   },
   async run({ args }) {
     process.exitCode = await runMemoryIndex({
@@ -967,6 +1020,7 @@ const indexCmd = defineCommand({
       rebuild: Boolean(args.rebuild),
       noEmbed: Boolean(args["no-embed"]),
       flushTurns: Boolean(args.turns),
+      reembed: Boolean(args.reembed),
     });
   },
 });

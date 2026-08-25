@@ -33,6 +33,13 @@ export function defaultEmbedder(config: Config): Embedder | undefined {
   return resolveEmbedders(config).document;
 }
 
+export function defaultEmbedderWithFetch(
+  config: Config,
+  fetchImpl?: typeof fetch,
+): Embedder | undefined {
+  return resolveEmbedders(config, { fetchImpl }).document;
+}
+
 export interface RunEmbedJobInput {
   personaDir: string;
   index: MemoryIndex;
@@ -95,6 +102,38 @@ export async function runEmbedJob(
     }
   }
 
+  return result;
+}
+
+export interface TurnEmbedJobResult {
+  totalTurns: number;
+  embedded: number;
+  failed: number;
+  errors: Array<{ path: string; error: string }>;
+}
+
+/** Re-embed every existing indexed turn; deliberately ignores cursor state. */
+export async function runTurnEmbedJob(input: {
+  index: MemoryIndex;
+  embedder: Embedder;
+}): Promise<TurnEmbedJobResult> {
+  const result: TurnEmbedJobResult = {
+    totalTurns: 0,
+    embedded: 0,
+    failed: 0,
+    errors: [],
+  };
+  for (const row of input.index.allTurnDocuments()) {
+    result.totalTurns++;
+    const r = await input.embedder(row.content);
+    if (!r.ok) {
+      result.failed++;
+      result.errors.push({ path: row.path, error: r.error });
+      continue;
+    }
+    input.index.upsertTurnEmbedding(row.path, r.values, sha256(row.content));
+    result.embedded++;
+  }
   return result;
 }
 

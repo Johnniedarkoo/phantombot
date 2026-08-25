@@ -279,6 +279,48 @@ describe("runMemoryIndex", () => {
     });
     expect(out.text).toContain("0 file(s)");
   });
+
+  test("--reembed rebuilds vectors while preserving FTS and all indexed turns", async () => {
+    await note("kb/concepts/A.md", "alpha source note");
+    const seeded = await MemoryIndex.open(indexPath);
+    await seeded.refreshStale(join(workdir, "personas", "phantom"));
+    seeded.upsertTurn({
+      id: 1,
+      persona: "phantom",
+      conversation: "cli:default",
+      role: "user",
+      text: "historical semantic turn",
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      embeddable: true,
+      source: "principal",
+      origin: "channel",
+    });
+    seeded.upsertEmbedding("kb/concepts/A.md", 0, new Float32Array([9]), "old");
+    seeded.close();
+
+    const code = await runMemoryIndex({
+      config,
+      indexPath,
+      reembed: true,
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      embedder: async () => ({
+        ok: true as const,
+        values: new Float32Array([1, 2]),
+        dims: 2,
+      }),
+    });
+    expect(code).toBe(0);
+    const check = await MemoryIndex.open(indexPath);
+    try {
+      expect(check.embeddingCount()).toBe(2);
+      expect(check.search("alpha")).toHaveLength(1);
+      expect(check.allTurnDocuments()).toHaveLength(1);
+      expect(existsSync(join(workdir, "personas", "phantom", "kb/concepts/A.md"))).toBe(true);
+    } finally {
+      check.close();
+    }
+  });
 });
 
 describe("integration — search picks up files written between calls", () => {

@@ -12,6 +12,7 @@ import {
   chunkText,
   defaultEmbedder,
   runEmbedJob,
+  runTurnEmbedJob,
   sha256,
 } from "../src/lib/embedJob.ts";
 import {
@@ -106,6 +107,11 @@ describe("cosineSimilarity", () => {
     const a = new Float32Array([1, 2, 3]);
     expect(cosineSimilarity(z, a)).toBe(0);
   });
+  test("dimension mismatch is safe and returns no similarity", () => {
+    expect(
+      cosineSimilarity(new Float32Array([1, 0]), new Float32Array([1])),
+    ).toBe(0);
+  });
 });
 
 describe("rrfMerge", () => {
@@ -144,6 +150,59 @@ describe("MemoryIndex embedding storage", () => {
     ix.upsertEmbedding("kb/A.md", 0, v2, "sha-2");
     expect(ix.embeddingCount()).toBe(1);
     expect(ix.embeddingSha("kb/A.md", 0)).toBe("sha-2");
+  });
+
+  test("clearing vectors preserves FTS and indexed turn documents", async () => {
+    await note("kb/concepts/A.md", "alpha content");
+    await ix.refreshStale(personaDir);
+    ix.upsertEmbedding("kb/concepts/A.md", 0, new Float32Array([1, 0]), "sha");
+    ix.upsertTurn({
+      id: 1,
+      persona: "phantom",
+      conversation: "cli:default",
+      role: "user",
+      text: "historical turn",
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      embeddable: true,
+      source: "principal",
+      origin: "channel",
+    }, new Float32Array([0, 1]), "turn-sha");
+    expect(ix.embeddingCount()).toBe(2);
+    expect(ix.search("alpha")).toHaveLength(1);
+    expect(ix.allTurnDocuments()).toHaveLength(1);
+    ix.clearEmbeddings();
+    expect(ix.embeddingCount()).toBe(0);
+    expect(ix.search("alpha")).toHaveLength(1);
+    expect(ix.allTurnDocuments()).toHaveLength(1);
+  });
+
+  test("re-embeds every historical turn document, not only missing rows", async () => {
+    ix.upsertTurn({
+      id: 1,
+      persona: "phantom",
+      conversation: "cli:default",
+      role: "user",
+      text: "first historical turn",
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      embeddable: true,
+      source: "principal",
+      origin: "channel",
+    });
+    ix.upsertTurn({
+      id: 2,
+      persona: "phantom",
+      conversation: "cli:default",
+      role: "assistant",
+      text: "second historical turn",
+      createdAt: new Date("2026-01-01T00:01:00Z"),
+      embeddable: true,
+      source: "unverified",
+      origin: "channel",
+    });
+    const r = await runTurnEmbedJob({ index: ix, embedder: fakeEmbedder() });
+    expect(r.totalTurns).toBe(2);
+    expect(r.embedded).toBe(2);
+    expect(ix.embeddingCount()).toBe(2);
   });
 });
 
