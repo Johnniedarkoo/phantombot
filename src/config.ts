@@ -789,12 +789,20 @@ export interface Config {
   updateChannel?: UpdateChannel;
 
   embeddings: {
-    /** "gemini" | "none". "none" = FTS5-only search. */
-    provider: "gemini" | "none";
+    /** "gemini" | "openai-compatible" | "none". */
+    provider: "gemini" | "openai-compatible" | "none";
     gemini?: {
       apiKey: string;
       model: string;
       dims: number;
+    };
+    openaiCompatible?: {
+      baseUrl: string;
+      model: string;
+      apiKey: string;
+      dims: number;
+      queryPrefix: string;
+      documentPrefix: string;
     };
   };
 
@@ -1161,6 +1169,8 @@ export async function loadConfig(persona?: string): Promise<Config> {
   const tomlP2p = (toml.p2p ?? {}) as Record<string, unknown>;
   const tomlEmbeddings = (toml.embeddings ?? {}) as Record<string, unknown>;
   const tomlGemini = (tomlEmbeddings.gemini ?? {}) as Record<string, unknown>;
+  const tomlOpenAI = (tomlEmbeddings.openai_compatible ??
+    tomlEmbeddings["openai-compatible"] ?? {}) as Record<string, unknown>;
   const tomlRetrieval = (toml.retrieval ?? {}) as Record<string, unknown>;
   const tomlTurnIndexing = (tomlRetrieval.turn_indexing ?? {}) as Record<
     string,
@@ -1404,7 +1414,7 @@ export async function loadConfig(persona?: string): Promise<Config> {
     // is the fail-closed direction.
     updateChannel: resolveUpdateChannel(globalToml.update_channel),
 
-    embeddings: buildEmbeddingsConfig(tomlEmbeddings, tomlGemini),
+    embeddings: buildEmbeddingsConfig(tomlEmbeddings, tomlGemini, tomlOpenAI),
 
     retrieval: buildRetrievalConfig(tomlRetrieval, tomlTurnIndexing),
     durableFacts: buildDurableFactsConfig(
@@ -1998,16 +2008,56 @@ function buildHarnessPersonasConfig(
 function buildEmbeddingsConfig(
   tomlEmbeddings: Record<string, unknown>,
   tomlGemini: Record<string, unknown>,
+  tomlOpenAI: Record<string, unknown>,
 ): Config["embeddings"] {
   const envApiKey = process.env.PHANTOMBOT_GEMINI_API_KEY;
   const tomlApiKey = asString(tomlGemini.api_key);
   const apiKey = envApiKey ?? tomlApiKey;
 
+  const configuredProvider = asString(tomlEmbeddings.provider);
   const provider =
-    (asString(tomlEmbeddings.provider) as "gemini" | "none" | undefined) ??
-    (apiKey ? "gemini" : "none");
+    configuredProvider === "gemini" ||
+    configuredProvider === "openai-compatible" ||
+    configuredProvider === "none"
+      ? configuredProvider
+      : apiKey
+        ? "gemini"
+        : "none";
 
-  if (provider !== "gemini") return { provider };
+  if (provider === "none") return { provider };
+
+  if (provider === "openai-compatible") {
+    const env = (name: string): string | undefined => process.env[name];
+    return {
+      provider,
+      openaiCompatible: {
+        baseUrl:
+          env("PHANTOMBOT_OPENAI_COMPATIBLE_BASE_URL") ??
+          asString(tomlOpenAI.base_url) ??
+          "",
+        model:
+          env("PHANTOMBOT_OPENAI_COMPATIBLE_MODEL") ??
+          asString(tomlOpenAI.model) ??
+          "",
+        apiKey:
+          env("PHANTOMBOT_OPENAI_COMPATIBLE_API_KEY") ??
+          asString(tomlOpenAI.api_key) ??
+          "",
+        dims:
+          asInt(tomlOpenAI.dims) ??
+          asInt(env("PHANTOMBOT_OPENAI_COMPATIBLE_DIMS")) ??
+          0,
+        queryPrefix:
+          env("PHANTOMBOT_OPENAI_COMPATIBLE_QUERY_PREFIX") ??
+          asString(tomlOpenAI.query_prefix) ??
+          "",
+        documentPrefix:
+          env("PHANTOMBOT_OPENAI_COMPATIBLE_DOCUMENT_PREFIX") ??
+          asString(tomlOpenAI.document_prefix) ??
+          "",
+      },
+    };
+  }
 
   return {
     provider: "gemini",

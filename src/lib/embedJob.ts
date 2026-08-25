@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "../config.ts";
-import { geminiEmbed, type EmbedResult } from "./geminiEmbed.ts";
+import { resolveEmbedders, type Embedder } from "./embedder.ts";
 import type { MemoryIndex } from "./memoryIndex.ts";
 
 /** Roughly 6000 tokens of slack-padded room for Gemini's 8192 limit. */
@@ -27,14 +27,10 @@ export interface EmbedJobResult {
   errors: Array<{ path: string; chunkIdx: number; error: string }>;
 }
 
-export type Embedder = (text: string) => Promise<EmbedResult>;
+export type { Embedder } from "./embedder.ts";
 
 export function defaultEmbedder(config: Config): Embedder | undefined {
-  if (config.embeddings.provider !== "gemini") return undefined;
-  const g = config.embeddings.gemini;
-  if (!g?.apiKey) return undefined;
-  return (text) =>
-    geminiEmbed(g.apiKey, text, { model: g.model, dims: g.dims });
+  return resolveEmbedders(config).document;
 }
 
 export interface RunEmbedJobInput {
