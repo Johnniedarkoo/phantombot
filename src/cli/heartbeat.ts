@@ -103,6 +103,10 @@ export interface RunHeartbeatCliInput {
 
 /** Outcome of the heartbeat's incremental note-embed pass. */
 export interface EmbedNotesResult {
+  embeddedChunks?: number;
+  skippedChunks?: number;
+  failedChunks?: number;
+  /** Backward-compatible adapter fields for existing heartbeat callers. */
   embedded: number;
   skipped: number;
   failed: number;
@@ -191,12 +195,15 @@ export async function runHeartbeatCli(
       const e = input.embedNotes
         ? await input.embedNotes()
         : await defaultEmbedNotes(config, dir, persona);
-      if (e && (e.embedded > 0 || e.failed > 0)) {
-        noteEmbedLine = `, embedded ${e.embedded}`;
+      const embeddedChunks = e?.embeddedChunks ?? e?.embedded ?? 0;
+      const skippedChunks = e?.skippedChunks ?? e?.skipped ?? 0;
+      const failedChunks = e?.failedChunks ?? e?.failed ?? 0;
+      if (e && (embeddedChunks > 0 || failedChunks > 0)) {
+        noteEmbedLine = `, embedded ${embeddedChunks} chunks`;
         log.info("heartbeat: embedded fresh notes", {
-          embedded: e.embedded,
-          skipped: e.skipped,
-          failed: e.failed,
+          embeddedChunks,
+          skippedChunks,
+          failedChunks,
         });
       }
     } catch (e) {
@@ -308,8 +315,8 @@ export async function runHeartbeatCli(
 /**
  * Production note-embed pass: build the configured embedder and run an
  * incremental embed job over the note index. Returns `null` when no
- * embedder is configured (e.g. `embeddings.provider: "none"` or a missing
- * Gemini key) so the caller prints no embed line. Owns the MemoryIndex
+ * embedder is configured (e.g. `embeddings.provider: "none"` or missing
+ * provider credentials) so the caller prints no embed line. Owns the MemoryIndex
  * handle it opens and closes it in a finally.
  */
 async function defaultEmbedNotes(
@@ -327,7 +334,14 @@ async function defaultEmbedNotes(
       embedder,
       maxChunkChars: documentChunkChars(config)!,
     });
-    return { embedded: e.embedded, skipped: e.skipped, failed: e.failed };
+    return {
+      embedded: e.embeddedChunks,
+      skipped: e.skippedChunks,
+      failed: e.failedChunks,
+      embeddedChunks: e.embeddedChunks,
+      skippedChunks: e.skippedChunks,
+      failedChunks: e.failedChunks,
+    };
   } finally {
     ix.close();
   }

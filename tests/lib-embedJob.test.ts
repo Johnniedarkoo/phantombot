@@ -240,6 +240,9 @@ describe("runEmbedJob", () => {
       maxChunkChars: 18_000,
     });
     expect(r1.totalNotes).toBe(2);
+    expect(r1.totalFiles).toBe(2);
+    expect(r1.totalChunks).toBe(2);
+    expect(r1.embeddedChunks).toBe(2);
     expect(r1.embedded).toBe(2);
     expect(r1.skipped).toBe(0);
     expect(r1.failed).toBe(0);
@@ -320,6 +323,30 @@ describe("runEmbedJob", () => {
     expect(r.failed).toBe(0);
     expect(calls).toEqual(["x".repeat(10), "x".repeat(10), "x".repeat(5)]);
     expect(ix.embeddingCount()).toBe(3);
+  });
+
+  test("incremental re-chunking prunes obsolete tail chunks", async () => {
+    await note("kb/concepts/resize.md", "x".repeat(25));
+    await ix.refreshStale(personaDir);
+    await runEmbedJob({
+      personaDir,
+      index: ix,
+      embedder: fakeEmbedder(),
+      maxChunkChars: 10,
+    });
+    expect(ix.allEmbeddings()).toHaveLength(3);
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await note("kb/concepts/resize.md", "x".repeat(25));
+    await ix.refreshStale(personaDir);
+    const r = await runEmbedJob({
+      personaDir,
+      index: ix,
+      embedder: fakeEmbedder(),
+      maxChunkChars: 20,
+    });
+    expect(r.totalChunks).toBe(2);
+    expect(ix.allEmbeddings()).toHaveLength(2);
   });
 });
 
