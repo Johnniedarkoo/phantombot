@@ -24,8 +24,9 @@ because one Phantom — with its own memory and judgment — saw it through.
 decisions, lessons, people, and standing preferences, authored in the
 **[Open Knowledge Format](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing/)**
 (OKF — Google Cloud's open standard for agent knowledge) and searchable by
-*meaning* with Gemini embeddings + hybrid vector/keyword retrieval. No Gemini
-key? Memory still gets superpowers: OKF **field-weighted BM25** plus
+*meaning* with optional Gemini or OpenAI-compatible embeddings + hybrid
+vector/keyword retrieval. No embedding provider? Memory still gets superpowers:
+OKF **field-weighted BM25** plus
 **concept-graph expansion** — far sharper than plain keyword search. It doesn't
 reset between sessions; it accumulates. So the
 longer a Phantom works with you, the more it understands your code and your
@@ -530,7 +531,9 @@ Harness notes:
   the same provider (e.g. two OpenRouter keys), the merge-write replaces the
   previous key, and Pi's model catalog only uses the one on file.
 - Claude Code is normally authenticated with OAuth on the host.
-- Gemini remains available for optional semantic-memory embeddings via `phantombot embedding`; it is not an agent harness.
+- Gemini and OpenAI-compatible endpoints are available for optional
+  semantic-memory embeddings via `phantombot embedding`; they are not agent
+  harnesses.
 - Codex can use `codex login` or `OPENAI_API_KEY`.
 - `chain` order is primary to fallback.
 - **The whole `[harnesses]` block is per-persona.** Which brain a persona
@@ -1986,7 +1989,7 @@ phantombot memory index --rebuild
 phantombot memory backup
 ```
 
-### Memory search: OKF superpowers by default, Gemini semantic on top
+### Memory search: OKF superpowers by default, semantic providers on top
 
 Phantombot stores memory in the **[Open Knowledge Format](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing/)**
 (OKF) — Google Cloud's open, vendor-neutral standard for the knowledge AI
@@ -2057,10 +2060,16 @@ as you wrote it.
 > agents, not a document store for the operator. It is the agent's own recall.
 > OKF is the *format*; where a human-facing vault lives is a separate question.
 
-**Add Gemini embeddings** (optional, recommended for production) to layer true
-**semantic** retrieval on top — matching by *meaning*, not just words. With a
-key, search becomes **hybrid**: OKF field-weighted BM25 *and* vector similarity,
-fused with reciprocal-rank fusion.
+Add an embeddings provider (optional) to layer true **semantic** retrieval on
+top — matching by *meaning*, not just words. With a provider, search becomes
+**hybrid**: OKF field-weighted BM25 *and* vector similarity, fused with
+reciprocal-rank fusion. The three choices are:
+
+- `none` — local OKF field-weighted BM25 plus link-graph expansion; no network
+  service or key is required.
+- `gemini` — the existing Gemini embedding service.
+- `openai-compatible` — any standard `POST <base_url>/embeddings` service,
+  including a separately managed local llama.cpp `llama-server`.
 
 Enable it:
 
@@ -2088,6 +2097,48 @@ api_key = "AIza..."
 model = "gemini-embedding-001"
 dims = 1536
 ```
+
+For a local CPU-only llama.cpp server, start it separately from PhantomBot.
+The server's model and pooling must match the embedding GGUF's model card; for
+a mean-pooled embedding model, the shape is:
+
+```bash
+llama-server -m /path/to/embedding.gguf --embedding --pooling mean \
+  --host 127.0.0.1 --port 8082
+```
+
+Verify `http://127.0.0.1:8082/v1/embeddings` first, then choose
+`OpenAI-compatible` in `phantombot embedding`. The equivalent configuration is:
+
+```toml
+[embeddings]
+provider = "openai-compatible"
+
+[embeddings.openai_compatible]
+base_url = "http://127.0.0.1:8082/v1"
+model = "your-embedding-model"
+api_key = ""                 # optional for localhost
+query_prefix = ""            # optional model-specific instruction
+document_prefix = ""         # optional model-specific instruction
+# dims is detected and written by `phantombot embedding`
+```
+
+Prefixes are applied only at the provider boundary: `query_prefix` is used
+for retrieval queries, while `document_prefix` is used for notes, KB files,
+and conversation turns. PhantomBot does not start, stop, download, or manage
+the embedding server. Ollama, Qdrant, and MCP are not required.
+
+When changing the embedding provider, model, or prefixes, run:
+
+```bash
+phantombot memory index --reembed
+```
+
+This clears and rebuilds only derived vectors; source files, raw conversation
+turns, and FTS content/index data are preserved. Run it even when the old and
+new providers report the same dimension: equal dimensions do not imply the
+same vector space. If an embedding request fails, the interactive turn and
+memory search continue with lexical/OKF retrieval.
 
 Without embeddings, search degrades cleanly to OKF field-weighted BM25 with
 link-graph expansion — never to plain keyword.
