@@ -119,6 +119,7 @@ export type CompleteFn = (
   systemPrompt: string,
   userMessage: string,
   signal?: AbortSignal,
+  turnContext?: string,
 ) => Promise<string>;
 
 export interface JudgeOptions {
@@ -142,6 +143,8 @@ export interface JudgeOptions {
    * loaded, in which case JUDGE_SYSTEM is used — the unchanged fallback.
    */
   systemPrompt?: string;
+  /** Trusted PhantomBot context rendered after any prior history and before the untrusted user content. */
+  turnContext?: string;
   signal?: AbortSignal;
 }
 
@@ -318,7 +321,12 @@ export async function judgeThreat(
 
   let raw: string;
   try {
-    raw = await opts.complete(systemPrompt, userText, opts.signal);
+    raw = await opts.complete(
+      systemPrompt,
+      userText,
+      opts.signal,
+      opts.turnContext,
+    );
   } catch (e) {
     return { ok: false, error: `judge completion failed: ${(e as Error).message}` };
   }
@@ -337,6 +345,7 @@ export async function judgeThreat(
       systemPrompt,
       `${userText}\n\n${RETRY_NUDGE}`,
       opts.signal,
+      opts.turnContext,
     );
   } catch (e) {
     return {
@@ -447,10 +456,11 @@ export function makeHarnessJudgeComplete(
   // Floor at the running user's home so the judge spawn never inherits an
   // inaccessible ambient cwd (→ EACCES → silent fail-open).
   const cwd = workingDir ?? homedir();
-  return async (systemPrompt, userMessage, signal) => {
+  return async (systemPrompt, userMessage, signal, turnContext) => {
     const chunks: string[] = [];
     for await (const chunk of harness.invoke({
       systemPrompt,
+      ...(turnContext ? { turnContext } : {}),
       userMessage,
       history: [],
       // No persona: the judge is not Robbie, it is an inert classifier.

@@ -9,7 +9,12 @@ Date: 2026-08-26
 - Base: `09324c015adc1d1d1062f40d6123582f32cd699a`
 - Branch: `feature/cache-friendly-prompt-layout`
 
-The implementation keeps PhantomBot authoritative for history, retrieval, durable facts, daily recall, and persistence. The llama.cpp prompt/KV state remains disposable. The feature gate is `PHANTOMBOT_CACHE_FRIENDLY_PROMPT=1`; the off path retains the legacy composition.
+This document is historical benchmark evidence from the temporary A/B
+experiment. At that time, the implementation kept PhantomBot authoritative for
+history, retrieval, durable facts, daily recall, and persistence while the
+llama.cpp prompt/KV state remained disposable. The experiment used the
+`PHANTOMBOT_CACHE_FRIENDLY_PROMPT=1` gate and retained a legacy off path; the
+follow-up canonicalization removes both from production.
 
 ## Benchmark method
 

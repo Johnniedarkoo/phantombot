@@ -1,9 +1,10 @@
 /**
  * Construct the system prompt for a turn.
  *
- * Order matters. Persona first (most stable, most cacheable). Memory next.
- * Channel context (sender name, timestamp) last so the LRU prompt-cache on
- * the Anthropic side stays warm for the persona-and-memory prefix.
+ * Order matters. Persona, policy, and instructions form the stable system
+ * prompt. Per-turn PhantomBot context is rendered after conversation history
+ * by the harness payload helpers so downstream prompt/KV caches can reuse the
+ * common prefix.
  */
 
 import { OKF_AGENT_TYPES, OKF_CORE_TYPES } from "../lib/okf.js";
@@ -29,54 +30,6 @@ export interface ChannelContext {
 }
 
 export function buildSystemPrompt(
-  persona: PersonaFiles,
-  channelCtx: ChannelContext,
-  retrievedMemory?: string,
-  durableFacts?: string,
-  dailyRecall?: string,
-): string {
-  const sections = buildStableSections(persona, channelCtx);
-
-  // Durable facts established earlier in THIS conversation, pulled by a plain
-  // SQL read (no model call) at prompt-assembly time. Sits just above the
-  // embedding-based retrieved context: these are the standing, de-duplicated
-  // facts extracted at the eviction cliff, so they anchor the turn even after
-  // the originating messages have scrolled out of the verbatim window.
-  if (durableFacts && durableFacts.trim().length > 0) {
-    sections.push("# Durable facts\n\n" + durableFacts.trim());
-  }
-
-  if (retrievedMemory && retrievedMemory.trim().length > 0) {
-    sections.push("# Retrieved context for this turn\n\n" + retrievedMemory.trim());
-  }
-
-  // Daily journal. Selected in code (lib/dailyRecall.ts), not by prose the
-  // agent has to remember or an attacker can edit: today's file always,
-  // yesterday's ONLY when the ledger shows its sweep never completed. Sits
-  // last of the memory blocks because it is the most volatile — it changes
-  // within a single turn — so the cacheable prefix above it stays stable.
-  if (dailyRecall && dailyRecall.trim().length > 0) {
-    sections.push("# Daily journal\n\n" + dailyRecall.trim());
-  }
-
-  sections.push(
-    "# Channel context\n\n" +
-      `- Channel: ${channelCtx.channel}\n` +
-      `- Conversation: ${channelCtx.conversationId}\n` +
-      (channelCtx.senderName ? `- Sender: ${channelCtx.senderName}\n` : "") +
-      `- Time (UTC): ${channelCtx.timestamp.toISOString()}\n`,
-  );
-
-  return sections.join("\n\n");
-}
-
-/**
- * Build the stable/high-authority portion used by the cache-friendly path.
- * Volatile facts, retrieval, daily recall, and display-only channel metadata
- * are intentionally not accepted here. Security selection remains system
- * material because it is an authority boundary, not turn data.
- */
-export function buildStableSystemPrompt(
   persona: PersonaFiles,
   channelCtx: ChannelContext,
 ): string {

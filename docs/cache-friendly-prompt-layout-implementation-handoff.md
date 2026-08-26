@@ -1,4 +1,4 @@
-# Cache-friendly prompt layout implementation handoff
+# Cache-friendly prompt layout implementation handoff (historical)
 
 Branch: `feature/cache-friendly-prompt-layout`
 
@@ -6,7 +6,7 @@ Base: `09324c015adc1d1d1062f40d6123582f32cd699a` from `perf/pi-ttft-instrumentat
 
 Design: `docs/cache-friendly-prompt-layout-design.md`
 
-## What is already in place
+## What was implemented
 
 The branch now contains the two architectural seams the implementation should use rather than duplicating formatting logic in each adapter:
 
@@ -20,7 +20,10 @@ The branch now contains the two architectural seams the implementation should us
 - `tests/cache-friendly-prompt-layout.test.ts`
   - basic ordering, legacy-absence, context-format, and authority-contract tests
 
-These files are intentionally not wired into production yet. The branch should remain behavior-preserving until the remaining integration is completed coherently across the orchestrator and harnesses.
+The branch then wired these seams into production across the orchestrator and
+harnesses. The follow-up canonicalization removed the temporary gate and the
+legacy prompt construction; this handoff remains as historical implementation
+context.
 
 ## Required integration
 

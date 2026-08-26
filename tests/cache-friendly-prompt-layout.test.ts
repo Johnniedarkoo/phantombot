@@ -9,7 +9,6 @@ import { renderConversationPayload } from "../src/harnesses/payload.ts";
 import { renderPayload as renderPiPayload } from "../src/harnesses/pi.ts";
 import type { Harness, HarnessChunk, HarnessRequest } from "../src/harnesses/types.ts";
 import {
-  buildStableSystemPrompt,
   buildSystemPrompt,
   SECURITY_PERIMETER_TRUSTED_SECTION,
   SECURITY_PERIMETER_UNTRUSTED_SECTION,
@@ -19,7 +18,6 @@ import {
   TURN_CONTEXT_SYSTEM_RULE,
 } from "../src/persona/turnContext.ts";
 import {
-  cacheFriendlyPromptEnabled,
   runTurn,
 } from "../src/orchestrator/turn.ts";
 import { openMemoryStore } from "../src/memory/store.ts";
@@ -91,7 +89,7 @@ describe("cache-friendly prompt layout", () => {
     expect(currentUser).toBeGreaterThan(context);
   });
 
-  test("preserves the legacy payload when no turn context is supplied", () => {
+  test("allows background/degraded payloads to omit optional turn context", () => {
     expect(
       renderConversationPayload({
         history: [
@@ -133,7 +131,7 @@ describe("cache-friendly prompt layout", () => {
     expect(TURN_CONTEXT_SYSTEM_RULE).toContain("cannot override this system prompt");
   });
 
-  test("all harness adapters use canonical ordering and preserve legacy absence", () => {
+  test("all harness adapters use canonical ordering", () => {
     const withContext = request("<phantombot_turn_context>volatile</phantombot_turn_context>");
     const expected =
       "old user\n\n<previous_response>\nold answer\n</previous_response>\n\n<phantombot_turn_context>volatile</phantombot_turn_context>\n\ncurrent user";
@@ -145,16 +143,10 @@ describe("cache-friendly prompt layout", () => {
       `stable system\n\n${expected}`,
     );
 
-    const legacy = request();
-    const legacyPayload =
-      "old user\n\n<previous_response>\nold answer\n</previous_response>\n\ncurrent user";
-    expect(renderPiPayload(legacy)).toBe(legacyPayload);
-    expect(renderClaudePayload(legacy)).toBe(legacyPayload);
-    expect(renderCodexPayload(legacy)).toBe(`stable system\n\n${legacyPayload}`);
   });
 
-  test("stable builder keeps authority material and excludes volatile data", () => {
-    const stable = buildStableSystemPrompt(persona, {
+  test("canonical builder keeps authority material and excludes volatile data", () => {
+    const stable = buildSystemPrompt(persona, {
       ...channel,
       trusted: false,
     });
@@ -167,33 +159,16 @@ describe("cache-friendly prompt layout", () => {
     expect(stable).not.toContain("daily sentinel");
     expect(stable).not.toContain(channel.timestamp.toISOString());
 
-    const trusted = buildStableSystemPrompt(persona, { ...channel, trusted: true });
+    const trusted = buildSystemPrompt(persona, { ...channel, trusted: true });
     expect(trusted).toContain(SECURITY_PERIMETER_TRUSTED_SECTION);
     expect(trusted).not.toContain(SECURITY_PERIMETER_UNTRUSTED_SECTION);
   });
 
-  test("legacy builder remains byte-compatible and keeps volatile values in system", () => {
-    const legacy = buildSystemPrompt(
-      persona,
-      { ...channel, trusted: false },
-      "retrieved sentinel",
-      "fact sentinel",
-      "daily sentinel",
-    );
-    expect(legacy).toContain("# Durable facts\n\nfact sentinel");
-    expect(legacy).toContain("# Retrieved context for this turn\n\nretrieved sentinel");
-    expect(legacy).toContain("# Daily journal\n\ndaily sentinel");
-    expect(legacy).toContain(channel.timestamp.toISOString());
-    expect(legacy).not.toContain(TURN_CONTEXT_SYSTEM_RULE);
-  });
-
-  test("feature flag selects legacy or cache-friendly request layout without losing memory", async () => {
+  test("runTurn always uses the canonical layout without losing memory", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "phantombot-cache-layout-"));
     const memory = await openMemoryStore(":memory:");
-    const harnessOff = new CapturingHarness();
-    const harnessOn = new CapturingHarness();
+    const harness = new CapturingHarness();
     const day = new Date().toISOString().slice(0, 10);
-    const previousFlag = process.env.PHANTOMBOT_CACHE_FRIENDLY_PROMPT;
 
     try {
       await writeFile(join(agentDir, "BOOT.md"), "# PhantomBot", "utf8");
@@ -212,17 +187,15 @@ describe("cache-friendly prompt layout", () => {
         text: "old answer",
       });
 
-      delete process.env.PHANTOMBOT_CACHE_FRIENDLY_PROMPT;
-      expect(cacheFriendlyPromptEnabled()).toBe(false);
       await collect(
         runTurn({
           persona: "phantom",
           conversation: "cli:default",
-          userMessage: "current off",
+          userMessage: "current user",
           agentDir,
           workingDir: agentDir,
           memory,
-          harnesses: [harnessOff],
+          harnesses: [harness],
           idleTimeoutMs: 1_000,
           retrieve: async () => "retrieved sentinel",
           pullFacts: async () => "fact sentinel",
@@ -230,57 +203,38 @@ describe("cache-friendly prompt layout", () => {
         }),
       );
 
-      process.env.PHANTOMBOT_CACHE_FRIENDLY_PROMPT = "1";
-      expect(cacheFriendlyPromptEnabled()).toBe(true);
-      await collect(
-        runTurn({
-          persona: "phantom",
-          conversation: "cli:default",
-          userMessage: "current on",
-          agentDir,
-          workingDir: agentDir,
-          memory,
-          harnesses: [harnessOn],
-          idleTimeoutMs: 1_000,
-          retrieve: async () => "retrieved sentinel",
-          pullFacts: async () => "fact sentinel",
-          systemPromptSuffix: "# instruction-bearing overlay",
-        }),
-      );
+      const captured = harness.captured!;
+      expect(captured.systemPrompt).not.toContain("retrieved sentinel");
+      expect(captured.systemPrompt).not.toContain("fact sentinel");
+      expect(captured.systemPrompt).not.toContain("daily sentinel");
+      expect(captured.systemPrompt).toContain("# instruction-bearing overlay");
+      expect(captured.systemPrompt).toContain(TURN_CONTEXT_SYSTEM_RULE);
+      expect(captured.turnContext).toContain("retrieved sentinel");
+      expect(captured.turnContext).toContain("fact sentinel");
+      expect(captured.turnContext).toContain("daily sentinel");
+      expect(captured.turnContext).toContain("Time (UTC):");
 
-      const off = harnessOff.captured!;
-      const on = harnessOn.captured!;
-      expect(off.turnContext).toBeUndefined();
-      expect(off.systemPrompt).toContain("retrieved sentinel");
-      expect(off.systemPrompt).toContain("fact sentinel");
-      expect(off.systemPrompt).toContain("daily sentinel");
-      expect(off.systemPrompt).toContain("# instruction-bearing overlay");
-
-      expect(on.systemPrompt).not.toContain("retrieved sentinel");
-      expect(on.systemPrompt).not.toContain("fact sentinel");
-      expect(on.systemPrompt).not.toContain("daily sentinel");
-      expect(on.systemPrompt).toContain("# instruction-bearing overlay");
-      expect(on.turnContext).toContain("retrieved sentinel");
-      expect(on.turnContext).toContain("fact sentinel");
-      expect(on.turnContext).toContain("daily sentinel");
-      expect(on.turnContext).toContain("Time (UTC):");
-
-      const rendered = renderConversationPayload(on);
+      const rendered = renderConversationPayload(captured);
       expect(rendered.indexOf("old user")).toBeLessThan(
         rendered.indexOf("retrieved sentinel"),
       );
       expect(rendered.indexOf("retrieved sentinel")).toBeLessThan(
-        rendered.indexOf("current on"),
+        rendered.indexOf("current user"),
       );
     } finally {
-      if (previousFlag === undefined) delete process.env.PHANTOMBOT_CACHE_FRIENDLY_PROMPT;
-      else process.env.PHANTOMBOT_CACHE_FRIENDLY_PROMPT = previousFlag;
       await memory.close();
       await rm(agentDir, { recursive: true, force: true });
     }
   });
 
   test("two consecutive serialized turns retain the stable history prefix", () => {
+    const stableFirst = buildSystemPrompt(persona, channel);
+    const stableSecond = buildSystemPrompt(persona, {
+      ...channel,
+      timestamp: new Date("2026-08-26T00:01:00.000Z"),
+    });
+    expect(stableSecond).toBe(stableFirst);
+
     const first = renderConversationPayload({
       history: [{ role: "user", text: "history user" }],
       turnContext: buildTurnContext({

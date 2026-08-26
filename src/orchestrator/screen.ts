@@ -17,8 +17,9 @@
  *      reads the decisions/people/norms drawers VERBATIM — concatenated and
  *      hard-truncated at a shared DRAWERS_CAP_BYTES budget across all three,
  *      not per drawer; the cut is a raw byte slice, so it can land mid-entry —
- *      then composes them into the judge's system prompt via
- *      buildSystemPrompt + JUDGE_NARROWING.
+ *      then supplies them as PhantomBot-provided volatile context after the
+ *      canonical persona/system prompt via buildTurnContext. The judge's
+ *      narrowing instructions remain system-level.
  *      The judge therefore has the principal's real context — identity, prior
  *      rulings, known senders, documented norms — as verbatim text rather
  *      than snippets, which fixes the old "nuance lost to truncation" problem
@@ -105,6 +106,7 @@ import {
   buildSystemPrompt,
   type ChannelContext,
 } from "../persona/builder.ts";
+import { buildTurnContext } from "../persona/turnContext.ts";
 import { loadPersona, type PersonaFiles } from "../persona/loader.ts";
 import { loadPhantomchatPersonaConfig } from "../channels/phantomchat/personaStore.ts";
 import type { MemoryStore } from "../memory/store.ts";
@@ -302,11 +304,10 @@ export function makeScreener(
         // No harness available to screen with (empty chain) — fail open.
         return { ok: false, error: "no harness in chain for screening" };
       }
-      // Compose the judge's system prompt from the FULL narrowed persona: the
-      // persona's own system prompt (identity + MEMORY + the full drawers in
-      // the retrievedMemory slot), then JUDGE_NARROWING to collapse it to the
-      // one rating job. If the persona didn't load, systemPrompt stays
-      // undefined and threatJudge falls back to JUDGE_SYSTEM.
+      // Compose the judge's stable system prompt from the FULL narrowed
+      // persona, then put the current drawer briefing in PhantomBot's
+      // explicitly framed volatile context block. If the persona didn't load,
+      // systemPrompt stays undefined and threatJudge falls back to JUDGE_SYSTEM.
       const personaFiles = await loadPersonaFiles();
       let systemPrompt: string | undefined;
       if (personaFiles) {
@@ -317,10 +318,20 @@ export function makeScreener(
           trusted: false,
         };
         const drawersText = await readBriefingDrawers(config, persona);
-        systemPrompt =
-          buildSystemPrompt(personaFiles, untrustedCtx, drawersText) +
+        systemPrompt = buildSystemPrompt(personaFiles, untrustedCtx) +
           "\n\n" +
           JUDGE_NARROWING;
+        const turnContext = buildTurnContext({
+          retrievedMemory: drawersText,
+          channel: untrustedCtx,
+        });
+        return judgeThreat(content, {
+          complete,
+          priors: _priors,
+          systemPrompt,
+          turnContext,
+          signal,
+        });
       }
       // priors is intentionally empty in production — the persona context
       // replaces the old FTS briefing. The <briefing> channel still exists in

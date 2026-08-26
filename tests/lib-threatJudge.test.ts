@@ -250,6 +250,17 @@ describe("makeHarnessJudgeComplete", () => {
     expect(seen.req?.history).toEqual([]);
   });
 
+  it("passes trusted PhantomBot turn context through the canonical suffix", async () => {
+    const { harness, seen } = recordingHarness(
+      "gemini",
+      '{"score": 5, "reason": "ok", "question": ""}',
+    );
+    const context = "<phantombot_turn_context>drawer briefing</phantombot_turn_context>";
+    const complete = makeHarnessJudgeComplete(harness, 1000, 2000);
+    await complete("sys", "untrusted content", undefined, context);
+    expect(seen.req?.turnContext).toBe(context);
+  });
+
   it("spawns in an explicit cwd, never the ambient one (fail-open-on-EACCES fix)", async () => {
     // The judge must NEVER inherit the ambient cwd: an inaccessible cwd makes
     // the harness spawn EACCES, which would fail the screen OPEN. So an

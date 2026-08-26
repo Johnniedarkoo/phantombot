@@ -291,7 +291,7 @@ export function buildPromptParts(
   },
 ): PromptParts {
   return {
-    systemPrompt: buildStableSystemPrompt(persona, channelCtx),
+    systemPrompt: buildSystemPrompt(persona, channelCtx),
     turnContext: buildTurnContext(channelCtx, options),
   };
 }
@@ -437,9 +437,11 @@ Preferred order of work:
 
 Do not combine both changes in one benchmark. We want causal attribution.
 
-## Feature-gated experiment
+## Historical feature-gated experiment
 
-The first implementation should be reversible for A/B testing.
+The first implementation was reversible for A/B testing. The measured result is
+recorded in `docs/cache-friendly-prompt-layout-results.md`; the gate and the
+legacy architecture have since been removed.
 
 A temporary environment gate is sufficient, for example:
 
@@ -454,9 +456,10 @@ With the flag on, only prompt placement/order changes. Retrieval results,
 history window, memory writes, model choice, tools, provider settings, and
 reasoning settings remain unchanged.
 
-The flag is an experiment switch, not necessarily permanent product config. If
-the new layout wins and semantics are validated, remove the old layout rather
-than carrying two architectures indefinitely.
+This section documents the historical A/B mechanism only. The validated layout
+is now the one canonical production architecture: PhantomBot owns durable
+memory, volatile context follows conversation history, and downstream prompt/KV
+cache state is disposable acceleration.
 
 ## Acceptance tests
 
@@ -471,7 +474,7 @@ Lock the exact ordering contract:
 5. turn context appears before the current user message;
 6. historical rendering before the inserted context remains unchanged;
 7. no memory/retrieval content is lost;
-8. absent `turnContext` preserves legacy harness behavior.
+8. absent optional `turnContext` keeps background/degraded harness callers valid.
 
 ### Prefix-invariance test
 
@@ -604,7 +607,7 @@ Mitigation:
 - keep a stable system instruction defining how the block is interpreted;
 - keep all actual policy/instructions in system role;
 - add semantic regression tests;
-- benchmark on a feature flag before making it default.
+- benchmark behind a temporary gate before making it default.
 
 ### 5. Context-window eviction
 
@@ -635,12 +638,12 @@ This design does not:
 
 ## Recommended implementation campaign
 
-Implement only the cache-friendly layout behind the temporary feature gate,
-reuse the existing TTFT instrumentation, and run an A/B on sequential turns.
+The completed campaign implemented the cache-friendly layout, reused the
+existing TTFT instrumentation, and ran an A/B on sequential turns.
 
-If it produces the expected large prefill reduction, make the new layout the
-canonical stateless path and then evaluate persistent Pi/RPC separately for the
-remaining ~3-second process-start cost.
+The measured reduction was sufficient to make the new layout the canonical
+stateless path. Persistent Pi/RPC remains separate deferred work for the
+remaining process-start cost.
 
 If it does not produce a large reduction, do not immediately add RPC. First
 confirm whether Pi or llama.cpp inserts volatile prefix material / prevents

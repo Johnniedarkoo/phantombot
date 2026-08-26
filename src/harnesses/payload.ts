@@ -23,7 +23,7 @@ export interface ConversationPayloadInput {
 }
 
 /**
- * Render prior conversation in the legacy PhantomBot format, then append the
+ * Render prior conversation in PhantomBot's canonical format, then append the
  * volatile turn context and finally the current user message.
  *
  * This helper intentionally knows nothing about system prompts. Pi/Claude keep

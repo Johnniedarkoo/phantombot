@@ -52,7 +52,6 @@ import {
   workspaceLockNotice,
 } from "../lib/workspaceLock.ts";
 import {
-  buildStableSystemPrompt,
   buildSystemPrompt,
   CONFIRM_BEFORE_LONG_JOBS_INSTRUCTION,
   PRE_TOOL_NARRATION_INSTRUCTION,
@@ -68,10 +67,6 @@ import type { FactSource } from "../config.ts";
 import type { ScreenVerdict } from "./screen.ts";
 
 export const DEFAULT_HISTORY_LIMIT = 30;
-
-export function cacheFriendlyPromptEnabled(): boolean {
-  return process.env.PHANTOMBOT_CACHE_FRIENDLY_PROMPT === "1";
-}
 
 export interface TurnInput {
   /** Persona name — used for memory scoping and log clarity. */
@@ -488,7 +483,7 @@ async function* runTurnBody(
   }
 
   // Durable facts: a plain SQL pull of the top standing facts for this
-  // persona/conversation, injected into the "# Durable facts" slot. NO LLM on
+  // persona/conversation, injected into the volatile turn-context block. NO LLM on
   // this path (that's the whole point — it runs on every turn). Belt-and-
   // suspenders try/catch: pullFacts already swallows its own failures, but a
   // turn must never die on the fact read.
@@ -528,26 +523,13 @@ async function* runTurnBody(
     timestamp: new Date(),
     trusted: input.trusted === true,
   };
-  const cacheFriendly = cacheFriendlyPromptEnabled();
-  let baseSystemPrompt: string;
-  let turnContext: string | undefined;
-  if (cacheFriendly) {
-    baseSystemPrompt = buildStableSystemPrompt(persona, channelCtx);
-    turnContext = buildTurnContext({
-      durableFacts,
-      retrievedMemory,
-      dailyRecall,
-      channel: channelCtx,
-    });
-  } else {
-    baseSystemPrompt = buildSystemPrompt(
-      persona,
-      channelCtx,
-      retrievedMemory,
-      durableFacts,
-      dailyRecall,
-    );
-  }
+  const baseSystemPrompt = buildSystemPrompt(persona, channelCtx);
+  const turnContext = buildTurnContext({
+    durableFacts,
+    retrievedMemory,
+    dailyRecall,
+    channel: channelCtx,
+  });
   // Channel-layer overlays in append order:
   //   1. systemPromptSuffix — caller-provided (e.g. Telegram's
   //      reply-style + voice-brevity rules; nightly's distillation
