@@ -186,8 +186,11 @@ export async function runEmbeddingPreflight(input: {
       return r.ok
         ? { ok: true, path }
         : { ok: false, path, error: r.error };
-    } catch (e) {
-      return { ok: false, path, error: (e as Error).message };
+    } catch {
+      // Match runEmbedJob: an index row can outlive a note deleted from disk.
+      // Preflight runs before refreshStale, so unreadable stale candidates must
+      // not prevent a later readable document from probing the provider.
+      continue;
     }
   }
   const turn = input.index.allTurnDocuments()[0];

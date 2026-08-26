@@ -40,4 +40,37 @@ describe("resolveEmbedders", () => {
     expect(requests.map((r) => r.input)).toEqual(["query: where?", "passage: fact"]);
     expect(requests.every((r) => r.signal === signal)).toBe(true);
   });
+
+  test("openai-compatible fails closed when dimensions are missing", () => {
+    expect(
+      resolveEmbedders({
+        embeddings: {
+          provider: "openai-compatible",
+          openaiCompatible: {
+            baseUrl: "http://localhost/v1",
+            model: "m",
+            apiKey: "",
+            dims: 0,
+            queryPrefix: "query: ",
+            documentPrefix: "passage: ",
+          },
+        },
+      } as never),
+    ).toEqual({});
+  });
+
+  test("gemini fails closed when dimensions are missing", () => {
+    expect(
+      resolveEmbedders({
+        embeddings: {
+          provider: "gemini",
+          gemini: {
+            apiKey: "test-key",
+            model: "gemini-embedding-001",
+            dims: 0,
+          },
+        },
+      } as never),
+    ).toEqual({});
+  });
 });

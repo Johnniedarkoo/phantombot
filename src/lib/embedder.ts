@@ -35,22 +35,21 @@ export function resolveEmbedders(
 
   if (embeddings.provider === "gemini") {
     const g = embeddings.gemini;
-    if (!g?.apiKey) return {};
+    const space = embeddingSpaceForConfig(embeddings);
+    if (!g?.apiKey || !space) return {};
     const embed = Object.assign(((text: string, signal?: AbortSignal) =>
       geminiEmbed(g.apiKey, text, {
         model: g.model,
         dims: g.dims,
         signal,
         fetchImpl: opts.fetchImpl,
-      })) as Embedder, {
-      space: embeddingSpaceForConfig(embeddings),
-    });
+      })) as Embedder, { space });
     return { query: embed, document: embed };
   }
 
   const o = embeddings.openaiCompatible;
-  if (!o?.baseUrl || !o.model) return {};
   const space = embeddingSpaceForConfig(embeddings);
+  if (!o?.baseUrl || !o.model || !space) return {};
   const make = (prefix: string): Embedder => Object.assign((
     (text: string, signal?: AbortSignal) =>
       openaiCompatibleEmbed(`${prefix}${text}`, {
