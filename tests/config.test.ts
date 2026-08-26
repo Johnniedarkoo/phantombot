@@ -105,7 +105,7 @@ const ENV_KEYS = [
   "PHANTOMBOT_TELEGRAM_VOICE_MAX_SENTENCES",
   "PHANTOMBOT_CHATTINESS",
   "PHANTOMBOT_PROMPT_CACHE_ENABLED",
-  "PHANTOMBOT_PROMPT_CACHE_MAX_EPOCH_TOKENS",
+  "PHANTOMBOT_PROMPT_CACHE_MAX_EPOCH_BYTES",
   "PHANTOMBOT_UPDATE_CHANNEL",
   "PHANTOMBOT_P2P_ENABLED",
   "PHANTOMBOT_P2P_PORT",
@@ -264,20 +264,21 @@ describe("loadConfig — prompt-cache settings", () => {
   test("is disabled by default", async () => {
     const c = await loadConfig();
     expect(c.promptCache).toEqual(DEFAULT_PROMPT_CACHE);
+    expect(DEFAULT_PROMPT_CACHE.maxEpochBytes).toBe(80_000);
   });
 
   test("reads one TOML switch and epoch ceiling", async () => {
-    await writeConfig(`[prompt_cache]\nenabled = true\nmax_epoch_tokens = 64000\n`);
+    await writeConfig(`[prompt_cache]\nenabled = true\nmax_epoch_bytes = 64000\n`);
     const c = await loadConfig();
-    expect(c.promptCache).toEqual({ enabled: true, maxEpochTokens: 64000 });
+    expect(c.promptCache).toEqual({ enabled: true, maxEpochBytes: 64000 });
   });
 
   test("environment values override the same prompt-cache table", async () => {
-    await writeConfig(`[prompt_cache]\nenabled = false\nmax_epoch_tokens = 64000\n`);
+    await writeConfig(`[prompt_cache]\nenabled = false\nmax_epoch_bytes = 64000\n`);
     process.env.PHANTOMBOT_PROMPT_CACHE_ENABLED = "true";
-    process.env.PHANTOMBOT_PROMPT_CACHE_MAX_EPOCH_TOKENS = "72000";
+    process.env.PHANTOMBOT_PROMPT_CACHE_MAX_EPOCH_BYTES = "72000";
     const c = await loadConfig();
-    expect(c.promptCache).toEqual({ enabled: true, maxEpochTokens: 72000 });
+    expect(c.promptCache).toEqual({ enabled: true, maxEpochBytes: 72000 });
   });
 });
 
