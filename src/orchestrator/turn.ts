@@ -58,14 +58,11 @@ import { isNightlyConversation } from "../lib/nightly.ts";
 import type { Harness, HarnessChunk } from "../harnesses/types.ts";
 import type { ToolCallDetail } from "../harnesses/toolNote.ts";
 import type { MemoryStore, TurnOrigin } from "../memory/store.ts";
-import type { FactSource } from "../config.ts";
+import { DEFAULT_PROMPT_CACHE, type FactSource, type PromptCacheSettings } from "../config.ts";
 import type { ScreenVerdict } from "./screen.ts";
+import { promptCacheEpochs } from "./promptCache.ts";
 
 export const DEFAULT_HISTORY_LIMIT = 30;
-
-export function cacheFriendlyPromptEnabled(): boolean {
-  return process.env.PHANTOMBOT_CACHE_FRIENDLY_PROMPT === "1";
-}
 
 export interface TurnInput {
   /** Persona name — used for memory scoping and log clarity. */
@@ -112,6 +109,8 @@ export interface TurnInput {
   startupTimeoutMs?: number;
   /** Number of prior turns to load. Default 30. */
   historyLimit?: number;
+  /** One opt-in setting for stable ordering and bounded prompt-cache epochs. */
+  promptCache?: PromptCacheSettings;
   /** Skip loading prior turns AND skip persisting this one. Default false. */
   noHistory?: boolean;
   /** Extra text appended to the system prompt. Used by nightly to inject distillation directives. */
@@ -465,7 +464,7 @@ async function* runTurnBody(
     timestamp: new Date(),
     trusted: input.trusted === true,
   };
-  const cacheFriendly = cacheFriendlyPromptEnabled();
+  const cacheFriendly = input.promptCache?.enabled === true;
   let baseSystemPrompt: string;
   let turnContext: string | undefined;
   if (cacheFriendly) {
@@ -592,6 +591,19 @@ async function* runTurnBody(
       ? baseSystemPrompt + "\n\n" + overlays.join("\n\n")
       : baseSystemPrompt;
 
+  const epochPlan = !input.noHistory
+    ? promptCacheEpochs.prepare({
+        settings: input.promptCache ?? DEFAULT_PROMPT_CACHE,
+        persona: input.persona,
+        conversation: input.conversation,
+        systemPrompt,
+        history,
+        historyLimit: input.historyLimit ?? DEFAULT_HISTORY_LIMIT,
+        turnContext,
+        userMessage: input.userMessage,
+      })
+    : undefined;
+
   let finalText = "";
   let succeeded = false;
 
@@ -651,7 +663,10 @@ async function* runTurnBody(
         systemPrompt,
         ...(turnContext ? { turnContext } : {}),
         userMessage: input.userMessage,
-        history,
+        history: [...(epochPlan?.baseHistory ?? history)],
+        ...(epochPlan?.epochTurns.length
+          ? { epochTurns: [...epochPlan.epochTurns] }
+          : {}),
         persona: input.persona,
         conversation: input.conversation,
         // #405: lets `phantombot workspace lock/unlock` attribute a claim to the
@@ -775,6 +790,14 @@ async function* runTurnBody(
         .catch(() => {
           // Out-of-band extraction must never surface to the user.
         });
+    }
+  }
+
+  if (epochPlan) {
+    if (succeeded && !input.noHistory) {
+      promptCacheEpochs.complete(epochPlan, finalText);
+    } else {
+      promptCacheEpochs.fail(epochPlan);
     }
   }
 }
