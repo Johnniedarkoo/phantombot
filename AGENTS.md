@@ -173,13 +173,18 @@ phantombot/
 - **Credential bootstrap** (`lib/vaultMigrate.ts` → `lib/vault.ts`) imports any legacy plaintext `.env` into the per-persona encrypted vaults ONCE, then `loadVaultIntoEnv()` injects the active persona's secrets into `process.env` at startup; each harness reloads that vault before every spawn so `phantombot vault set` takes effect mid-session. Nothing reads a `.env` file at runtime (#452).
 - **Tick fires scheduled tasks** (`src/cli/tick.ts`); 1-minute systemd timer; lockfile prevents overlap; missed runs are skipped, not piled up.
 - **Heartbeat is mechanical** (no LLM); **nightly is cognitive** (LLM-driven distillation).
-- **Prompt layout keeps PhantomBot authoritative.** The orchestrator owns
-  history, retrieval, durable facts, daily recall, and restart reconstruction.
-  The temporary `PHANTOMBOT_CACHE_FRIENDLY_PROMPT=1` experiment keeps persona,
+- **Prompt-cache optimization keeps PhantomBot authoritative.** The
+  orchestrator owns history, retrieval, durable facts, daily recall, and
+  restart reconstruction. The opt-in `[prompt_cache]` feature keeps persona,
   policy, security, and instruction-bearing overlays in the system prompt,
   then renders volatile PhantomBot context after canonical history and before
-  the current user message. The llama.cpp/Pi cache is disposable acceleration
-  only; it is never a source of durable memory.
+  the current user message. Its in-process epoch manager appends completed
+  context/user/assistant triples until a conservative prompt budget requires a
+  deterministic rebase from canonical history. Epoch state is disposable: it
+  contains no SQLite rows, Pi sessions, llama.cpp slots, KV blobs, or backend
+  handles. The feature is OFF by default; the llama.cpp/Pi cache is never a
+  source of durable memory, and a backend that cannot reuse exact prefixes
+  still receives correct prompts.
 - **`workingDir` is REQUIRED on every `runTurn` call** (#387) — the harness subprocess cwd, deliberately with no default. Interactive surfaces (telegram, phantomchat, ask, tick, reactions) pass `homedir()`, because the owner asks for work on repos all over their home dir. Machine-driven background turns (nightly) pass the **persona dir**. This used to silently default to `homedir()` and every background caller took the default, so nightly stages woke up in `$HOME` unable to see their own `memory/` from cwd — and went hunting for it. On macOS those recursive walks cross `~/Library/Containers`, tripping the TCC `kTCCServiceSystemPolicyAppData` prompt ("phantombot would like to access data from other apps") once per spawned date. If you add a `runTurn` caller, decide which tree it may treat as home and say so explicitly.
 
 ## Channel layer (core + adapters)
@@ -398,14 +403,16 @@ version string can't carry that information.
 9. **Adding a new harness — three places that must be touched, not one.** `src/harnesses/buildChain.ts` (factory: instantiate the wrapper class), `src/cli/harness.ts` (`SUPPORTED_HARNESSES` for the TUI + `detectAvailability` for the binary-on-PATH check), and `src/config.ts` (Config type slot + loader for `[harnesses.<id>]`). Plus inline test fixtures across ~12 files that have a literal Config object. If you forget any, typecheck + tests catch it — but it's tedious; the buildChain.ts extraction was specifically to retire the *fourth* duplicate that was about to land with each new harness. Gemini CLI is retired; Gemini embeddings remain under `[embeddings]`.
 10. **Channel-specific behavior belongs in the channel layer, not in personas.** Brevity for voice replies, formatting for Slack, etc. should be appended to the system prompt at the channel boundary (see `VOICE_REPLY_INSTRUCTION` in `src/channels/core/prompts.ts`, passed via `runTurn`'s `systemPromptSuffix`). Putting "be brief on voice" in a persona's BOOT.md/SOUL.md throttles text replies too — and persists across all the persona's contexts where verbosity is fine. Channel-layer suffixes are scoped to the turn that needs them.
 
-11. **Volatile turn context must stay after history.** When working on the
-cache-friendly prompt experiment, keep high-authority persona/policy/security
-material in `systemPrompt`, and use `HarnessRequest.turnContext` for the
-current turn's facts, retrieval, daily recall, and display-only channel data.
-Adapters must use `renderConversationPayload()` so the order remains history →
-turn context → current user message. Do not make llama.cpp cache state a second
-memory owner, and do not move trusted/untrusted policy or instruction-bearing
-overlays into the data block.
+11. **Prompt-cache ordering and epochs must stay disposable.** The opt-in
+`[prompt_cache]` feature keeps high-authority persona/policy/security material
+in `systemPrompt`, uses `HarnessRequest.turnContext` for the current turn's
+facts, retrieval, daily recall, and display-only channel data, and carries
+completed triples in `HarnessRequest.epochTurns`. Adapters must use
+`renderConversationPayload()` so the order remains canonical history → retained
+epoch context/user/assistant triples → current turn context → current user.
+The orchestrator owns epoch state above the harnesses; it must never become a
+second memory owner or persist llama.cpp/Pi cache handles. Do not move
+trusted/untrusted policy or instruction-bearing overlays into the data block.
 
 11. **Reply modality is mirror-input by default, with a per-message text override available.** `processChatMessage` in `src/channels/core/engine.ts` picks the wire format (sendMessage vs sendVoice) via `replyModalityOverride()` from `src/lib/audio.ts`: when the user's message (post-STT, so voice transcripts count) contains an explicit directive like *"reply in text"*, *"no voice"*, or *"send a voice note"*, that wins; otherwise modality mirrors input. The override is parsed by a small, deliberately conservative regex set — anchored on reply-verbs and unmistakable shorthand, no bare-noun matches ("text message to John" must not trigger). Voice is still capped by `ttsSupported(config)`: an override asking for voice when no TTS provider is configured degrades to text gracefully, same as the original no-TTS fallback. If you extend the regex set, add cases to `replyModalityOverride` in `tests/lib-audio.test.ts` AND to the three end-to-end scenarios in `tests/channels-telegram.test.ts` (voice-in→text, text-in→voice, text-in→voice-without-TTS).
 
