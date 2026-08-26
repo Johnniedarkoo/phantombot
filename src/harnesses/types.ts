@@ -30,6 +30,8 @@ export interface HarnessRequest {
    * message. Optional so background/degraded callers remain compatible.
    */
   turnContext?: string;
+  /** Completed cache-epoch turns, rendered after canonical history. */
+  epochTurns?: readonly import("./payload.ts").PromptEpochTurn[];
   /** The new user message to respond to. */
   userMessage: string;
   /** Prior turns of this conversation, oldest first. May be empty. */

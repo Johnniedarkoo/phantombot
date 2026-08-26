@@ -13,6 +13,8 @@ import type { HistoryTurn } from "./types.ts";
  */
 export interface ConversationPayloadInput {
   history: readonly HistoryTurn[];
+  /** Completed turns retained by the orchestrator's current cache epoch. */
+  epochTurns?: readonly PromptEpochTurn[];
   /**
    * Volatile PhantomBot-provided context for this request only: retrieved
    * memory, durable facts, daily recall, timestamp/channel metadata, etc.
@@ -44,9 +46,25 @@ export function renderConversationPayload(
     }
   }
 
+  for (const turn of input.epochTurns ?? []) {
+    const turnContext = turn.turnContext.trim();
+    if (turnContext) parts.push(turnContext);
+    parts.push(turn.userMessage);
+    parts.push(
+      `<previous_response>\n${turn.assistantMessage}\n</previous_response>`,
+    );
+  }
+
   const turnContext = input.turnContext?.trim();
   if (turnContext) parts.push(turnContext);
 
   parts.push(input.userMessage);
   return parts.join("\n\n");
+}
+
+export interface PromptEpochTurn {
+  /** Context supplied immediately before this historical user turn. */
+  turnContext: string;
+  userMessage: string;
+  assistantMessage: string;
 }
