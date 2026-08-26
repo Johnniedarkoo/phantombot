@@ -171,6 +171,13 @@ phantombot builds the persona prompt, loads relevant memory, sends the turn to
 the harness, and relays the final answer to Telegram. The harness performs the
 SSH, file edits, searches, and command execution through its native tool loop.
 
+PhantomBot remains the owner of conversation history and durable memory. The
+cache-friendly prompt experiment (`PHANTOMBOT_CACHE_FRIENDLY_PROMPT=1`) keeps
+persona instructions and security policy in the system prompt, then places the
+current turn's retrieved context, durable facts, daily recall, and channel
+metadata after canonical history and before the current message. Any llama.cpp
+or Pi prompt cache is disposable acceleration; losing it never loses memory.
+
 ## Install
 
 ```bash

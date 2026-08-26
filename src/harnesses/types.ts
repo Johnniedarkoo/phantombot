@@ -18,8 +18,18 @@ export interface HistoryTurn {
 }
 
 export interface HarnessRequest {
-  /** The agent's full system prompt (persona + retrieved memory + channel context). */
+  /**
+   * High-authority system material: persona identity, policy, instructions,
+   * security rules, and instruction-bearing overlays. On the cache-friendly
+   * path this deliberately excludes volatile PhantomBot turn context.
+   */
   systemPrompt: string;
+  /**
+   * Volatile PhantomBot-provided context for THIS turn. When present,
+   * adapters place it after canonical history and before the current user
+   * message. Optional so background/degraded callers remain compatible.
+   */
+  turnContext?: string;
   /** The new user message to respond to. */
   userMessage: string;
   /** Prior turns of this conversation, oldest first. May be empty. */
