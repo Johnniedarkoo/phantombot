@@ -145,3 +145,26 @@ trimming or summarization, selective context dropping, KV save/restore, SSD
 storage, embedding changes, reasoning changes, or a second memory store. A
 future optimization must preserve PhantomBot's canonical durable-state
 ownership and keep cache state disposable.
+
+## Operational telemetry
+
+When `[prompt_cache].enabled = true`, the orchestrator emits one INFO JSON
+line per eligible turn with `msg: "prompt_cache.epoch"`. The safe fields are
+`event`, `persona`, `conversation`, `base_history_turns`, `epoch_turns`,
+`prompt_bytes`, `max_epoch_bytes`, and `retain_epoch`. `prompt_bytes` is the
+same rendered UTF-8 measurement used by the epoch ceiling. Budget rebases also
+include `projected_epoch_bytes`, the pre-rebase projection.
+
+`event` is one of `new`, `append`, `rebase`, or `bypass`. `new` carries
+`reason: "no_state"`; `rebase` carries `rebase_reason`; and `bypass` carries
+`bypass_reason`. Reasons currently emitted are `no_state`, `budget`,
+`system_changed`, `history_changed`, `concurrent_turn`, `oversized_base`, and
+`no_history`. When multiple invalidation conditions are true, the deterministic
+precedence is `no_state`, `concurrent_turn`, `system_changed`,
+`history_changed`, then `budget`; a request that remains over the ceiling after
+rebasing is reported as `bypass/oversized_base`.
+
+These are operational measurements only. No prompt, user or assistant text,
+retrieved memory, durable fact, daily recall, system/persona content, tool
+argument, or reversible content hash is logged. Telemetry does not become cache
+state and is not persisted as conversation data.

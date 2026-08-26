@@ -342,6 +342,236 @@ describe("cache-friendly prompt layout", () => {
     expect(plan.retainEpoch).toBe(false);
   });
 
+  test("classifies prompt-cache lifecycle decisions with safe metadata", () => {
+    const manager = new PromptCacheEpochManager();
+    const settings = { enabled: true, maxEpochBytes: 100 };
+    const base = {
+      settings,
+      persona: "phantom",
+      conversation: "cli:telemetry",
+      systemPrompt: "stable",
+      history: [],
+      turnContext: "context",
+    };
+    const first = manager.prepare({ ...base, userMessage: "one" })!;
+    expect(first.event).toBe("new");
+    expect(first.reason).toBe("no_state");
+    expect(first.baseHistory).toHaveLength(0);
+    expect(first.epochTurns).toHaveLength(0);
+    expect(first.promptBytes).toBe(
+      estimatePromptBytes({
+        systemPrompt: "stable",
+        history: [],
+        turnContext: "context",
+        userMessage: "one",
+      }),
+    );
+    manager.complete(first, "answer one");
+
+    const append = manager.prepare({
+      ...base,
+      history: [
+        { role: "user", text: "one" },
+        { role: "assistant", text: "answer one" },
+      ],
+      userMessage: "two",
+    })!;
+    expect(append.event).toBe("append");
+    expect(append.reason).toBeUndefined();
+    expect(append.epochTurns).toHaveLength(1);
+
+    const concurrent = manager.prepare({ ...base, userMessage: "three" })!;
+    expect(concurrent.event).toBe("rebase");
+    expect(concurrent.reason).toBe("concurrent_turn");
+    manager.fail(concurrent);
+  });
+
+  test("classifies budget, system, history, and oversized-base decisions", () => {
+    const manager = new PromptCacheEpochManager();
+    const first = manager.prepare({
+      settings: { enabled: true, maxEpochBytes: 75 },
+      persona: "phantom",
+      conversation: "cli:reasons",
+      systemPrompt: "s",
+      history: [],
+      turnContext: "c",
+      userMessage: "u",
+    })!;
+    manager.complete(first, "a");
+    const budget = manager.prepare({
+      settings: { enabled: true, maxEpochBytes: 75 },
+      persona: "phantom",
+      conversation: "cli:reasons",
+      systemPrompt: "s",
+      history: [
+        { role: "user", text: "u" },
+        { role: "assistant", text: "a" },
+      ],
+      turnContext: "c".repeat(20),
+      userMessage: "u2",
+    })!;
+    expect(budget.event).toBe("rebase");
+    expect(budget.reason).toBe("budget");
+    expect(budget.projectedEpochBytes).toBeGreaterThan(budget.promptBytes);
+    manager.complete(budget, "a2");
+
+    const system = manager.prepare({
+      settings: { enabled: true, maxEpochBytes: 400 },
+      persona: "phantom",
+      conversation: "cli:reasons",
+      systemPrompt: "changed",
+      history: [
+        { role: "user", text: "u" },
+        { role: "assistant", text: "a" },
+        { role: "user", text: "u2" },
+        { role: "assistant", text: "a2" },
+      ],
+      turnContext: "c",
+      userMessage: "u3",
+    })!;
+    expect(system.event).toBe("rebase");
+    expect(system.reason).toBe("system_changed");
+    manager.complete(system, "a3");
+
+    const history = manager.prepare({
+      settings: { enabled: true, maxEpochBytes: 400 },
+      persona: "phantom",
+      conversation: "cli:reasons",
+      systemPrompt: "changed",
+      history: [{ role: "user", text: "edited" }],
+      turnContext: "c",
+      userMessage: "u4",
+    })!;
+    expect(history.event).toBe("rebase");
+    expect(history.reason).toBe("history_changed");
+    manager.fail(history);
+
+    const oversized = manager.prepare({
+      settings: { enabled: true, maxEpochBytes: 2 },
+      persona: "phantom",
+      conversation: "cli:oversized",
+      systemPrompt: "stable",
+      history: [],
+      turnContext: "context",
+      userMessage: "user",
+    })!;
+    expect(oversized.event).toBe("bypass");
+    expect(oversized.reason).toBe("oversized_base");
+    expect(oversized.retainEpoch).toBe(false);
+    manager.fail(oversized);
+  });
+
+  test("feature-off decisions return no plan and emit no cache telemetry", () => {
+    const manager = new PromptCacheEpochManager();
+    const lines: string[] = [];
+    const originalWrite = process.stderr.write;
+    process.stderr.write = ((chunk: unknown) => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      expect(
+        manager.prepare({
+          settings: { enabled: false, maxEpochBytes: 100 },
+          persona: "prompt text persona",
+          conversation: "conversation with user text",
+          systemPrompt: "private system prompt",
+          history: [{ role: "user", text: "user secret" }],
+          turnContext: "retrieval secret",
+          userMessage: "assistant secret",
+        }),
+      ).toBeUndefined();
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    expect(lines.some((line) => line.includes('"msg":"prompt_cache.epoch"'))).toBe(false);
+  });
+
+  test("logs the safe lifecycle schema and no-history bypass", () => {
+    const manager = new PromptCacheEpochManager();
+    const lines: string[] = [];
+    const originalWrite = process.stderr.write;
+    process.stderr.write = ((chunk: unknown) => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      manager.prepare({
+        settings: { enabled: true, maxEpochBytes: 200 },
+        persona: "persona-id",
+        conversation: "conversation-id",
+        systemPrompt: "system secret",
+        history: [{ role: "user", text: "user secret" }],
+        turnContext: "retrieval secret",
+        userMessage: "current user secret",
+      });
+      manager.bypass(
+        {
+          settings: { enabled: true, maxEpochBytes: 200 },
+          persona: "persona-id",
+          conversation: "conversation-id",
+          systemPrompt: "system secret",
+          history: [],
+          turnContext: "retrieval secret",
+          userMessage: "current user secret",
+        },
+        "no_history",
+      );
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    const events = lines
+      .filter((line) => line.includes('"msg":"prompt_cache.epoch"'))
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({
+      msg: "prompt_cache.epoch",
+      event: "new",
+      reason: "no_state",
+      persona: "persona-id",
+      conversation: "conversation-id",
+      base_history_turns: 1,
+      epoch_turns: 0,
+      max_epoch_bytes: 200,
+      retain_epoch: true,
+    });
+    expect(events[1]).toMatchObject({
+      event: "bypass",
+      bypass_reason: "no_history",
+      base_history_turns: 0,
+      epoch_turns: 0,
+      retain_epoch: false,
+    });
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain("system secret");
+    expect(serialized).not.toContain("user secret");
+    expect(serialized).not.toContain("retrieval secret");
+    expect(serialized).not.toContain("current user secret");
+  });
+
+  test("telemetry metadata contains no prompt, retrieval, or turn contents", () => {
+    const manager = new PromptCacheEpochManager();
+    const plan = manager.prepare({
+      settings: { enabled: true, maxEpochBytes: 200 },
+      persona: "persona-id",
+      conversation: "conversation-id",
+      systemPrompt: "system secret",
+      history: [{ role: "user", text: "user secret" }],
+      turnContext: "retrieval secret",
+      userMessage: "current user secret",
+    })!;
+    const metadata = {
+      event: plan.event,
+      reason: plan.reason,
+      promptBytes: plan.promptBytes,
+      epochTurnCount: plan.epochTurns.length,
+      retainEpoch: plan.retainEpoch,
+    };
+    expect(JSON.stringify(metadata)).not.toContain("secret");
+    expect(JSON.stringify(metadata)).not.toContain("system");
+    manager.fail(plan);
+  });
+
   test("keeps payload N as an exact textual prefix of payload N+1", () => {
     // This proves PhantomBot's serialized payload property only. Pi, Claude,
     // and Codex are stateless CLI harnesses: their next model input can have a
