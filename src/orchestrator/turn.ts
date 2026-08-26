@@ -591,18 +591,19 @@ async function* runTurnBody(
       ? baseSystemPrompt + "\n\n" + overlays.join("\n\n")
       : baseSystemPrompt;
 
-  const epochPlan = !input.noHistory
-    ? promptCacheEpochs.prepare({
-        settings: input.promptCache ?? DEFAULT_PROMPT_CACHE,
-        persona: input.persona,
-        conversation: input.conversation,
-        systemPrompt,
-        history,
-        historyLimit: input.historyLimit ?? DEFAULT_HISTORY_LIMIT,
-        turnContext,
-        userMessage: input.userMessage,
-      })
-    : undefined;
+  const promptCacheInput = {
+    settings: input.promptCache ?? DEFAULT_PROMPT_CACHE,
+    persona: input.persona,
+    conversation: input.conversation,
+    systemPrompt,
+    history,
+    historyLimit: input.historyLimit ?? DEFAULT_HISTORY_LIMIT,
+    turnContext,
+    userMessage: input.userMessage,
+  };
+  const epochPlan = input.noHistory
+    ? (promptCacheEpochs.bypass(promptCacheInput, "no_history"), undefined)
+    : promptCacheEpochs.prepare(promptCacheInput);
 
   let finalText = "";
   let succeeded = false;
