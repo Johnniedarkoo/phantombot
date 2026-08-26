@@ -38,7 +38,8 @@ import {
   memoryIndexPath,
   type RetrievalSettings,
 } from "../config.ts";
-import { geminiEmbed } from "../lib/geminiEmbed.ts";
+import { resolveEmbedders } from "../lib/embedder.ts";
+import { embeddingSpaceForConfig } from "../lib/embeddingSpace.ts";
 import { log } from "../lib/logger.ts";
 import {
   allowedAudiencesForRoom,
@@ -74,7 +75,7 @@ export interface RetrieveContextOptions {
    */
   conversation?: string;
   signal?: AbortSignal;
-  /** Injectable fetch for tests (passed through to geminiEmbed). */
+  /** Injectable fetch for tests (passed through to the configured embedder). */
   fetchImpl?: typeof fetch;
 }
 
@@ -97,20 +98,16 @@ export async function retrieveContext(
     // same incremental refresh `phantombot memory search` does.
     await ix.refreshStale(opts.personaDir);
 
-    // Hybrid (FTS + vector) only when embeddings are configured AND we have
-    // stored vectors to compare against; otherwise FTS-only is still useful.
+    // Hybrid (FTS + vector) only when a configured query embedder exists AND
+    // we have stored vectors to compare against; otherwise FTS-only is still
+    // useful.
     let queryVec: Float32Array | undefined;
-    if (
-      opts.embeddings.provider === "gemini" &&
-      opts.embeddings.gemini?.apiKey &&
-      ix.embeddingCount() > 0
-    ) {
-      const r = await geminiEmbed(opts.embeddings.gemini.apiKey, query, {
-        model: opts.embeddings.gemini.model,
-        dims: opts.embeddings.gemini.dims,
-        signal: opts.signal,
-        fetchImpl: opts.fetchImpl,
-      });
+    const queryEmbedder = resolveEmbedders(opts.embeddings, {
+      fetchImpl: opts.fetchImpl,
+    }).query;
+    const embeddingSpace = embeddingSpaceForConfig(opts.embeddings);
+    if (queryEmbedder && embeddingSpace && ix.embeddingCount(embeddingSpace) > 0) {
+      const r = await queryEmbedder(query, opts.signal);
       if (r.ok) queryVec = r.values;
       else
         log.warn("retrieval: query embed failed; FTS-only this turn", {
@@ -126,8 +123,8 @@ export async function retrieveContext(
         ? { halfLifeDays: dc.halfLifeDays, floor: dc.floor }
         : undefined;
 
-    // Gemini path: hybrid (BM25 + vector via RRF), unchanged. No-embeddings
-    // path: fielded BM25 plus OKF link-graph expansion (the superpower) when
+    // Configured embeddings path: hybrid (BM25 + vector via RRF), unchanged.
+    // No-embeddings path: fielded BM25 plus OKF link-graph expansion (the superpower) when
     // enabled — so keyword-only personas get semantic-ish spread for free.
     // Turn-decay rides along every path so stale turns sink regardless.
     const ge = opts.settings.graphExpansion;
@@ -137,6 +134,7 @@ export async function retrieveContext(
           limit: opts.settings.limit,
           conversation: opts.conversation,
           decay,
+          embeddingSpace,
         })
       : ge?.enabled
         ? ix.searchExpanded(query, {
@@ -231,6 +229,7 @@ export async function retrieveContext(
         limit: CROSS_CANDIDATE_POOL,
         decay,
         turnFilter,
+        embeddingSpace,
       });
       crossHits = selectCrossConversationHits(candidates, {
         currentConversation: opts.conversation!,

@@ -291,10 +291,10 @@ export interface RetrievalSettings {
   turnIndexing: TurnIndexingSettings;
   /**
    * OKF link-graph expansion for the no-embeddings (BM25-only) path. When a
-   * persona has no Gemini key, fielded BM25 hits are augmented with concepts
+   * persona has no embedding provider, fielded BM25 hits are augmented with concepts
    * reachable via markdown links from those hits — the keyword-only stand-in
    * for semantic spread. Ignored when embeddings are configured (the hybrid
-   * vector path is used instead, so Gemini users are unaffected).
+   * vector path is used instead, so embedding-provider users are unaffected).
    */
   graphExpansion: GraphExpansionSettings;
   /**
@@ -632,6 +632,12 @@ export interface TelegramStreamingSettings {
  */
 export const DEFAULT_CHATTINESS = true;
 
+/** Existing Gemini note/KB chunking guard, retained for compatibility. */
+export const DEFAULT_GEMINI_MAX_CHUNK_CHARS = 18_000;
+
+/** Conservative default for providers whose tokenizer/runtime is external. */
+export const DEFAULT_OPENAI_COMPATIBLE_MAX_CHUNK_CHARS = 5_000;
+
 export const DEFAULT_TELEGRAM_STREAMING: TelegramStreamingSettings = {
   narrationFlushMs: 4500,
   bubbleMaxSentences: 4,
@@ -789,12 +795,22 @@ export interface Config {
   updateChannel?: UpdateChannel;
 
   embeddings: {
-    /** "gemini" | "none". "none" = FTS5-only search. */
-    provider: "gemini" | "none";
+    /** "gemini" | "openai-compatible" | "none". */
+    provider: "gemini" | "openai-compatible" | "none";
     gemini?: {
       apiKey: string;
       model: string;
       dims: number;
+    };
+    openaiCompatible?: {
+      baseUrl: string;
+      model: string;
+      apiKey: string;
+      dims: number;
+      queryPrefix: string;
+      documentPrefix: string;
+      /** Character-based guard for note/KB embedding requests. */
+      maxChunkChars?: number;
     };
   };
 
@@ -1161,6 +1177,8 @@ export async function loadConfig(persona?: string): Promise<Config> {
   const tomlP2p = (toml.p2p ?? {}) as Record<string, unknown>;
   const tomlEmbeddings = (toml.embeddings ?? {}) as Record<string, unknown>;
   const tomlGemini = (tomlEmbeddings.gemini ?? {}) as Record<string, unknown>;
+  const tomlOpenAI = (tomlEmbeddings.openai_compatible ??
+    tomlEmbeddings["openai-compatible"] ?? {}) as Record<string, unknown>;
   const tomlRetrieval = (toml.retrieval ?? {}) as Record<string, unknown>;
   const tomlTurnIndexing = (tomlRetrieval.turn_indexing ?? {}) as Record<
     string,
@@ -1404,7 +1422,7 @@ export async function loadConfig(persona?: string): Promise<Config> {
     // is the fail-closed direction.
     updateChannel: resolveUpdateChannel(globalToml.update_channel),
 
-    embeddings: buildEmbeddingsConfig(tomlEmbeddings, tomlGemini),
+    embeddings: buildEmbeddingsConfig(tomlEmbeddings, tomlGemini, tomlOpenAI),
 
     retrieval: buildRetrievalConfig(tomlRetrieval, tomlTurnIndexing),
     durableFacts: buildDurableFactsConfig(
@@ -1995,19 +2013,84 @@ function buildHarnessPersonasConfig(
   return Object.keys(personas).length > 0 ? personas : undefined;
 }
 
+/**
+ * Resolve the note/KB chunking guard for the configured embedding transport.
+ * This is character-based and intentionally does not claim to be a token
+ * limit: PhantomBot does not own the tokenizer or runtime capacity of an
+ * OpenAI-compatible endpoint.
+ */
+export function documentChunkChars(
+  config: Pick<Config, "embeddings">,
+): number | undefined {
+  if (config.embeddings.provider === "gemini") {
+    return DEFAULT_GEMINI_MAX_CHUNK_CHARS;
+  }
+  if (config.embeddings.provider === "openai-compatible") {
+    const configured = config.embeddings.openaiCompatible?.maxChunkChars;
+    const limit = configured === undefined ? 0 : Math.floor(configured);
+    return Number.isFinite(limit) && limit > 0
+      ? limit
+      : DEFAULT_OPENAI_COMPATIBLE_MAX_CHUNK_CHARS;
+  }
+  return undefined;
+}
+
 function buildEmbeddingsConfig(
   tomlEmbeddings: Record<string, unknown>,
   tomlGemini: Record<string, unknown>,
+  tomlOpenAI: Record<string, unknown>,
 ): Config["embeddings"] {
   const envApiKey = process.env.PHANTOMBOT_GEMINI_API_KEY;
   const tomlApiKey = asString(tomlGemini.api_key);
   const apiKey = envApiKey ?? tomlApiKey;
 
+  const configuredProvider = asString(tomlEmbeddings.provider);
   const provider =
-    (asString(tomlEmbeddings.provider) as "gemini" | "none" | undefined) ??
-    (apiKey ? "gemini" : "none");
+    configuredProvider === "gemini" ||
+    configuredProvider === "openai-compatible" ||
+    configuredProvider === "none"
+      ? configuredProvider
+      : apiKey
+        ? "gemini"
+        : "none";
 
-  if (provider !== "gemini") return { provider };
+  if (provider === "none") return { provider };
+
+  if (provider === "openai-compatible") {
+    const env = (name: string): string | undefined => process.env[name];
+    return {
+      provider,
+      openaiCompatible: {
+        baseUrl:
+          env("PHANTOMBOT_OPENAI_COMPATIBLE_BASE_URL") ??
+          asString(tomlOpenAI.base_url) ??
+          "",
+        model:
+          env("PHANTOMBOT_OPENAI_COMPATIBLE_MODEL") ??
+          asString(tomlOpenAI.model) ??
+          "",
+        apiKey:
+          env("PHANTOMBOT_OPENAI_COMPATIBLE_API_KEY") ??
+          asString(tomlOpenAI.api_key) ??
+          "",
+        dims:
+          asInt(env("PHANTOMBOT_OPENAI_COMPATIBLE_DIMS")) ??
+          asInt(tomlOpenAI.dims) ??
+          0,
+        queryPrefix:
+          env("PHANTOMBOT_OPENAI_COMPATIBLE_QUERY_PREFIX") ??
+          asString(tomlOpenAI.query_prefix) ??
+          "",
+        documentPrefix:
+          env("PHANTOMBOT_OPENAI_COMPATIBLE_DOCUMENT_PREFIX") ??
+          asString(tomlOpenAI.document_prefix) ??
+          "",
+        maxChunkChars:
+          asInt(tomlOpenAI.max_chunk_chars) ??
+          DEFAULT_OPENAI_COMPATIBLE_MAX_CHUNK_CHARS,
+      },
+    };
+  }
 
   return {
     provider: "gemini",

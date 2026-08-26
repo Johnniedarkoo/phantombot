@@ -14,8 +14,8 @@
  *                              print today's daily-file path (creates the
  *                              directory if missing — returns the path
  *                              unconditionally so the harness can write to it)
- *   phantombot memory index [--rebuild]
- *                              rebuild the FTS5 index (incremental by default)
+ *   phantombot memory index [--rebuild] [--reembed]
+ *                              rebuild FTS5 or only derived vectors
  *   phantombot memory capture "<text>" --tag <tag> [--tag <tag> ...]
  *                              append a tagged line to today's daily file
  *                              and record the capture in capture_log
@@ -39,13 +39,22 @@ import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 import {
+  DEFAULT_GEMINI_MAX_CHUNK_CHARS,
+  documentChunkChars,
   type Config,
   loadConfig,
   memoryIndexPath,
   personaDir,
 } from "../config.ts";
-import { defaultEmbedder, runEmbedJob } from "../lib/embedJob.ts";
-import { geminiEmbed } from "../lib/geminiEmbed.ts";
+import {
+  defaultEmbedderWithFetch,
+  runEmbeddingPreflight,
+  runEmbedJob,
+  runTurnEmbedJob,
+  type Embedder,
+} from "../lib/embedJob.ts";
+import { resolveEmbedders } from "../lib/embedder.ts";
+import { embeddingSpaceForConfig } from "../lib/embeddingSpace.ts";
 import { TAG_TO_DRAWER } from "../lib/heartbeat.ts";
 import type { WriteSink } from "../lib/io.ts";
 import { log } from "../lib/logger.ts";
@@ -111,6 +120,8 @@ export interface RunSearchInput extends RunMemoryInput {
   limit?: number;
   /** Override the index path for testing. */
   indexPath?: string;
+  /** Override embedding HTTP for tests. */
+  fetchImpl?: typeof fetch;
 }
 
 export async function runMemorySearch(
@@ -130,33 +141,27 @@ export async function runMemorySearch(
   try {
     await ix.refreshStale(dir);
 
-    // If embeddings are configured AND there are stored vectors, do a
+    // If a query embedder is configured AND there are stored vectors, do a
     // hybrid search. Otherwise fall back to FTS-only.
     let queryVec: Float32Array | undefined;
-    if (
-      config.embeddings.provider === "gemini" &&
-      config.embeddings.gemini?.apiKey &&
-      ix.embeddingCount() > 0
-    ) {
-      const r = await geminiEmbed(
-        config.embeddings.gemini.apiKey,
-        input.query,
-        {
-          model: config.embeddings.gemini.model,
-          dims: config.embeddings.gemini.dims,
-        },
-      );
+    const queryEmbedder = resolveEmbedders(config, {
+      fetchImpl: input.fetchImpl,
+    }).query;
+    const embeddingSpace = embeddingSpaceForConfig(config.embeddings);
+    if (queryEmbedder && embeddingSpace && ix.embeddingCount(embeddingSpace) > 0) {
+      const r = await queryEmbedder(input.query);
       if (r.ok) queryVec = r.values;
       else err.write(`(query embed failed: ${r.error}; falling back to FTS-only)\n`);
     }
 
     // No-embeddings path gets OKF link-graph expansion when enabled, matching
-    // turn-time auto-retrieval; the hybrid (Gemini) path is unchanged.
+    // turn-time auto-retrieval; the hybrid path is provider-neutral.
     const ge = config.retrieval?.graphExpansion;
     const hits = queryVec
       ? ix.hybridSearch(input.query, queryVec, {
           scope: input.scope,
           limit: input.limit,
+          embeddingSpace,
         })
       : ge?.enabled
         ? ix.searchExpanded(input.query, {
@@ -275,6 +280,12 @@ export interface RunIndexInputV2 extends RunIndexInput {
    * below the turn-index batch and haven't aged into the heartbeat window yet.
    */
   flushTurns?: boolean;
+  /** Clear and fully rebuild only note/turn vectors. */
+  reembed?: boolean;
+  /** Override embedding HTTP for tests. */
+  fetchImpl?: typeof fetch;
+  /** Test seam for the derived-vector rebuild. */
+  embedder?: Embedder;
 }
 
 export async function runMemoryIndex(
@@ -287,6 +298,11 @@ export async function runMemoryIndex(
 
   if (!existsSync(dir)) {
     err.write(`persona '${persona}' not found at ${dir}\n`);
+    return 2;
+  }
+
+  if (input.reembed && input.flushTurns) {
+    err.write("--reembed and --turns cannot be used together\n");
     return 2;
   }
 
@@ -333,6 +349,77 @@ export async function runMemoryIndex(
 
   const ix = await MemoryIndex.open(input.indexPath ?? memoryIndexPath(persona));
   try {
+    const reembedder =
+      input.embedder ?? defaultEmbedderWithFetch(config, input.fetchImpl);
+    if (input.reembed) {
+      if (!reembedder) {
+        err.write(
+          `(embeddings provider is "${config.embeddings.provider}"; ` +
+            "configure an embedding provider before --reembed)\n",
+        );
+        return 1;
+      }
+      const space =
+        reembedder.space ?? embeddingSpaceForConfig(config.embeddings);
+      if (!space) {
+        err.write(
+          "cannot reembed: the configured provider has no known embedding dimensions; " +
+            "validate the provider first\n",
+        );
+        return 1;
+      }
+      const maxChunkChars =
+        documentChunkChars(config) ?? DEFAULT_GEMINI_MAX_CHUNK_CHARS;
+      // Probe the real endpoint before touching FTS or embedding rows. A
+      // failed preflight must leave both the searchable index and vectors
+      // exactly as they were when the command started.
+      const preflight = await runEmbeddingPreflight({
+        personaDir: dir,
+        index: ix,
+        embedder: reembedder,
+        maxChunkChars,
+      });
+      if (!preflight.ok) {
+        err.write(
+          `reembed preflight failed${preflight.path ? ` for ${preflight.path}` : ""}: ` +
+            `${preflight.error ?? "unknown embedding failure"}\n`,
+        );
+        return 1;
+      }
+      await ix.refreshStale(dir);
+      out.write(
+        `rebuilding derived vectors for '${persona}' ` +
+          "(source files, raw turns, and FTS are preserved)…\n",
+      );
+      const notes = await runEmbedJob({
+        personaDir: dir,
+        index: ix,
+        embedder: reembedder,
+        maxChunkChars,
+        force: true,
+        space,
+      });
+      const turns = await runTurnEmbedJob({
+        index: ix,
+        embedder: reembedder,
+        space,
+      });
+      const failures = notes.failedChunks + turns.failed;
+      if (failures === 0) ix.removeObsoleteEmbeddingSpaces(space);
+      out.write(
+        `re-embedded ${notes.embeddedChunks}/${notes.totalChunks} note chunks ` +
+          `across ${notes.totalFiles} files and ` +
+          `${turns.embedded}/${turns.totalTurns} turns` +
+          (failures > 0
+            ? `; failed ${failures}`
+            : "") +
+          `\n`,
+      );
+      for (const e of [...notes.errors.map((x) => ({ ...x, kind: "note" })), ...turns.errors.map((x) => ({ ...x, kind: "turn", chunkIdx: undefined }))].slice(0, 5)) {
+        err.write(`  ${e.kind} ${e.path}: ${e.error}\n`);
+      }
+      return failures > 0 ? 1 : 0;
+    }
     const ftsResult = input.rebuild
       ? { ...(await ix.rebuild(dir)), removed: 0 }
       : await ix.refreshStale(dir);
@@ -347,11 +434,12 @@ export async function runMemoryIndex(
       out.write(`(skipping embedding pass; --no-embed)\n`);
       return 0;
     }
-    const embedder = defaultEmbedder(config);
+    const embedder =
+      input.embedder ?? defaultEmbedderWithFetch(config, input.fetchImpl);
     if (!embedder) {
       out.write(
         `(embeddings provider is "${config.embeddings.provider}"; ` +
-          `run \`phantombot embedding\` to set up Gemini)\n`,
+          "run `phantombot embedding` to configure it)\n",
       );
       return 0;
     }
@@ -361,11 +449,13 @@ export async function runMemoryIndex(
       personaDir: dir,
       index: ix,
       embedder,
+      maxChunkChars:
+        documentChunkChars(config) ?? DEFAULT_GEMINI_MAX_CHUNK_CHARS,
       force: input.rebuild,
     });
     out.write(
-      `embedded ${r.embedded}, skipped ${r.skipped} (sha match), ` +
-        `failed ${r.failed} of ${r.totalNotes} notes\n`,
+      `embedded ${r.embeddedChunks} chunks across ${r.totalFiles} note files, ` +
+      `skipped ${r.skippedChunks} (sha match), failed ${r.failedChunks}\n`,
     );
     if (r.failed > 0) {
       for (const e of r.errors.slice(0, 5)) {
@@ -518,9 +608,15 @@ export async function indexAfterCapture(
     // Then the vector embed for the new chunk(s), if embeddings are set up.
     // sha-skip means unchanged chunks cost nothing; a missing key just means
     // FTS-only recall until the heartbeat runs the full job.
-    const embedder = defaultEmbedder(config);
+    const embedder = defaultEmbedderWithFetch(config);
     if (embedder) {
-      await runEmbedJob({ personaDir: dir, index: ix, embedder });
+      await runEmbedJob({
+        personaDir: dir,
+        index: ix,
+        embedder,
+        maxChunkChars:
+          documentChunkChars(config) ?? DEFAULT_GEMINI_MAX_CHUNK_CHARS,
+      });
     }
   } catch (e) {
     log.warn(`memory capture: index-on-write failed (non-fatal): ${(e as Error).message}`);
@@ -893,7 +989,7 @@ export async function runMemoryRestore(input: {
 // ---------------------------------------------------------------------------
 
 const searchCmd = defineCommand({
-  meta: { name: "search", description: "Search memory/ and kb/: hybrid BM25+vector when Gemini embeddings are set, else OKF field-weighted BM25 with link-graph expansion." },
+  meta: { name: "search", description: "Search memory/ and kb/: hybrid BM25+vector when an embedding provider is set, else OKF field-weighted BM25 with link-graph expansion." },
   args: {
     query: {
       type: "positional",
@@ -960,12 +1056,13 @@ const todayCmd = defineCommand({
 });
 
 const indexCmd = defineCommand({
-  meta: { name: "index", description: "Refresh FTS5 + embeddings (incremental by default; --rebuild for from-scratch; --no-embed to skip the vector pass)." },
+  meta: { name: "index", description: "Refresh FTS5 + embeddings (incremental by default; --rebuild for from-scratch; --reembed for a full derived-vector rebuild; --no-embed to skip vectors)." },
   args: {
     persona: { type: "string", description: "Persona name." },
     rebuild: { type: "boolean", description: "Drop and re-index from scratch.", default: false },
     "no-embed": { type: "boolean", description: "Skip embedding pass (FTS only).", default: false },
     turns: { type: "boolean", description: "Force-flush unindexed conversation turn tails (all conversations) instead of the notes/KB index.", default: false },
+    reembed: { type: "boolean", description: "Clear and rebuild only note/turn embeddings; preserve source files, raw turns, and FTS.", default: false },
   },
   async run({ args }) {
     process.exitCode = await runMemoryIndex({
@@ -973,6 +1070,7 @@ const indexCmd = defineCommand({
       rebuild: Boolean(args.rebuild),
       noEmbed: Boolean(args["no-embed"]),
       flushTurns: Boolean(args.turns),
+      reembed: Boolean(args.reembed),
     });
   },
 });

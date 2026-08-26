@@ -17,6 +17,8 @@ import {
   runMemoryToday,
 } from "../src/cli/memory.ts";
 import type { Config } from "../src/config.ts";
+import { makeEmbeddingSpace } from "../src/lib/embeddingSpace.ts";
+import { sha256 } from "../src/lib/embedJob.ts";
 import { MemoryIndex } from "../src/lib/memoryIndex.ts";
 
 class CaptureStream {
@@ -68,6 +70,16 @@ async function note(rel: string, content: string) {
   await writeFile(join(workdir, "personas", "phantom", rel), content);
 }
 
+function geminiConfig(): Config {
+  return {
+    ...config,
+    embeddings: {
+      provider: "gemini",
+      gemini: { apiKey: "test", model: "embed", dims: 2 },
+    },
+  };
+}
+
 describe("runMemorySearch", () => {
   test("returns JSON results for a matching query", async () => {
     await note("kb/concepts/Foo.md", "deye inverter facts");
@@ -117,6 +129,55 @@ describe("runMemorySearch", () => {
     const parsed = JSON.parse(out.text);
     expect(parsed.results).toHaveLength(1);
     expect(parsed.results[0].scope).toBe("memory");
+  });
+
+  test("uses the OpenAI-compatible query embedder for hybrid search", async () => {
+    await note("kb/concepts/Foo.md", "deye inverter facts");
+    const ix = await MemoryIndex.open(indexPath);
+    await ix.refreshStale(join(workdir, "personas", "phantom"));
+    ix.upsertEmbedding(
+      "kb/concepts/Foo.md",
+      0,
+      new Float32Array([1, 0]),
+      "sha",
+      makeEmbeddingSpace({
+        provider: "openai-compatible",
+        model: "embed",
+        dimensions: 2,
+        documentPrefix: "passage: ",
+      }),
+    );
+    ix.close();
+    const out = new CaptureStream();
+    const code = await runMemorySearch({
+      query: "different wording",
+      config: {
+        ...config,
+        embeddings: {
+          provider: "openai-compatible",
+          openaiCompatible: {
+            baseUrl: "http://localhost:8082/v1",
+            model: "embed",
+            apiKey: "",
+            dims: 2,
+            queryPrefix: "query: ",
+            documentPrefix: "passage: ",
+          },
+        },
+      },
+      indexPath,
+      out,
+      err: new CaptureStream(),
+      fetchImpl: (async (_url, init) => {
+        expect(JSON.parse(String(init?.body)).input).toBe("query: different wording");
+        return new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch,
+    });
+    expect(code).toBe(0);
+    expect(JSON.parse(out.text).results[0].path).toBe("kb/concepts/Foo.md");
   });
 });
 
@@ -240,6 +301,208 @@ describe("runMemoryIndex", () => {
       err: new CaptureStream(),
     });
     expect(out.text).toContain("0 file(s)");
+  });
+
+  test("--reembed rebuilds vectors while preserving FTS and all indexed turns", async () => {
+    await note("kb/concepts/A.md", "alpha source note");
+    const seeded = await MemoryIndex.open(indexPath);
+    await seeded.refreshStale(join(workdir, "personas", "phantom"));
+    seeded.upsertTurn({
+      id: 1,
+      persona: "phantom",
+      conversation: "cli:default",
+      role: "user",
+      text: "historical semantic turn",
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      embeddable: true,
+      source: "principal",
+      origin: "channel",
+    });
+    seeded.upsertEmbedding("kb/concepts/A.md", 0, new Float32Array([9]), "old");
+    seeded.close();
+
+    const code = await runMemoryIndex({
+      config: {
+        ...config,
+        embeddings: {
+          provider: "gemini",
+          gemini: { apiKey: "test", model: "embed", dims: 2 },
+        },
+      },
+      indexPath,
+      reembed: true,
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      embedder: async () => ({
+        ok: true as const,
+        values: new Float32Array([1, 2]),
+        dims: 2,
+      }),
+    });
+    expect(code).toBe(0);
+    const check = await MemoryIndex.open(indexPath);
+    try {
+      expect(check.embeddingCount()).toBe(2);
+      expect(check.search("alpha")).toHaveLength(1);
+      expect(check.allTurnDocuments()).toHaveLength(1);
+      expect(existsSync(join(workdir, "personas", "phantom", "kb/concepts/A.md"))).toBe(true);
+    } finally {
+      check.close();
+    }
+  });
+
+  test("reembed preflight failure preserves old FTS state and vectors", async () => {
+    await note("kb/concepts/A.md", "old content");
+    const seeded = await MemoryIndex.open(indexPath);
+    await seeded.refreshStale(join(workdir, "personas", "phantom"));
+    const space = makeEmbeddingSpace({ provider: "gemini", model: "embed", dimensions: 2 });
+    seeded.upsertEmbedding("kb/concepts/A.md", 0, new Float32Array([3, 4]), "old-sha", space);
+    seeded.close();
+    await note("kb/concepts/A.md", "edited content");
+
+    const code = await runMemoryIndex({
+      config: geminiConfig(),
+      indexPath,
+      reembed: true,
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      embedder: async () => ({ ok: false as const, error: "endpoint down" }),
+    });
+    expect(code).toBe(1);
+    const check = await MemoryIndex.open(indexPath);
+    try {
+      const row = check.allEmbeddings()[0]!;
+      expect(Array.from(row.vec)).toEqual([3, 4]);
+      expect(row.textSha).toBe("old-sha");
+      expect(row.spaceFingerprint).toBe(space.fingerprint);
+      expect(check.search("old content")).toHaveLength(1);
+      expect(check.search("edited content")).toHaveLength(0);
+    } finally {
+      check.close();
+    }
+  });
+
+  test("mid-note failure is nonzero and leaves the failed note out of the current space", async () => {
+    await note("kb/concepts/A.md", "alpha");
+    await note("kb/concepts/B.md", "beta");
+    let calls = 0;
+    const code = await runMemoryIndex({
+      config: geminiConfig(),
+      indexPath,
+      reembed: true,
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      embedder: async () => {
+        calls++;
+        return calls <= 2
+          ? { ok: true as const, values: new Float32Array([1, 0]), dims: 2 }
+          : { ok: false as const, error: "mid-note outage" };
+      },
+    });
+    expect(code).toBe(1);
+    const check = await MemoryIndex.open(indexPath);
+    try {
+      expect(
+        check.allEmbeddings(
+          makeEmbeddingSpace({ provider: "gemini", model: "embed", dimensions: 2 }),
+        ),
+      ).toHaveLength(1);
+    } finally {
+      check.close();
+    }
+  });
+
+  test("mid-turn failure is nonzero and foreign turn residue remains ineligible", async () => {
+    await note("kb/concepts/A.md", "alpha");
+    const seeded = await MemoryIndex.open(indexPath);
+    await seeded.refreshStale(join(workdir, "personas", "phantom"));
+    seeded.upsertTurn({
+      id: 1,
+      persona: "phantom",
+      conversation: "cli:default",
+      role: "user",
+      text: "historical turn",
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      embeddable: true,
+      source: "principal",
+      origin: "channel",
+    }, new Float32Array([9, 9]), "foreign", makeEmbeddingSpace({ provider: "gemini", model: "old", dimensions: 2 }));
+    seeded.close();
+    let calls = 0;
+    const code = await runMemoryIndex({
+      config: geminiConfig(),
+      indexPath,
+      reembed: true,
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      embedder: async () => {
+        calls++;
+        return calls <= 2
+          ? { ok: true as const, values: new Float32Array([1, 0]), dims: 2 }
+          : { ok: false as const, error: "mid-turn outage" };
+      },
+    });
+    expect(code).toBe(1);
+    const check = await MemoryIndex.open(indexPath);
+    try {
+      const current = makeEmbeddingSpace({ provider: "gemini", model: "embed", dimensions: 2 });
+      expect(check.allEmbeddings(current)).toHaveLength(1);
+      expect(check.allEmbeddings()).toHaveLength(2);
+    } finally {
+      check.close();
+    }
+  });
+
+  test("successful reembed removes foreign-space residue and picks up new and edited notes", async () => {
+    await note("kb/concepts/A.md", "old alpha");
+    const seeded = await MemoryIndex.open(indexPath);
+    await seeded.refreshStale(join(workdir, "personas", "phantom"));
+    seeded.upsertEmbedding(
+      "kb/concepts/A.md",
+      0,
+      new Float32Array([8, 8]),
+      "foreign",
+      makeEmbeddingSpace({ provider: "gemini", model: "old", dimensions: 2 }),
+    );
+    seeded.close();
+    await note("kb/concepts/A.md", "new alpha");
+    await note("kb/concepts/B.md", "new beta");
+    const code = await runMemoryIndex({
+      config: geminiConfig(),
+      indexPath,
+      reembed: true,
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      embedder: async (text) => ({
+        ok: true as const,
+        values: new Float32Array([text.length, 1]),
+        dims: 2,
+      }),
+    });
+    expect(code).toBe(0);
+    const check = await MemoryIndex.open(indexPath);
+    try {
+      const current = makeEmbeddingSpace({ provider: "gemini", model: "embed", dimensions: 2 });
+      expect(check.allEmbeddings(current)).toHaveLength(2);
+      expect(check.allEmbeddings()).toHaveLength(2);
+      expect(check.embeddingSha("kb/concepts/A.md", 0, current)).toBe(sha256("new alpha"));
+      expect(check.search("new beta")).toHaveLength(1);
+    } finally {
+      check.close();
+    }
+  });
+
+  test("explicit reembed with no provider returns nonzero", async () => {
+    const err = new CaptureStream();
+    const code = await runMemoryIndex({
+      config,
+      indexPath,
+      reembed: true,
+      out: new CaptureStream(),
+      err,
+    });
+    expect(code).toBe(1);
+    expect(err.text).toContain("configure an embedding provider");
   });
 });
 

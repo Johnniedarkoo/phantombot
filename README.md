@@ -24,8 +24,9 @@ because one Phantom — with its own memory and judgment — saw it through.
 decisions, lessons, people, and standing preferences, authored in the
 **[Open Knowledge Format](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing/)**
 (OKF — Google Cloud's open standard for agent knowledge) and searchable by
-*meaning* with Gemini embeddings + hybrid vector/keyword retrieval. No Gemini
-key? Memory still gets superpowers: OKF **field-weighted BM25** plus
+*meaning* with optional Gemini or OpenAI-compatible embeddings + hybrid
+vector/keyword retrieval. No embedding provider? Memory still gets superpowers:
+OKF **field-weighted BM25** plus
 **concept-graph expansion** — far sharper than plain keyword search. It doesn't
 reset between sessions; it accumulates. So the
 longer a Phantom works with you, the more it understands your code and your
@@ -239,7 +240,7 @@ phantombot phantomchat # encrypted Nostr DMs
 phantombot telegram    # BotFather token + allowed Telegram user IDs
 
 phantombot voice       # optional TTS/STT setup
-phantombot embedding   # optional Gemini semantic-memory setup
+phantombot embedding   # optional semantic-memory provider setup
 
 phantombot run         # foreground host runtime for configured chat channels + P2P
 phantombot run --if-not-running  # supervisor keep-alive; quiet success if already running
@@ -530,7 +531,9 @@ Harness notes:
   the same provider (e.g. two OpenRouter keys), the merge-write replaces the
   previous key, and Pi's model catalog only uses the one on file.
 - Claude Code is normally authenticated with OAuth on the host.
-- Gemini remains available for optional semantic-memory embeddings via `phantombot embedding`; it is not an agent harness.
+- Gemini and OpenAI-compatible endpoints are available for optional
+  semantic-memory embeddings via `phantombot embedding`; they are not agent
+  harnesses.
 - Codex can use `codex login` or `OPENAI_API_KEY`.
 - `chain` order is primary to fallback.
 - **The whole `[harnesses]` block is per-persona.** Which brain a persona
@@ -587,7 +590,7 @@ Setup and channels:
 | `phantombot telegram [--persona <name>]` | Configure a Telegram bot and allowlist |
 | `phantombot phantomchat [--persona <name>]` | Configure PhantomChat identity, relays, and allowlist |
 | `phantombot voice [--persona <name>]` | Configure TTS/STT |
-| `phantombot embedding` | Configure optional Gemini embeddings |
+| `phantombot embedding` | Configure optional Gemini/OpenAI-compatible embeddings, or none |
 | `phantombot acp install zed|jetbrains|vscode` | Register the ACP agent with an editor |
 
 `phantombot persona <name>` switches the daemon-wide default persona.
@@ -1863,11 +1866,11 @@ screening outage degrades to "unscreened", never "app down". (This is distinct
 from the **fail-closed hold** above, which governs an escalated-but-unanswered
 request: that simply never runs.)
 
-> **Recommended for production environments.** Threat screening needs no
-> embedding key or separate model configuration: it runs on the primary
-> harness and reads the ranked drawer briefing directly. Gemini embeddings
-> affect normal memory retrieval, not whether screening runs or which drawer
-> rows the judge receives. Screening is **not** a wall —
+> **Recommended for production environments.** Threat screening itself needs no
+> extra configuration — it runs on your primary harness, which is always
+> present. Embeddings improve long-term memory retrieval; without an embedding
+> provider, OKF field-weighted BM25 (lexical) remains available. Screening is
+> **not a wall** —
 > a sufficiently clever injection can still fool an LLM judge, just as it can
 > fool a human — but it filters the obvious majority and puts a human beat in
 > front of the rest.
@@ -1986,7 +1989,7 @@ phantombot memory index --rebuild
 phantombot memory backup
 ```
 
-### Memory search: OKF superpowers by default, Gemini semantic on top
+### Memory search: OKF superpowers by default, semantic providers on top
 
 Phantombot stores memory in the **[Open Knowledge Format](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing/)**
 (OKF) — Google Cloud's open, vendor-neutral standard for the knowledge AI
@@ -2057,10 +2060,16 @@ as you wrote it.
 > agents, not a document store for the operator. It is the agent's own recall.
 > OKF is the *format*; where a human-facing vault lives is a separate question.
 
-**Add Gemini embeddings** (optional, recommended for production) to layer true
-**semantic** retrieval on top — matching by *meaning*, not just words. With a
-key, search becomes **hybrid**: OKF field-weighted BM25 *and* vector similarity,
-fused with reciprocal-rank fusion.
+Add an embeddings provider (optional) to layer true **semantic** retrieval on
+top — matching by *meaning*, not just words. With a provider, search becomes
+**hybrid**: OKF field-weighted BM25 *and* vector similarity, fused with
+reciprocal-rank fusion. The three choices are:
+
+- `none` — local OKF field-weighted BM25 plus link-graph expansion; no network
+  service or key is required.
+- `gemini` — the existing Gemini embedding service.
+- `openai-compatible` — any standard `POST <base_url>/embeddings` service,
+  including a separately managed local llama.cpp `llama-server`.
 
 Enable it:
 
@@ -2069,13 +2078,15 @@ phantombot embedding
 phantombot memory index --rebuild
 ```
 
-**Privacy boundary:** enabling Gemini sends the plaintext being embedded to
-Google's Generative Language API. That includes daily-journal and KB content,
-indexed conversation turns, and each semantic search query. The local
-SQLite database remains local, but the text submitted for vector generation
-does not. Leave embeddings disabled to keep recall entirely on-host with
-BM25F + link-graph expansion; your configured model harness still receives
-normal turn prompts under that provider's own terms.
+**Privacy boundary:** local SQLite and markdown memory remain local storage,
+PhantomBot sends the plaintext being embedded to the configured endpoint, which
+receives it. That includes note/KB chunks, indexed conversation-turn text, and
+retrieval queries. Gemini sends that text to Google's Generative Language API;
+an OpenAI-compatible endpoint may be remote or may be localhost. A localhost
+endpoint keeps those embedding calls on the local machine. This is separate
+from normal model-provider/harness privacy: turn prompts and tool calls still
+follow the terms of the model provider you configure. Leave embeddings
+disabled to keep recall entirely on-host with BM25F + link-graph expansion.
 
 Equivalent TOML:
 
@@ -2088,6 +2099,63 @@ api_key = "AIza..."
 model = "gemini-embedding-001"
 dims = 1536
 ```
+
+For a local CPU-only llama.cpp server, start it separately from PhantomBot.
+The server's model and pooling must match the embedding GGUF's model card; for
+a mean-pooled embedding model, the shape is:
+
+```bash
+llama-server -m /path/to/embedding.gguf --embedding --pooling mean \
+  --host 127.0.0.1 --port 8082
+```
+
+Verify `http://127.0.0.1:8082/v1/embeddings` first, then choose
+`OpenAI-compatible` in `phantombot embedding`. The equivalent configuration is:
+
+```toml
+[embeddings]
+provider = "openai-compatible"
+
+[embeddings.openai_compatible]
+base_url = "http://127.0.0.1:8082/v1"
+model = "your-embedding-model"
+api_key = ""                 # optional for localhost
+query_prefix = ""            # optional model-specific instruction
+document_prefix = ""         # optional model-specific instruction
+max_chunk_chars = 5000        # optional character-based note/KB request guard
+# dims is detected and written by `phantombot embedding`
+```
+
+Prefixes are applied only at the provider boundary: `query_prefix` is used
+for retrieval queries, while `document_prefix` is used for notes, KB files,
+and conversation turns. PhantomBot does not start, stop, download, or manage
+the embedding server. OpenAI-compatible note/KB documents default to 5,000
+characters per embedding request; `max_chunk_chars` can be raised or lowered
+to suit the configured endpoint. This is a conservative character-based
+transport/runtime guard, not an exact token limit or a llama.cpp protocol
+limit. Gemini retains its existing 18,000-character note/KB chunking.
+Ollama, Qdrant, and MCP are not required.
+
+An OpenAI-compatible endpoint may be remote. A remote endpoint receives the
+text PhantomBot sends for embedding: note/KB chunks, indexed conversation-turn
+text, and retrieval queries. A localhost endpoint keeps those embedding
+requests local. Provider, model, or `document_prefix` changes require (or are
+strongly recommended to receive) a full reembed; `query_prefix` alone does not
+invalidate stored document vectors. `max_chunk_chars` controls chunk lifecycle,
+not embedding-space identity.
+
+When changing the embedding provider, model, or prefixes, run:
+
+```bash
+phantombot memory index --reembed
+```
+
+This rebuilds only derived vectors; source files, raw conversation turns, and
+FTS content/index data are preserved. Existing vector rows are removed only
+after the full replacement succeeds. Run it even when the old and new
+providers report the same dimension: equal dimensions do not imply the same
+vector space. If an embedding request fails, the interactive turn and memory
+search continue with lexical/OKF retrieval.
 
 Without embeddings, search degrades cleanly to OKF field-weighted BM25 with
 link-graph expansion — never to plain keyword.

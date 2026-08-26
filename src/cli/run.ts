@@ -753,24 +753,23 @@ export async function runRun(input: RunInput = {}): Promise<number> {
   // expansion — so this is an informational line, not a warning, and never
   // blocks startup.
   const semanticSearch =
-    config.embeddings?.provider === "gemini" &&
-    !!config.embeddings?.gemini?.apiKey;
+    (config.embeddings?.provider === "gemini" &&
+      !!config.embeddings?.gemini?.apiKey) ||
+    (config.embeddings?.provider === "openai-compatible" &&
+      !!config.embeddings?.openaiCompatible?.baseUrl &&
+      !!config.embeddings?.openaiCompatible?.model);
   if (!semanticSearch) {
     out.write(
       "  memory: semantic (vector) search OFF — OKF field-weighted BM25 + " +
-        "link-graph expansion active. Optional: run `phantombot embedding` to add Gemini.\n",
+        "link-graph expansion active. Optional: run `phantombot embedding` to add semantic embeddings.\n",
     );
     // Threat screening itself does NOT depend on this key — the judge runs
     // on your PRIMARY harness (whichever of claude/pi/gemini/codex), which is
-    // always present, so untrusted input is screened regardless. What the key
-    // adds is the judge's BRIEFING recall (decisions/people/norms): without
-    // embeddings the judge falls back to keyword-only recall (or none), which
-    // is a quality degrade, not a security hole. Recommended for production so
-    // the judge remembers what you've approved and what's routine.
+    // always present, so untrusted input is screened regardless. Embeddings
+    // improve long-term memory retrieval; they do not enable threat screening.
     out.write(
       "  security: threat screening ACTIVE (runs on your primary harness). " +
-        "Judge briefing recall is keyword-only without a Gemini key — run " +
-        "`phantombot embedding` for semantic recall of rulings/contacts/norms.\n",
+        "Embedding configuration is independent of screening.\n",
     );
   }
   out.write("Ctrl-C to stop.\n");

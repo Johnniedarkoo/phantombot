@@ -22,6 +22,7 @@ import {
   type RetrievalSettings,
 } from "../src/config.ts";
 import { MemoryIndex } from "../src/lib/memoryIndex.ts";
+import { makeEmbeddingSpace } from "../src/lib/embeddingSpace.ts";
 import {
   conversationChannel,
   crossAttribution,
@@ -288,7 +289,17 @@ describe("retrieveContext", () => {
     await ix.refreshStale(personaDir);
     const vec = new Float32Array(1536);
     vec[0] = 1;
-    ix.upsertEmbedding("kb/infra/Inverter.md", 0, vec, "sha-test");
+    ix.upsertEmbedding(
+      "kb/infra/Inverter.md",
+      0,
+      vec,
+      "sha-test",
+      makeEmbeddingSpace({
+        provider: "gemini",
+        model: "gemini-embedding-001",
+        dimensions: 1536,
+      }),
+    );
     ix.close();
 
     // fetchImpl returns the same vector so cosine similarity is maximal.
@@ -311,6 +322,101 @@ describe("retrieveContext", () => {
     });
     expect(out).toBeDefined();
     expect(out!).toContain("Inverter.md");
+  });
+
+  test("openai-compatible provider uses the generic hybrid path", async () => {
+    const ix = await MemoryIndex.open(indexPath);
+    await ix.refreshStale(personaDir);
+    const vec = new Float32Array(2);
+    vec[0] = 1;
+    ix.upsertEmbedding(
+      "kb/infra/Inverter.md",
+      0,
+      vec,
+      "sha-test",
+      makeEmbeddingSpace({
+        provider: "openai-compatible",
+        model: "embed",
+        dimensions: 2,
+        documentPrefix: "passage: ",
+      }),
+    );
+    ix.close();
+
+    const fetchImpl = (async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      expect(body.input).toBe("query: deye inverter");
+      return new Response(
+        JSON.stringify({ data: [{ embedding: [1, 0] }] }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const out = await retrieveContext({
+      query: "deye inverter",
+      personaDir,
+      indexPath,
+      embeddings: {
+        provider: "openai-compatible",
+        openaiCompatible: {
+          baseUrl: "http://localhost:8082/v1",
+          model: "embed",
+          apiKey: "",
+          dims: 2,
+          queryPrefix: "query: ",
+          documentPrefix: "passage: ",
+        },
+      },
+      settings: { ...DEFAULT_RETRIEVAL },
+      fetchImpl,
+    });
+    expect(out).toBeDefined();
+    expect(out!).toContain("Inverter.md");
+  });
+
+  test("foreign vectors do not trigger a query embed and use lexical fallback", async () => {
+    const ix = await MemoryIndex.open(indexPath);
+    await ix.refreshStale(personaDir);
+    ix.upsertEmbedding(
+      "kb/infra/Inverter.md",
+      0,
+      new Float32Array([1, 0]),
+      "foreign",
+      makeEmbeddingSpace({
+        provider: "openai-compatible",
+        model: "old-model",
+        dimensions: 2,
+        documentPrefix: "passage: ",
+      }),
+    );
+    ix.close();
+    let calls = 0;
+    const out = await retrieveContext({
+      query: "deye inverter",
+      personaDir,
+      indexPath,
+      embeddings: {
+        provider: "openai-compatible",
+        openaiCompatible: {
+          baseUrl: "http://localhost:8082/v1",
+          model: "new-model",
+          apiKey: "",
+          dims: 2,
+          queryPrefix: "query: ",
+          documentPrefix: "passage: ",
+        },
+      },
+      settings: { ...DEFAULT_RETRIEVAL },
+      fetchImpl: (async () => {
+        calls++;
+        return new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) as unknown as typeof fetch,
+    });
+    expect(calls).toBe(0);
+    expect(out).toContain("Inverter.md");
   });
 
   test("opt-out restores strict per-conversation scoping (PR #132 behaviour)", async () => {

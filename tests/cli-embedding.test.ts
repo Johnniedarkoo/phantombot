@@ -7,7 +7,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applyEmbeddingConfig } from "../src/cli/embedding.ts";
+import {
+  applyEmbeddingConfig,
+  optionalPromptText,
+} from "../src/cli/embedding.ts";
 import { loadConfig } from "../src/config.ts";
 
 let workdir: string;
@@ -83,6 +86,42 @@ describe("applyEmbeddingConfig — none", () => {
     expect(c.embeddings.provider).toBe("none");
     // gemini sub-config not exposed when provider is none.
     expect(c.embeddings.gemini).toBeUndefined();
+  });
+});
+
+describe("applyEmbeddingConfig — openai-compatible", () => {
+  test("writes endpoint settings and detected dimensions", async () => {
+    await applyEmbeddingConfig(configPath, {
+      provider: "openai-compatible",
+      openaiCompatible: {
+        baseUrl: "http://127.0.0.1:8082/v1",
+        model: "example-embedding-model",
+        apiKey: "",
+        dims: 1024,
+        queryPrefix: "query: ",
+        documentPrefix: "passage: ",
+      },
+    });
+    const text = await readFile(configPath, "utf8");
+    expect(text).toContain('provider = "openai-compatible"');
+    expect(text).toContain("[embeddings.openai_compatible]");
+    expect(text).toContain("dims = 1024");
+    const c = await loadConfig();
+    expect(c.embeddings.openaiCompatible).toEqual({
+      baseUrl: "http://127.0.0.1:8082/v1",
+      model: "example-embedding-model",
+      apiKey: "",
+      dims: 1024,
+      queryPrefix: "query: ",
+      documentPrefix: "passage: ",
+      maxChunkChars: 5000,
+    });
+  });
+
+  test("empty optional prompt values remain empty", () => {
+    expect(optionalPromptText(undefined)).toBe("");
+    expect(optionalPromptText("")).toBe("");
+    expect(optionalPromptText("local-key")).toBe("local-key");
   });
 });
 
