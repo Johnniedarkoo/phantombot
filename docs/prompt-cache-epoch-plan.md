@@ -15,17 +15,17 @@ behind one setting:
 1. high-authority system material is kept stable and volatile PhantomBot turn
    context is placed after canonical history; and
 2. completed turns are retained in a bounded, in-process append-only epoch so
-   the next request can reuse the exact serialized prefix.
+   the next PhantomBot payload can retain an exact serialized prefix.
 
 ```toml
 [prompt_cache]
 enabled = false
-max_epoch_tokens = 80000
+max_epoch_bytes = 80000
 ```
 
 The equivalent environment overrides are
 `PHANTOMBOT_PROMPT_CACHE_ENABLED` and
-`PHANTOMBOT_PROMPT_CACHE_MAX_EPOCH_TOKENS`.
+`PHANTOMBOT_PROMPT_CACHE_MAX_EPOCH_BYTES`.
 
 ## Serialization
 
@@ -56,6 +56,26 @@ authenticated instruction, and historical text cannot override current
 principal instructions, retrieval, security policy, tool authorization, or
 stable system rules. Delimiters are framing only.
 
+There are two separate prefix claims:
+
+1. **PhantomBot serialized payload prefix:** within an epoch, payload N is an
+   exact textual prefix of payload N+1. The historical context and user
+   message that previously broke the prefix are retained identically.
+2. **Backend/model KV prefix:** Pi, Claude, and Codex are stateless CLI
+   harnesses that submit this rendered history as a flattened user-side
+   payload. On the immediately following request, the actual model-input LCP
+   can extend through the previous context and user message, but the
+   chat-template transition to the generated assistant response differs. The
+   immediately previous generated assistant response is therefore not
+   guaranteed to be reusable on that next request. Its wrapped representation
+   is present in the next request and can become part of the reusable prefix
+   on the request after that.
+
+The epoch tests prove the first property only; they do not claim full backend
+KV reuse of the immediately previous assistant generation. Assistant responses
+remain in epoch history because they are required for conversation semantics
+and become part of the stable serialized prefix on later turns.
+
 ## Ownership and lifecycle
 
 `PromptCacheEpochManager` lives above the harnesses in the orchestrator. Its
@@ -82,7 +102,7 @@ Before a request is rendered, the manager compares the current canonical
 history and full system prompt identity with the epoch state. It starts a new
 epoch when:
 
-- the projected prompt exceeds `max_epoch_tokens`;
+- the projected prompt exceeds `max_epoch_bytes`;
 - the process has no prior in-memory state;
 - the persona or conversation key changes;
 - the high-authority system prompt changes, including instruction-bearing
@@ -100,15 +120,19 @@ epoch ceiling, the request is still sent from canonical history for correctness
 but is not retained in an epoch. The setting is an optimization budget, not a
 reason to reject a conversation.
 
-## Token budget
+## Rendered byte budget
 
-PhantomBot currently has no shared exact tokenizer or model-context registry
-for all supported harnesses. The manager therefore uses a deterministic
-conservative UTF-16 code-unit estimate over the serialized system and payload
-strings. It deliberately overestimates non-ASCII text and is a prompt-budget
-estimate, not a claim about any particular model tokenizer. `max_epoch_tokens` should be chosen below the available
-prompt budget for the configured harness/model; backend-specific cache or
-context settings are outside this feature.
+`max_epoch_bytes` measures the UTF-8 byte length of the PhantomBot-rendered
+system prompt and conversation payload, including their separator when both
+are present. It is not an exact model-token count. Harness, chat-template, and
+tool tokens may exist outside this measurement, so the setting is an
+optimization bound, not a guarantee about the backend's usable context.
+
+Operators should choose the value conservatively for their configured model
+and harness. The shipped `80000` value is a conservative local starting
+point; we will tune it from benchmark evidence later. PhantomBot does not
+infer a token limit from a hardcoded bytes-per-token ratio and does not
+introduce a tokenizer or backend/model registry.
 
 No llama.cpp flags, cache settings, slot controls, persistence, or model
 configuration are required. Backends that do not reuse exact prefixes still

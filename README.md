@@ -606,29 +606,38 @@ The optimization is one opt-in feature and is disabled by default:
 ```toml
 [prompt_cache]
 enabled = false
-max_epoch_tokens = 80000
+max_epoch_bytes = 80000
 ```
 
 When enabled, PhantomBot keeps high-authority persona and security material
 ahead of canonical history, then places the current PhantomBot-provided context
 and user message after that history. Completed turns are appended to a small,
-in-process cache epoch so a compatible backend can reuse the exact serialized
-prefix across consecutive turns. The epoch is rebuilt from the canonical
-memory database when its estimated prompt budget is reached or its identity is
-no longer valid. That rebase causes one cold turn; it does not discard or
-rewrite durable memory.
+in-process cache epoch so payload N is an exact textual prefix of payload N+1.
+The epoch is rebuilt from the canonical memory database when its byte budget is
+reached or its identity is no longer valid. That rebase causes one cold turn;
+it does not discard or rewrite durable memory.
 
 The epoch contains no backend handles, slot identifiers, sessions, or persisted
 conversation data. It disappears on process restart, persona/conversation
 changes, prompt-policy changes, history edits, and failed serialization checks.
-`max_epoch_tokens` is a deterministic conservative prompt-budget estimate, not
-an exact tokenizer or a backend-specific context promise. Choose it below the
-available prompt budget for the configured harness/model. There is no fixed
-speedup guarantee: backends that do not reuse exact prefixes receive the same
-correct conversation semantics, with only the opt-in serialization behavior.
+`max_epoch_bytes` measures PhantomBot-rendered UTF-8 bytes, not exact model
+tokens. Harness, chat-template, and tool tokens may exist outside this
+measurement, so it is an optimization bound rather than a backend context
+guarantee. Operators should choose it conservatively for their model/harness;
+the shipped `80000` value will be tuned from benchmark evidence later. There is
+no fixed speedup guarantee: backends that do not reuse exact prefixes receive
+the same correct conversation semantics, with only the opt-in serialization
+behavior.
+
+The serialized-prefix property is distinct from backend KV reuse. Pi, Claude,
+and Codex are stateless CLI harnesses, so the immediately previous generated
+assistant response is not guaranteed to be reusable in the model input on the
+very next request when the chat-template role boundary differs. The historical
+context and user message remain identical, and the wrapped assistant response
+becomes part of the reusable serialized prefix on a later request.
 
 Environment overrides are `PHANTOMBOT_PROMPT_CACHE_ENABLED` and
-`PHANTOMBOT_PROMPT_CACHE_MAX_EPOCH_TOKENS`.
+`PHANTOMBOT_PROMPT_CACHE_MAX_EPOCH_BYTES`.
 
 The first time a newer phantombot starts, it **copies** the persona-scoped keys
 out of the global file into each persona's own file. It never deletes anything:

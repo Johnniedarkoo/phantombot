@@ -649,13 +649,13 @@ export const DEFAULT_TELEGRAM_STREAMING: TelegramStreamingSettings = {
 export interface PromptCacheSettings {
   /** Enable cache-friendly prompt ordering and bounded append-only epochs. */
   enabled: boolean;
-  /** Maximum estimated prompt tokens retained in one disposable epoch. */
-  maxEpochTokens: number;
+  /** Maximum rendered UTF-8 bytes retained in one disposable epoch. */
+  maxEpochBytes: number;
 }
 
 export const DEFAULT_PROMPT_CACHE: PromptCacheSettings = {
   enabled: false,
-  maxEpochTokens: 80_000,
+  maxEpochBytes: 80_000,
 };
 
 export interface Config {
@@ -2419,18 +2419,18 @@ function buildPromptCacheConfig(
   toml: Record<string, unknown>,
 ): PromptCacheSettings {
   const configuredMax =
-    asInt(process.env.PHANTOMBOT_PROMPT_CACHE_MAX_EPOCH_TOKENS) ??
-    asInt(toml.max_epoch_tokens);
-  const maxEpochTokens =
+    asInt(process.env.PHANTOMBOT_PROMPT_CACHE_MAX_EPOCH_BYTES) ??
+    asInt(toml.max_epoch_bytes);
+  const maxEpochBytes =
     configuredMax !== undefined && configuredMax > 0
       ? configuredMax
-      : DEFAULT_PROMPT_CACHE.maxEpochTokens;
+      : DEFAULT_PROMPT_CACHE.maxEpochBytes;
   return {
     enabled:
       asBool(process.env.PHANTOMBOT_PROMPT_CACHE_ENABLED) ??
       asBool(toml.enabled) ??
       DEFAULT_PROMPT_CACHE.enabled,
-    maxEpochTokens,
+    maxEpochBytes,
   };
 }
 

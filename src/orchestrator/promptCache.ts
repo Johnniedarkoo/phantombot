@@ -82,7 +82,7 @@ export class PromptCacheEpochManager {
       rebased = true;
     }
 
-    const projected = estimatePromptTokens({
+    const projected = estimatePromptBytes({
       systemPrompt: input.systemPrompt,
       history: state.baseHistory,
       epochTurns: state.epochTurns,
@@ -96,7 +96,7 @@ export class PromptCacheEpochManager {
     // epoch. The budget is a cache-epoch ceiling, not a reason to reject a
     // user turn.
     let retainEpoch = true;
-    if (projected > input.settings.maxEpochTokens) {
+    if (projected > input.settings.maxEpochBytes) {
       if (state.epochTurns.length > 0) {
         state = this.newState({
           key,
@@ -109,13 +109,13 @@ export class PromptCacheEpochManager {
         rebased = true;
       }
       if (
-        estimatePromptTokens({
+        estimatePromptBytes({
           systemPrompt: input.systemPrompt,
           history: state.baseHistory,
           epochTurns: [],
           turnContext: input.turnContext,
           userMessage: input.userMessage,
-        }) > input.settings.maxEpochTokens
+        }) > input.settings.maxEpochBytes
       ) {
         state.active = true;
         retainEpoch = false;
@@ -202,8 +202,8 @@ export function clearPromptCacheEpochs(): void {
   promptCacheEpochs.clear();
 }
 
-/** Conservative, backend-neutral token estimate used only for epoch bounds. */
-export function estimatePromptTokens(input: {
+/** Rendered UTF-8 byte count used only for the backend-neutral epoch bound. */
+export function estimatePromptBytes(input: {
   systemPrompt: string;
   history: readonly HistoryTurn[];
   epochTurns?: readonly PromptEpochTurn[];
@@ -211,10 +211,10 @@ export function estimatePromptTokens(input: {
   userMessage: string;
 }): number {
   const payload = renderConversationPayload(input);
-  // UTF-8 bytes are a conservative upper bound for ordinary text tokenizers:
-  // every textual token represents at least one input byte. This is not an
-  // exact model tokenizer; it deliberately overestimates non-ASCII text while
-  // avoiding backend-specific tokenizer RPC coupling.
+  // This measures only PhantomBot's rendered system/payload bytes. It is not
+  // an exact model-token count: harness/chat-template/tool tokens may exist
+  // outside this measurement. Keeping the bound byte-based avoids pretending
+  // that one tokenizer or backend applies to every supported harness.
   return (
     Buffer.byteLength(input.systemPrompt, "utf8") +
     Buffer.byteLength(payload, "utf8") +

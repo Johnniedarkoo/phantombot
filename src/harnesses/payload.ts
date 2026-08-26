@@ -7,9 +7,12 @@ import type { HistoryTurn } from "./types.ts";
  *   stable system prompt (owned by the harness) -> historical turns ->
  *   volatile per-turn context -> current user message
  *
- * Keeping volatile context after historical turns maximizes the exact common
- * prefix available to downstream KV/prompt caches while leaving PhantomBot as
- * the authoritative owner of conversation state.
+ * Keeping volatile context after historical turns preserves the longest useful
+ * serialized prefix available to downstream prompt caches while leaving
+ * PhantomBot as the authoritative owner of conversation state. This textual
+ * prefix claim does not guarantee that a stateless harness/model can reuse the
+ * immediately preceding generated assistant response: its chat-template role
+ * transition may differ on the next request.
  */
 export interface ConversationPayloadInput {
   history: readonly HistoryTurn[];

@@ -413,6 +413,11 @@ epoch context/user/assistant triples → current turn context → current user.
 The orchestrator owns epoch state above the harnesses; it must never become a
 second memory owner or persist llama.cpp/Pi cache handles. Do not move
 trusted/untrusted policy or instruction-bearing overlays into the data block.
+The epoch's exact-prefix guarantee is about PhantomBot's serialized payload,
+not full backend KV reuse: stateless Pi/Claude/Codex chat-template role
+transitions mean the immediately previous generated assistant response is not
+guaranteed reusable on the following request, though it becomes part of the
+stable serialized prefix on a later request.
 
 11. **Reply modality is mirror-input by default, with a per-message text override available.** `processChatMessage` in `src/channels/core/engine.ts` picks the wire format (sendMessage vs sendVoice) via `replyModalityOverride()` from `src/lib/audio.ts`: when the user's message (post-STT, so voice transcripts count) contains an explicit directive like *"reply in text"*, *"no voice"*, or *"send a voice note"*, that wins; otherwise modality mirrors input. The override is parsed by a small, deliberately conservative regex set — anchored on reply-verbs and unmistakable shorthand, no bare-noun matches ("text message to John" must not trigger). Voice is still capped by `ttsSupported(config)`: an override asking for voice when no TTS provider is configured degrades to text gracefully, same as the original no-TTS fallback. If you extend the regex set, add cases to `replyModalityOverride` in `tests/lib-audio.test.ts` AND to the three end-to-end scenarios in `tests/channels-telegram.test.ts` (voice-in→text, text-in→voice, text-in→voice-without-TTS).
 

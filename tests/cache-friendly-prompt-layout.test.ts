@@ -23,6 +23,7 @@ import {
 } from "../src/orchestrator/turn.ts";
 import {
   clearPromptCacheEpochs,
+  estimatePromptBytes,
   PromptCacheEpochManager,
 } from "../src/orchestrator/promptCache.ts";
 import { DEFAULT_PROMPT_CACHE } from "../src/config.ts";
@@ -249,7 +250,7 @@ describe("cache-friendly prompt layout", () => {
           memory,
           harnesses: [harnessOff],
           idleTimeoutMs: 1_000,
-          promptCache: { enabled: false, maxEpochTokens: 80_000 },
+          promptCache: { enabled: false, maxEpochBytes: 80_000 },
           retrieve: async () => "retrieved sentinel",
           pullFacts: async () => "fact sentinel",
           systemPromptSuffix: "# instruction-bearing overlay",
@@ -266,7 +267,7 @@ describe("cache-friendly prompt layout", () => {
           memory,
           harnesses: [harnessOn],
           idleTimeoutMs: 1_000,
-          promptCache: { enabled: true, maxEpochTokens: 80_000 },
+          promptCache: { enabled: true, maxEpochBytes: 80_000 },
           retrieve: async () => "retrieved sentinel",
           pullFacts: async () => "fact sentinel",
           systemPromptSuffix: "# instruction-bearing overlay",
@@ -304,9 +305,52 @@ describe("cache-friendly prompt layout", () => {
     }
   });
 
-  test("appends the completed turn and preserves the exact serialized prefix", () => {
+  test("rebases using the rendered UTF-8 byte count", () => {
+    const input = {
+      systemPrompt: "é",
+      history: [],
+      turnContext: "🙂",
+      userMessage: "u",
+    };
+    const renderedPayload = renderConversationPayload(input);
+    expect(renderedPayload).toBe("🙂\n\nu");
+    expect(estimatePromptBytes(input)).toBe(
+      Buffer.byteLength(input.systemPrompt, "utf8") +
+        Buffer.byteLength(renderedPayload, "utf8") +
+        2,
+    );
+
     const manager = new PromptCacheEpochManager();
-    const settings = { enabled: true, maxEpochTokens: 200 };
+    const plan = manager.prepare({
+      settings: { enabled: true, maxEpochBytes: 5 },
+      persona: "phantom",
+      conversation: "cli:bytes",
+      systemPrompt: "",
+      history: [],
+      turnContext: "🙂",
+      userMessage: "u",
+    })!;
+    // The rendered payload is 7 UTF-8 bytes (4 + 2 + 1), even though its
+    // JavaScript string length is only 5. A 5-byte ceiling must not retain it.
+    expect(estimatePromptBytes({
+      systemPrompt: "",
+      history: plan.baseHistory,
+      epochTurns: plan.epochTurns,
+      turnContext: plan.turnContext,
+      userMessage: plan.userMessage,
+    })).toBe(7);
+    expect(plan.retainEpoch).toBe(false);
+  });
+
+  test("keeps payload N as an exact textual prefix of payload N+1", () => {
+    // This proves PhantomBot's serialized payload property only. Pi, Claude,
+    // and Codex are stateless CLI harnesses: their next model input can have a
+    // different chat-template role boundary, so this is not proof that the
+    // immediately preceding generated assistant response is reused by backend
+    // KV state on the following request. That response becomes part of the
+    // stable serialized prefix on a later request.
+    const manager = new PromptCacheEpochManager();
+    const settings = { enabled: true, maxEpochBytes: 200 };
     const first = manager.prepare({
       settings,
       persona: "phantom",
@@ -354,7 +398,7 @@ describe("cache-friendly prompt layout", () => {
 
   test("rebases before the budget, while retaining canonical history", () => {
     const manager = new PromptCacheEpochManager();
-    const settings = { enabled: true, maxEpochTokens: 70 };
+    const settings = { enabled: true, maxEpochBytes: 70 };
     const first = manager.prepare({
       settings,
       persona: "phantom",
@@ -406,7 +450,7 @@ describe("cache-friendly prompt layout", () => {
   });
 
   test("system mutation, key changes, and restart cannot leak epoch state", () => {
-    const settings = { enabled: true, maxEpochTokens: 500 };
+    const settings = { enabled: true, maxEpochBytes: 500 };
     const manager = new PromptCacheEpochManager();
     const first = manager.prepare({
       settings,
