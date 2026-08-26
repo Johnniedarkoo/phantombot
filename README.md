@@ -171,12 +171,14 @@ phantombot builds the persona prompt, loads relevant memory, sends the turn to
 the harness, and relays the final answer to Telegram. The harness performs the
 SSH, file edits, searches, and command execution through its native tool loop.
 
-PhantomBot remains the owner of conversation history and durable memory. The
-cache-friendly prompt experiment (`PHANTOMBOT_CACHE_FRIENDLY_PROMPT=1`) keeps
-persona instructions and security policy in the system prompt, then places the
-current turn's retrieved context, durable facts, daily recall, and channel
-metadata after canonical history and before the current message. Any llama.cpp
-or Pi prompt cache is disposable acceleration; losing it never loses memory.
+PhantomBot remains the owner of conversation history and durable memory. An
+opt-in prompt-cache setting keeps persona instructions and security policy in
+the stable system prompt, places each turn's retrieved context, durable facts,
+daily recall, and channel metadata after canonical history, and retains a
+bounded append-only chain of completed turns for exact-prefix reuse. Cache
+state is disposable acceleration; losing it never loses memory. The feature is
+disabled by default, and its benefit depends on the selected backend supporting
+exact prompt-prefix caching.
 
 ## Install
 
@@ -596,6 +598,37 @@ always has.
 Some keys describe the *machine* and are only ever read from the global file:
 `default_persona`, `autostart_personas`, `update_channel`, `personas_dir` and
 `memory_db`. A persona cannot elect itself default or move the personas root.
+
+### Prompt-cache optimization
+
+The optimization is one opt-in feature and is disabled by default:
+
+```toml
+[prompt_cache]
+enabled = false
+max_epoch_tokens = 80000
+```
+
+When enabled, PhantomBot keeps high-authority persona and security material
+ahead of canonical history, then places the current PhantomBot-provided context
+and user message after that history. Completed turns are appended to a small,
+in-process cache epoch so a compatible backend can reuse the exact serialized
+prefix across consecutive turns. The epoch is rebuilt from the canonical
+memory database when its estimated prompt budget is reached or its identity is
+no longer valid. That rebase causes one cold turn; it does not discard or
+rewrite durable memory.
+
+The epoch contains no backend handles, slot identifiers, sessions, or persisted
+conversation data. It disappears on process restart, persona/conversation
+changes, prompt-policy changes, history edits, and failed serialization checks.
+`max_epoch_tokens` is a deterministic conservative prompt-budget estimate, not
+an exact tokenizer or a backend-specific context promise. Choose it below the
+available prompt budget for the configured harness/model. There is no fixed
+speedup guarantee: backends that do not reuse exact prefixes receive the same
+correct conversation semantics, with only the opt-in serialization behavior.
+
+Environment overrides are `PHANTOMBOT_PROMPT_CACHE_ENABLED` and
+`PHANTOMBOT_PROMPT_CACHE_MAX_EPOCH_TOKENS`.
 
 The first time a newer phantombot starts, it **copies** the persona-scoped keys
 out of the global file into each persona's own file. It never deletes anything:
