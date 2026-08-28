@@ -26,7 +26,8 @@
  *              persona-bound Telegram bot (`channels.telegram.personas.<name>`)
  *              AND the default bot when both are configured, plus that persona's
  *              `phantomchat.json`.
- *              Omitting it uses the default persona. A `tick`-fired notify has
+ *              Omitting it resolves PHANTOMBOT_PERSONA env, then the default
+ *              persona. A `tick`-fired notify has
  *              no inbound context, so this is how it lands in the right place.
  * Both message/voice flags can be combined to send text AND voice.
  */
@@ -42,6 +43,7 @@ import {
   type Config,
   type TelegramAccount,
   loadConfigForPersona,
+  resolvePersona,
 } from "../config.ts";
 import { loadPhantomchatPersonaConfig } from "../channels/phantomchat/personaStore.ts";
 import { type AudioSupport, synthesize, ttsSupport } from "../lib/audio.ts";
@@ -103,7 +105,8 @@ export interface RunNotifyInput {
   /**
    * Which persona's channels to notify. Broadcasts across the persona-bound
    * Telegram bot AND the default bot (when both are configured), plus that
-   * persona's phantomchat.json. When omitted, the default persona is used.
+   * persona's phantomchat.json. When omitted, PHANTOMBOT_PERSONA env is
+   * honored, then the default persona.
    */
   persona?: string;
   /** Inject for testing. Default: HttpTelegramTransport with the configured token. */
@@ -136,7 +139,7 @@ export async function runNotify(input: RunNotifyInput = {}): Promise<number> {
   const { config, persona, host } = input.config
     ? {
         config: input.config,
-        persona: input.persona ?? input.config.defaultPersona,
+        persona: resolvePersona(input.persona, input.config),
         host: input.config,
       }
     : await loadConfigForPersona(input.persona);
@@ -403,7 +406,7 @@ export default defineCommand({
     persona: {
       type: "string",
       description:
-        "Which persona's channels to notify (its Telegram bot + phantomchat identity). Defaults to the default persona. Broadcasts to every authorized owner of each configured channel.",
+        "Which persona's channels to notify (its Telegram bot + phantomchat identity). Default: PHANTOMBOT_PERSONA env, then the default persona. Broadcasts to every authorized owner of each configured channel.",
     },
   },
   async run({ args }) {

@@ -45,6 +45,7 @@ import {
   loadConfig,
   memoryIndexPath,
   personaDir,
+  resolvePersona,
 } from "../config.ts";
 import {
   defaultEmbedderWithFetch,
@@ -97,7 +98,7 @@ function resolvePersonaDir(config: Config, persona?: string): {
   persona: string;
   dir: string;
 } {
-  const name = persona ?? config.defaultPersona;
+  const name = resolvePersona(persona, config);
   return { persona: name, dir: personaDir(config, name) };
 }
 
@@ -1165,7 +1166,7 @@ const searchCmd = defineCommand({
       description: "What to search for.",
       required: true,
     },
-    persona: { type: "string", description: "Persona name (default: configured default)." },
+    persona: { type: "string", description: "Persona name (default: PHANTOMBOT_PERSONA env, then the configured default persona)." },
     scope: {
       type: "string",
       description: "memory | kb | all (default: all)",

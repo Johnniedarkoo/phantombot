@@ -19,6 +19,7 @@ import {
   memoryIndexPath,
   personaDir,
   loadConfigForPersona,
+  resolvePersona,
 } from "../config.ts";
 import { isPhantombotBinary } from "../lib/binaryIdentity.ts";
 import { defaultEmbedder, runEmbedJob } from "../lib/embedJob.ts";
@@ -124,7 +125,7 @@ export async function runHeartbeatCli(
   const { config, persona } = input.config
     ? {
         config: input.config,
-        persona: input.persona ?? input.config.defaultPersona,
+        persona: resolvePersona(input.persona, input.config),
       }
     : await loadConfigForPersona(input.persona);
   const dir = personaDir(config, persona);
@@ -411,7 +412,7 @@ export default defineCommand({
   args: {
     persona: {
       type: "string",
-      description: "Persona name (default: configured default).",
+      description: "Persona name (default: PHANTOMBOT_PERSONA env, then the configured default persona).",
     },
   },
   async run({ args }) {
