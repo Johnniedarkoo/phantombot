@@ -82,6 +82,7 @@ and become part of the stable serialized prefix on later turns.
 state is keyed by persona and conversation and contains only:
 
 - the stable-system fingerprint;
+- the explicit trust bit and effective security-surface fingerprint;
 - canonical history observed at epoch start and an in-process canonical
   expectation used to detect edits;
 - serialized context/user/assistant triples; and
@@ -96,6 +97,20 @@ Concurrent turns for the same key invalidate the previous in-process epoch;
 the next turn safely rebuilds from the memory store. This favors a predictable
 rebase over making an ordering assumption about completion races.
 
+Security boundaries are explicit cache boundaries as well. A trusted/untrusted
+transition rebases from canonical history even when the rendered system prompt
+happens to be unchanged. A held untrusted request discards the warm epoch before
+the hold is returned, because held requests stop before cache preparation. The
+manager also discards all persona states for a conversation when its active
+persona changes, so A → B → A cannot resume A's earlier epoch; other
+persona/conversation keys remain independent for normal multi-persona service.
+Effective screening and tool-surface changes use the same explicit security
+boundary. Channel authentication, allowlists, harness/MCP configuration, and
+other security settings are loaded by the long-lived process and their existing
+settings flows require a restart. Since epoch state is process-local, a restart
+already clears it; persona/policy prompt edits remain additionally covered by
+the full system fingerprint.
+
 ## Rebase rules
 
 Before a request is rendered, the manager compares the current canonical
@@ -107,7 +122,8 @@ epoch when:
 - the persona or conversation key changes;
 - the high-authority system prompt changes, including instruction-bearing
   overlays;
-- canonical history no longer matches the expected persisted tail; or
+- canonical history no longer matches the expected persisted tail;
+- explicit trust, persona, or effective security-surface state changes; or
 - an active concurrent turn makes the old ordering unverifiable.
 
 Rebasing discards only the serialized epoch snapshots. It rebuilds from the
@@ -155,14 +171,18 @@ line per eligible turn with `msg: "prompt_cache.epoch"`. The safe fields are
 same rendered UTF-8 measurement used by the epoch ceiling. Budget rebases also
 include `projected_epoch_bytes`, the pre-rebase projection.
 
-`event` is one of `new`, `append`, `rebase`, or `bypass`. `new` carries
+`event` is one of `new`, `append`, `rebase`, `bypass`, or `invalidate`. `new` carries
 `reason: "no_state"`; `rebase` carries `rebase_reason`; and `bypass` carries
-`bypass_reason`. Reasons currently emitted are `no_state`, `budget`,
+`bypass_reason`. `invalidate` carries `invalidation_reason`. Reasons currently
+emitted are `no_state`, `budget`,
 `system_changed`, `history_changed`, `concurrent_turn`, `oversized_base`, and
-`no_history`. When multiple invalidation conditions are true, the deterministic
-precedence is `no_state`, `concurrent_turn`, `system_changed`,
-`history_changed`, then `budget`; a request that remains over the ceiling after
-rebasing is reported as `bypass/oversized_base`.
+`no_history`, plus the explicit security reasons `trust_changed`,
+`persona_changed`, `threat_hold`, and `security_changed`. When multiple
+invalidation conditions are true, the deterministic precedence is
+`persona_changed`, `no_state`, `concurrent_turn`, `trust_changed`,
+`security_changed`, `system_changed`, `history_changed`, then `budget`; a
+request that remains over the ceiling after rebasing is reported as
+`bypass/oversized_base`.
 
 These are operational measurements only. No prompt, user or assistant text,
 retrieved memory, durable fact, daily recall, system/persona content, tool

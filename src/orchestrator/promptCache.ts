@@ -10,7 +10,12 @@ import { log } from "../lib/logger.ts";
 
 const DEFAULT_HISTORY_LIMIT = 30;
 
-export type PromptCacheEpochEvent = "new" | "append" | "rebase" | "bypass";
+export type PromptCacheEpochEvent =
+  | "new"
+  | "append"
+  | "rebase"
+  | "bypass"
+  | "invalidate";
 
 export type PromptCacheReason =
   | "no_state"
@@ -20,7 +25,11 @@ export type PromptCacheReason =
   | "concurrent_turn"
   | "oversized_base"
   | "no_history"
-  | "cache_error";
+  | "cache_error"
+  | "trust_changed"
+  | "persona_changed"
+  | "threat_hold"
+  | "security_changed";
 
 export type PromptCacheErrorPhase =
   | "prepare"
@@ -33,6 +42,8 @@ interface EpochState {
   persona: string;
   conversation: string;
   systemFingerprint: string;
+  trusted: boolean;
+  securityFingerprint: string;
   baseHistory: HistoryTurn[];
   canonicalHistory: HistoryTurn[];
   epochTurns: PromptEpochTurn[];
@@ -61,6 +72,10 @@ export interface PreparePromptCacheInput {
   conversation: string;
   systemPrompt: string;
   history: readonly HistoryTurn[];
+  /** Explicit security provenance; never infer this from prompt text. */
+  trusted?: boolean;
+  /** Effective security/tool-surface identity for this turn. */
+  securityFingerprint?: string;
   historyLimit?: number;
   turnContext?: string;
   userMessage: string;
@@ -84,6 +99,8 @@ interface PromptCacheTelemetry {
  */
 export class PromptCacheEpochManager {
   private readonly states = new Map<string, EpochState>();
+  /** The current persona for each conversation served by this process. */
+  private readonly activePersonas = new Map<string, string>();
 
   prepare(input: PreparePromptCacheInput): PromptCacheEpochPlan | undefined {
     if (!input.settings.enabled) return undefined;
@@ -94,6 +111,16 @@ export class PromptCacheEpochManager {
       input.historyLimit ?? DEFAULT_HISTORY_LIMIT,
     );
     const fingerprint = systemFingerprint(input.systemPrompt);
+    const trusted = input.trusted === true;
+    const securityFingerprint =
+      input.securityFingerprint ?? (trusted ? "trusted" : "untrusted");
+    const previousPersona = this.activePersonas.get(input.conversation);
+    const personaChanged =
+      previousPersona !== undefined && previousPersona !== input.persona;
+    if (personaChanged) {
+      this.deleteConversationStates(input.conversation);
+    }
+    this.activePersonas.set(input.conversation, input.persona);
     let state = this.states.get(key);
     let rebased = false;
     let reason: PromptCacheReason | undefined;
@@ -109,10 +136,16 @@ export class PromptCacheEpochManager {
       throw new Error("prompt-cache state is invalid");
     }
 
-    if (!state) {
+    if (personaChanged) {
+      reason = "persona_changed";
+    } else if (!state) {
       reason = "no_state";
     } else if (state.active) {
       reason = "concurrent_turn";
+    } else if (state.trusted !== trusted) {
+      reason = "trust_changed";
+    } else if (state.securityFingerprint !== securityFingerprint) {
+      reason = "security_changed";
     } else if (state.systemFingerprint !== fingerprint) {
       reason = "system_changed";
     } else if (
@@ -130,6 +163,8 @@ export class PromptCacheEpochManager {
         persona: input.persona,
         conversation: input.conversation,
         systemFingerprint: fingerprint,
+        trusted,
+        securityFingerprint,
         history: input.history,
       });
       this.states.set(key, state);
@@ -164,6 +199,8 @@ export class PromptCacheEpochManager {
           persona: input.persona,
           conversation: input.conversation,
           systemFingerprint: fingerprint,
+          trusted,
+          securityFingerprint,
           history: input.history,
         });
         this.states.set(key, state);
@@ -322,8 +359,31 @@ export class PromptCacheEpochManager {
     this.states.delete(cacheKey(persona, conversation));
   }
 
+  /**
+   * Invalidate a security boundary without touching canonical memory.
+   *
+   * This is deliberately best-effort bookkeeping: a hold, trust transition,
+   * or effective security-surface change must never turn into a failed turn
+   * because disposable cache state could not be removed.
+   */
+  invalidate(
+    input: Pick<PreparePromptCacheInput, "settings" | "persona" | "conversation">,
+    reason: "trust_changed" | "persona_changed" | "threat_hold" | "security_changed",
+  ): void {
+    if (!input.settings.enabled) return;
+    this.states.delete(cacheKey(input.persona, input.conversation));
+    log.info("prompt_cache.epoch", {
+      event: "invalidate",
+      persona: input.persona,
+      conversation: input.conversation,
+      retain_epoch: false,
+      invalidation_reason: reason,
+    });
+  }
+
   clear(): void {
     this.states.clear();
+    this.activePersonas.clear();
   }
 
   private logTelemetry(
@@ -366,11 +426,19 @@ export class PromptCacheEpochManager {
       persona: input.persona,
       conversation: input.conversation,
       systemFingerprint: input.systemFingerprint,
+      trusted: input.trusted,
+      securityFingerprint: input.securityFingerprint,
       baseHistory: history,
       canonicalHistory: cloneHistory(history),
       epochTurns: [],
       active: false,
     };
+  }
+
+  private deleteConversationStates(conversation: string): void {
+    for (const [key, state] of this.states) {
+      if (state.conversation === conversation) this.states.delete(key);
+    }
   }
 }
 
@@ -424,6 +492,32 @@ export function estimatePromptBytes(input: {
   );
 }
 
+/**
+ * Stable identity for the effective security surface of a cached turn.
+ *
+ * This is intentionally not telemetry and is never exposed to a harness. It
+ * makes changes to screening availability or the per-turn tool surface an
+ * explicit cache boundary, independent of prompt wording.
+ */
+export function promptCacheSecurityFingerprint(input: {
+  trusted: boolean;
+  screening: "screened" | "unscreened" | "trusted";
+  mcpMode: "default" | "none";
+  tools: readonly string[] | undefined;
+}): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        trusted: input.trusted,
+        screening: input.screening,
+        mcpMode: input.mcpMode,
+        tools: input.tools ? [...input.tools].sort() : null,
+      }),
+      "utf8",
+    )
+    .digest("hex");
+}
+
 function cacheKey(persona: string, conversation: string): string {
   return `${persona}\u0000${conversation}`;
 }
@@ -468,6 +562,8 @@ function isValidEpochState(
     state.conversation !== expectedConversation ||
     typeof state.systemFingerprint !== "string" ||
     !/^[0-9a-f]{64}$/.test(state.systemFingerprint) ||
+    typeof state.trusted !== "boolean" ||
+    typeof state.securityFingerprint !== "string" ||
     typeof state.active !== "boolean" ||
     !Array.isArray(state.baseHistory) ||
     !Array.isArray(state.canonicalHistory) ||

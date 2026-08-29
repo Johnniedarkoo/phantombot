@@ -625,6 +625,18 @@ request. A failure while preparing, completing, or discarding cache bookkeeping
 is contained: a valid model response remains a successful user turn. Cache-error
 telemetry contains safe metadata only and never prompt content.
 
+Security boundaries are explicit cache boundaries too. Trusted/untrusted
+transitions rebase from canonical history even if prompt text would otherwise
+look unchanged. A held untrusted request discards the warm epoch before the
+hold returns, and changing persona within a conversation discards the prior
+persona state so A → B → A cannot revive it. Effective screening and tool
+surface changes also rebase. Channel authentication, allowlists, harness/MCP
+configuration, and other security settings use the existing restart-required
+configuration lifecycle; a process restart clears all in-process epoch state.
+Persona/policy prompt edits remain additionally covered by the full system
+fingerprint. These are security lifecycle rules, not claims about prompt
+position or authority.
+
 The epoch contains no backend handles, slot identifiers, sessions, or persisted
 conversation data. It disappears on process restart, persona/conversation
 changes, prompt-policy changes, history edits, and failed serialization checks.

@@ -193,6 +193,13 @@ phantombot/
   content. The opt-in config block is:
   `[prompt_cache]` with `enabled = false` and `max_epoch_bytes = 80000`;
   set `enabled = true` only when the optimization is wanted.
+  Epochs explicitly rebase across trusted/untrusted transitions, discard before
+  returning a held untrusted request, and discard a conversation's prior
+  persona states on persona changes so A → B → A cannot revive an old epoch.
+  Effective screening/tool-surface changes are explicit security boundaries;
+  restart-required security configuration is already covered because epochs
+  are process-local. These rules are security lifecycle controls, not authority
+  claims about prompt position.
 - **`workingDir` is REQUIRED on every `runTurn` call** (#387) — the harness subprocess cwd, deliberately with no default. Interactive surfaces (telegram, phantomchat, ask, tick, reactions) pass `homedir()`, because the owner asks for work on repos all over their home dir. Machine-driven background turns (nightly) pass the **persona dir**. This used to silently default to `homedir()` and every background caller took the default, so nightly stages woke up in `$HOME` unable to see their own `memory/` from cwd — and went hunting for it. On macOS those recursive walks cross `~/Library/Containers`, tripping the TCC `kTCCServiceSystemPolicyAppData` prompt ("phantombot would like to access data from other apps") once per spawned date. If you add a `runTurn` caller, decide which tree it may treat as home and say so explicitly.
 
 ## Channel layer (core + adapters)
