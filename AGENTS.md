@@ -173,12 +173,12 @@ phantombot/
 - **Credential bootstrap** (`lib/vaultMigrate.ts` → `lib/vault.ts`) imports any legacy plaintext `.env` into the per-persona encrypted vaults ONCE, then `loadVaultIntoEnv()` injects the active persona's secrets into `process.env` at startup; each harness reloads that vault before every spawn so `phantombot vault set` takes effect mid-session. Nothing reads a `.env` file at runtime (#452).
 - **Tick fires scheduled tasks** (`src/cli/tick.ts`); 1-minute systemd timer; lockfile prevents overlap; missed runs are skipped, not piled up.
 - **Heartbeat is mechanical** (no LLM); **nightly is cognitive** (LLM-driven distillation).
-- **Prompt-cache optimization keeps PhantomBot authoritative.** The
+- **Prompt-cache optimization preserves PhantomBot's ownership.** The
   orchestrator owns history, retrieval, durable facts, daily recall, and
   restart reconstruction. The opt-in `[prompt_cache]` feature keeps persona,
   policy, security, and instruction-bearing overlays in the system prompt,
   then renders volatile PhantomBot context after canonical history and before
-  the current user message. Its in-process epoch manager appends completed
+  the current user message for exact-prefix reuse. Its in-process epoch manager appends completed
   context/user/assistant triples until a conservative prompt budget requires a
   deterministic rebase from canonical history. Epoch state is disposable: it
   contains no SQLite rows, Pi sessions, llama.cpp slots, KV blobs, or backend
@@ -202,8 +202,9 @@ phantombot/
   fail-open but fingerprinted as unscreened. Effective screening/tool-surface
   changes are explicit security boundaries; restart-required security
   configuration is already covered because epochs are process-local. These
-  rules are security lifecycle controls, not authority claims about prompt
-  position.
+  rules are security lifecycle controls. Security authority comes from explicit
+  trust state, threat screening, security/system policy, and epoch invalidation,
+  never from prompt position or token order.
 - **`workingDir` is REQUIRED on every `runTurn` call** (#387) — the harness subprocess cwd, deliberately with no default. Interactive surfaces (telegram, phantomchat, ask, tick, reactions) pass `homedir()`, because the owner asks for work on repos all over their home dir. Machine-driven background turns (nightly) pass the **persona dir**. This used to silently default to `homedir()` and every background caller took the default, so nightly stages woke up in `$HOME` unable to see their own `memory/` from cwd — and went hunting for it. On macOS those recursive walks cross `~/Library/Containers`, tripping the TCC `kTCCServiceSystemPolicyAppData` prompt ("phantombot would like to access data from other apps") once per spawned date. If you add a `runTurn` caller, decide which tree it may treat as home and say so explicitly.
 
 ## Channel layer (core + adapters)
@@ -423,12 +424,14 @@ version string can't carry that information.
 10. **Channel-specific behavior belongs in the channel layer, not in personas.** Brevity for voice replies, formatting for Slack, etc. should be appended to the system prompt at the channel boundary (see `VOICE_REPLY_INSTRUCTION` in `src/channels/core/prompts.ts`, passed via `runTurn`'s `systemPromptSuffix`). Putting "be brief on voice" in a persona's BOOT.md/SOUL.md throttles text replies too — and persists across all the persona's contexts where verbosity is fine. Channel-layer suffixes are scoped to the turn that needs them.
 
 11. **Prompt-cache ordering and epochs must stay disposable.** The opt-in
-`[prompt_cache]` feature keeps high-authority persona/policy/security material
+`[prompt_cache]` feature keeps stable persona/policy/security material
 in `systemPrompt`, uses `HarnessRequest.turnContext` for the current turn's
 facts, retrieval, daily recall, and display-only channel data, and carries
 completed triples in `HarnessRequest.epochTurns`. Adapters must use
 `renderConversationPayload()` so the order remains canonical history → retained
-epoch context/user/assistant triples → current turn context → current user.
+epoch context/user/assistant triples → current turn context → current user;
+this order exists for cache/prefix reuse only and does not assign trust or
+authority.
 The orchestrator owns epoch state above the harnesses; it must never become a
 second memory owner or persist llama.cpp/Pi cache handles. Do not move
 trusted/untrusted policy or instruction-bearing overlays into the data block.

@@ -1,9 +1,10 @@
 /**
  * Construct the system prompt for a turn.
  *
- * Order matters. Persona first (most stable, most cacheable). Memory next.
- * Channel context (sender name, timestamp) last so the LRU prompt-cache on
- * the Anthropic side stays warm for the persona-and-memory prefix.
+ * Serialization order is a cache optimization: keep stable persona material
+ * together and place changing channel context later so downstream prompt
+ * caches can reuse the longest stable prefix. Position does not assign trust,
+ * authority, or security meaning.
  */
 
 import { OKF_AGENT_TYPES, OKF_CORE_TYPES } from "../lib/okf.js";
@@ -71,10 +72,11 @@ export function buildSystemPrompt(
 }
 
 /**
- * Build the stable/high-authority portion used by the cache-friendly path.
+ * Build the stable system portion used by the cache-friendly path.
  * Volatile facts, retrieval, daily recall, and display-only channel metadata
  * are intentionally not accepted here. Security selection remains system
- * material because it is an authority boundary, not turn data.
+ * material because explicit trust/threat-screen policy selects it; prompt
+ * placement is not an authority boundary.
  */
 export function buildStableSystemPrompt(
   persona: PersonaFiles,
