@@ -184,8 +184,9 @@ phantombot/
   contains no SQLite rows, Pi sessions, llama.cpp slots, KV blobs, or backend
   handles. The feature is OFF by default; the llama.cpp/Pi cache is never a
   source of durable memory, and a backend that cannot reuse exact prefixes
-  still receives correct prompts. Missing, invalid, corrupt, or inconsistent
-  epoch bookkeeping must be discarded and fall back to the normal feature-off
+  still receives correct prompts. If no epoch state exists, PhantomBot starts a
+  fresh cold epoch from canonical history. Invalid, corrupt, or inconsistent
+  state is discarded; preparation failures fall back to the normal feature-off
   prompt path for that request. Preparation, completion, and discard failures
   are best-effort and must not turn a successful model response into a failed
   user turn; cache-error telemetry contains safe metadata only, never prompt

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -66,6 +66,22 @@ class CapturingHarness implements Harness {
   async *invoke(req: HarnessRequest): AsyncGenerator<HarnessChunk> {
     this.captured = req;
     yield { type: "done", finalText: "ok" };
+  }
+}
+
+class FailingHarness implements Harness {
+  readonly id = "fake-fail";
+
+  async available(): Promise<boolean> {
+    return true;
+  }
+
+  async *invoke(_req: HarnessRequest): AsyncGenerator<HarnessChunk> {
+    yield {
+      type: "error",
+      error: "model failure secret",
+      recoverable: false,
+    };
   }
 }
 
@@ -312,8 +328,13 @@ describe("cache-friendly prompt layout", () => {
       const agentDir = await mkdtemp(
         join(tmpdir(), "phantombot-cache-prepare-error-"),
       );
+      const controlAgentDir = await mkdtemp(
+        join(tmpdir(), "phantombot-cache-prepare-control-"),
+      );
       const memory = await openMemoryStore(":memory:");
+      const controlMemory = await openMemoryStore(":memory:");
       const harness = new CapturingHarness();
+      const controlHarness = new CapturingHarness();
       const states = (
         promptCacheEpochs as unknown as {
           states: Map<string, { epochTurns: unknown[] }>;
@@ -326,8 +347,28 @@ describe("cache-friendly prompt layout", () => {
         return true;
       }) as typeof process.stderr.write;
       try {
+        setSystemTime(new Date("2026-08-26T00:00:00.000Z"));
         clearPromptCacheEpochs();
         await writeFile(join(agentDir, "BOOT.md"), "# PhantomBot", "utf8");
+        await writeFile(
+          join(controlAgentDir, "BOOT.md"),
+          "# PhantomBot",
+          "utf8",
+        );
+        for (const store of [memory, controlMemory]) {
+          await store.appendTurn({
+            persona: "phantom",
+            conversation: "cli:prepare-error",
+            role: "user",
+            text: "old user",
+          });
+          await store.appendTurn({
+            persona: "phantom",
+            conversation: "cli:prepare-error",
+            role: "assistant",
+            text: "old answer",
+          });
+        }
         await collect(
           runTurn({
             persona: "phantom",
@@ -339,6 +380,21 @@ describe("cache-friendly prompt layout", () => {
             harnesses: [harness],
             idleTimeoutMs: 1_000,
             promptCache: { enabled: true, maxEpochBytes: 80_000 },
+            systemPromptSuffix: "# instruction-bearing overlay",
+          }),
+        );
+        await collect(
+          runTurn({
+            persona: "phantom",
+            conversation: "cli:prepare-error",
+            userMessage: "seed",
+            agentDir: controlAgentDir,
+            workingDir: controlAgentDir,
+            memory: controlMemory,
+            harnesses: [controlHarness],
+            idleTimeoutMs: 1_000,
+            promptCache: { enabled: false, maxEpochBytes: 80_000 },
+            systemPromptSuffix: "# instruction-bearing overlay",
           }),
         );
         const state = states.get("phantom\u0000cli:prepare-error");
@@ -357,19 +413,56 @@ describe("cache-friendly prompt layout", () => {
             promptCache: { enabled: true, maxEpochBytes: 80_000 },
             retrieve: async () => "retrieval secret",
             pullFacts: async () => "fact secret",
+            systemPromptSuffix: "# instruction-bearing overlay",
+          }),
+        );
+        await collect(
+          runTurn({
+            persona: "phantom",
+            conversation: "cli:prepare-error",
+            userMessage: "current user secret",
+            agentDir: controlAgentDir,
+            workingDir: controlAgentDir,
+            memory: controlMemory,
+            harnesses: [controlHarness],
+            idleTimeoutMs: 1_000,
+            promptCache: { enabled: false, maxEpochBytes: 80_000 },
+            retrieve: async () => "retrieval secret",
+            pullFacts: async () => "fact secret",
+            systemPromptSuffix: "# instruction-bearing overlay",
           }),
         );
       } finally {
         process.stderr.write = originalWrite;
         clearPromptCacheEpochs();
         await memory.close();
+        await controlMemory.close();
         await rm(agentDir, { recursive: true, force: true });
+        await rm(controlAgentDir, { recursive: true, force: true });
+        setSystemTime();
       }
 
-      expect(harness.captured?.turnContext).toBeUndefined();
-      expect(harness.captured?.systemPrompt).toContain("retrieval secret");
-      expect(harness.captured?.systemPrompt).toContain("fact secret");
-      expect(harness.captured?.systemPrompt).not.toContain(TURN_CONTEXT_SYSTEM_RULE);
+      const fallback = harness.captured!;
+      const control = controlHarness.captured!;
+      expect(fallback.turnContext).toBeUndefined();
+      expect(fallback.systemPrompt).toContain("retrieval secret");
+      expect(fallback.systemPrompt).toContain("fact secret");
+      expect(fallback.systemPrompt).not.toContain(TURN_CONTEXT_SYSTEM_RULE);
+      expect({
+        systemPrompt: fallback.systemPrompt,
+        history: fallback.history,
+        turnContext: fallback.turnContext,
+        epochTurns: fallback.epochTurns,
+        userMessage: fallback.userMessage,
+        renderedPayload: renderConversationPayload(fallback),
+      }).toEqual({
+        systemPrompt: control.systemPrompt,
+        history: control.history,
+        turnContext: control.turnContext,
+        epochTurns: control.epochTurns,
+        userMessage: control.userMessage,
+        renderedPayload: renderConversationPayload(control),
+      });
       const telemetry = lines.join("");
       expect(telemetry).toContain('"bypass_reason":"cache_error"');
       expect(telemetry).toContain('"phase":"prepare"');
@@ -473,6 +566,56 @@ describe("cache-friendly prompt layout", () => {
       expect(telemetry).toContain('"phase":"complete"');
       expect(telemetry).not.toContain("assistant secret from broken completion state");
       expect(telemetry).not.toContain("current user secret");
+    },
+  );
+
+  test(
+    "failed-request bookkeeping failure cannot fail the already failed turn",
+    async () => {
+      const agentDir = await mkdtemp(
+        join(tmpdir(), "phantombot-cache-fail-error-"),
+      );
+      const memory = await openMemoryStore(":memory:");
+      const harness = new FailingHarness();
+      const originalFail = promptCacheEpochs.fail;
+      const originalWrite = process.stderr.write;
+      const lines: string[] = [];
+      promptCacheEpochs.fail = (() => {
+        throw new Error("failed bookkeeping secret");
+      }) as typeof originalFail;
+      process.stderr.write = ((chunk: unknown) => {
+        lines.push(String(chunk));
+        return true;
+      }) as typeof process.stderr.write;
+      try {
+        clearPromptCacheEpochs();
+        await writeFile(join(agentDir, "BOOT.md"), "# PhantomBot", "utf8");
+        await collect(
+          runTurn({
+            persona: "phantom",
+            conversation: "cli:fail-error",
+            userMessage: "failed user secret",
+            agentDir,
+            workingDir: agentDir,
+            memory,
+            harnesses: [harness],
+            idleTimeoutMs: 1_000,
+            promptCache: { enabled: true, maxEpochBytes: 80_000 },
+          }),
+        );
+      } finally {
+        process.stderr.write = originalWrite;
+        promptCacheEpochs.fail = originalFail;
+        clearPromptCacheEpochs();
+        await memory.close();
+        await rm(agentDir, { recursive: true, force: true });
+      }
+
+      const telemetry = lines.join("");
+      expect(telemetry).toContain('"bypass_reason":"cache_error"');
+      expect(telemetry).toContain('"phase":"fail"');
+      expect(telemetry).not.toContain("failed bookkeeping secret");
+      expect(telemetry).not.toContain("failed user secret");
     },
   );
 

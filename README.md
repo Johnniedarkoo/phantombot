@@ -618,10 +618,11 @@ reached or its identity is no longer valid. That rebase causes one cold turn;
 it does not discard or rewrite durable memory.
 
 Epoch bookkeeping is disposable optimization state, not part of turn
-correctness. If it is missing, invalid, corrupt, or inconsistent, PhantomBot
-discards it and uses the normal feature-off prompt path for that request. A
-failure while preparing, completing, or discarding cache bookkeeping is
-contained: a valid model response remains a successful user turn. Cache-error
+correctness. If no epoch state exists, PhantomBot starts a fresh cold epoch
+from canonical history. Invalid, corrupt, or inconsistent state is discarded;
+preparation failures fall back to the normal feature-off prompt path for that
+request. A failure while preparing, completing, or discarding cache bookkeeping
+is contained: a valid model response remains a successful user turn. Cache-error
 telemetry contains safe metadata only and never prompt content.
 
 The epoch contains no backend handles, slot identifiers, sessions, or persisted
