@@ -25,9 +25,15 @@ import { hostSnapshot } from "./snapshot.ts";
 import { openChat } from "./chatSession.ts";
 import type { WizardAnswers } from "./screens/Wizard.tsx";
 import { loadConfig, loadConfigForPersona } from "../config.ts";
-import { personaCompleteness, type WizardStep } from "../lib/personaComplete.ts";
+import {
+  personaCompleteness,
+  type WizardStep,
+} from "../lib/personaComplete.ts";
 import { runPersonaNew } from "../cli/persona-new.ts";
 import { log } from "../lib/logger.ts";
+import { personaConfigPath } from "../lib/personaConfig.ts";
+import { updateConfigToml, setIn } from "../lib/configWriter.ts";
+import { listPersonaDirs } from "../lib/personaDefault.ts";
 
 /**
  * Decide what the app opens on.
@@ -198,17 +204,42 @@ export function installSignalExit(
 export async function createPhantomFromWizard(
   answers: WizardAnswers,
 ): Promise<void> {
-  const code = await runPersonaNew({
-    name: answers.name,
-    harness: answers.brain,
-    autostart: true,
-    makeDefault: answers.makeDefault,
-    // The wizard's own output is the summary screen; the subcommand's stdout
-    // would land underneath the rendered frame.
-    out: { write: () => {} },
-    err: { write: () => {} },
-  });
-  if (code !== 0) throw new Error(`could not create persona '${answers.name}'`);
+  // Load the target's effective layer before creating it. With no persona file
+  // yet this is the host chain; on a retry it also preserves any partial layer
+  // that did make it to disk instead of borrowing the current default's chain.
+  const target = await loadConfig(answers.name);
+  if (!listPersonaDirs(target).includes(answers.name)) {
+    let stderr = "";
+    const code = await runPersonaNew({
+      name: answers.name,
+      harness: answers.brain,
+      autostart: true,
+      makeDefault: answers.makeDefault,
+      // The wizard's own output is the summary screen; the subcommand's stdout
+      // would land underneath the rendered frame.
+      out: { write: () => {} },
+      err: { write: (chunk) => void (stderr += chunk) },
+    });
+    if (code !== 0) {
+      throw new Error(
+        stderr.trim() || `could not create persona '${answers.name}'`,
+      );
+    }
+  }
+
+  // The review screen promises a persona-local config file. Record the chosen
+  // brain there so the daemon reads the same choice the user just reviewed.
+  // This deliberately bypasses resolvePersonaWriteTarget(): a new persona has
+  // no config file yet, so that helper would target the global config. Preserve
+  // inherited fallbacks while moving the chosen brain to the head of the chain.
+  const chain = [
+    answers.brain,
+    ...(target.harnesses?.chain ?? []).filter((id) => id !== answers.brain),
+  ];
+  await updateConfigToml(
+    personaConfigPath(target.personasDir, answers.name),
+    (toml) => setIn(toml, ["harnesses", "chain"], chain),
+  );
 }
 
 /**
@@ -239,7 +270,8 @@ export async function runRepl(
       for await (const event of chat.send(text)) {
         if (event.type === "text") out.write(event.text);
         else if (event.type === "tool") out.write(`\n› ${event.title}\n`);
-        else if (event.type === "error") out.write(`\nerror: ${event.message}\n`);
+        else if (event.type === "error")
+          out.write(`\nerror: ${event.message}\n`);
       }
       out.write("\n");
     }
