@@ -194,3 +194,22 @@ These are operational measurements only. No prompt, user or assistant text,
 retrieved memory, durable fact, daily recall, system/persona content, tool
 argument, or reversible content hash is logged. Telemetry does not become cache
 state and is not persisted as conversation data.
+
+## Stage 5 behavioral-equivalence evidence
+
+Deterministic CI evidence is in
+`tests/prompt-cache-behavioral-equivalence.test.ts`. Each comparison uses two
+isolated temporary persona/memory fixtures with the same persona, canonical
+history, current question, context content, and deterministic fixture harness;
+the warm fixture reaches the target through a completed prior epoch turn.
+
+- An identical untrusted threat-screen hold is returned on the cold and warm
+  paths. Neither path invokes the capable harness, and the warm path discards
+  its epoch with the existing `threat_hold` invalidation.
+- Durable-fact recall returns the same relevant fact on both paths: the
+  principal's emergency rendezvous city is Delft.
+- Retrieved-memory recall returns the same relevant memory on both paths: the
+  staging codename is Amber Finch.
+
+No controlled local-model A/B was run: this checkout had no safe existing local
+inference endpoint or local model server available without reconfiguration.
