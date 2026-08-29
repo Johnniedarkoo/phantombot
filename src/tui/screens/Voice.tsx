@@ -21,8 +21,8 @@ import React, { useState } from "react";
 import { Box, Text, useInput } from "ink";
 
 import { Frame, Field } from "../components/Frame.tsx";
-import { glyph, theme } from "../theme.ts";
-import type { VoiceProvider } from "../../lib/voice.ts";
+import { badge, glyph, theme } from "../theme.ts";
+import { providerHearsVoice, type VoiceProvider } from "../../lib/voice.ts";
 
 /**
  * Providers in the order the wizard offers them: `azure_edge` leads the real
@@ -35,13 +35,7 @@ export const VOICE_PROVIDERS: VoiceProvider[] = [
   "elevenlabs",
 ];
 
-/**
- * Can this provider TRANSCRIBE? Mirrors the dispatch in `lib/audio.ts`. If a
- * new STT backend is added there, this list is what has to move with it.
- */
-export function providerHearsVoice(provider: VoiceProvider): boolean {
-  return provider === "openai" || provider === "elevenlabs";
-}
+export { providerHearsVoice };
 
 export function VoiceScreen(props: {
   personaName: string;
@@ -76,10 +70,10 @@ export function VoiceScreen(props: {
     <Frame
       title={["phantombot", props.personaName, "voice"]}
       footer={[
-        { key: "left/right", label: "change" },
-        { key: "p", label: "preview", onPress: props.onPreview },
-        { key: "return", label: "save" },
-        { key: "esc", label: "back" },
+        { icon: badge.change, key: "←→", label: "Change" },
+        { icon: badge.preview, key: "p", label: "Preview", onPress: props.onPreview },
+        { icon: badge.save, key: "↵", label: "Save" },
+        { icon: badge.back, key: "esc", label: "Back" },
       ]}
     >
       <Field

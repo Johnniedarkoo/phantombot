@@ -100,6 +100,15 @@ export interface OpenChatInput {
   persona: string;
   /** How many prior turns to show on open. */
   historyLimit?: number;
+  /**
+   * Where harness stderr goes.
+   *
+   * NOT `process.stderr` by default when the TUI is driving: the harness writes
+   * diagnostics to the same terminal the app is drawing on, so its output lands
+   * on top of the frame — the "logs underneath the box" the user sees. The TUI
+   * passes the log buffer here; the REPL and tests can pass anything.
+   */
+  stderr?: { write(chunk: string): void };
   /** Test seams. */
   memory?: MemoryStore;
   harnesses?: Harness[];
@@ -117,22 +126,34 @@ export async function openChat(input: OpenChatInput): Promise<ChatSession> {
     // PATH-relative harness still starts when phantombot was launched from a
     // narrow environment.
     ({ config } = await resolveHarnessBinsForConfig(config));
-    harnesses = buildHarnessChain(config, process.stderr, persona);
+    harnesses = buildHarnessChain(
+      config,
+      input.stderr ?? process.stderr,
+      persona,
+    );
   }
 
   const memory = input.memory ?? (await openMemoryStore(config.memoryDbPath));
   const ownsMemory = !input.memory;
 
-  const prior = await memory.recentTurns(
+  const prior = await memory.recentTurnsForConversationDisplay(
     persona,
     conversation,
     input.historyLimit ?? 40,
   );
-  const history: ChatMessage[] = prior.map((turn) => ({
-    role: turn.role === "user" ? "user" : "assistant",
-    text: turn.text,
-    at: 0,
-  }));
+  // Replayed turns keep the time they actually happened. `at: 0` here is what
+  // made the transcript "lose" every timestamp the moment the app restarted:
+  // the rows were fine, they just had no clock on them. Date.parse of a bad or
+  // missing stamp is NaN, so fall back to 0 (renders as no time) rather than
+  // 1970.
+  const history: ChatMessage[] = prior.map((turn) => {
+    const at = turn.createdAt?.getTime?.() ?? NaN;
+    return {
+      role: turn.role === "user" ? ("user" as const) : ("assistant" as const),
+      text: turn.text,
+      at: Number.isFinite(at) ? at : 0,
+    };
+  });
 
   async function* send(
     text: string,

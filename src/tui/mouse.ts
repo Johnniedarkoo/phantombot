@@ -231,6 +231,26 @@ export interface InstalledMouse {
    * of this file — clicking anywhere fires keyboard shortcuts at random.
    */
   stdin: NodeJS.ReadStream;
+  /**
+   * Hand the real stdin over to a line-mode prompt or a child process, and take
+   * it back afterwards.
+   *
+   * This is a full DETACH, not a flag. `false` removes our `data` listener and
+   * drops raw mode; `true` re-attaches, restores raw mode and — the part that
+   * matters — calls `resume()` on the real stdin.
+   *
+   * Resuming is not belt-and-braces. `@clack` reads through `readline`, and
+   * closing a readline interface PAUSES its input stream; an editor spawned
+   * with an inherited stdin can leave it paused too. A paused stdin never emits
+   * `data` again, so the tap goes quiet, nothing reaches Ink, and the app comes
+   * back from the prompt DEAF to every keystroke while still drawing perfectly.
+   * Verified in a pty: after one clack prompt, `process.stdin.isPaused()` is
+   * true and stays true.
+   *
+   * Detaching (rather than merely not forwarding) also stops us competing with
+   * the prompt for the same bytes while it owns the terminal.
+   */
+  setForwarding: (on: boolean) => void;
   /** Restore the terminal. Idempotent; call it from every exit path. */
   teardown: () => void;
   /** False when there was no TTY to enable reporting on. */
@@ -251,7 +271,7 @@ export function installMouse(options: InstallMouseOptions = {}): InstalledMouse 
   const stdout = options.stdout ?? process.stdout;
   const dispatcher = options.dispatcher ?? mouse;
   if (!stdin.isTTY || !stdout.isTTY) {
-    return { stdin, teardown: () => {}, enabled: false };
+    return { stdin, setForwarding: () => {}, teardown: () => {}, enabled: false };
   }
 
   stdout.write(MOUSE_ON);
@@ -270,7 +290,9 @@ export function installMouse(options: InstallMouseOptions = {}): InstalledMouse 
   filtered.ref = (() => filtered) as NodeJS.ReadStream["ref"];
   filtered.unref = (() => filtered) as NodeJS.ReadStream["unref"];
 
+  let forwarding = true;
   const onData = (data: Buffer | string) => {
+    if (!forwarding) return;
     const chunk = typeof data === "string" ? data : data.toString("utf8");
     const { events, rest } = stripMouseSequences(chunk);
     for (const event of events) dispatcher.dispatch(event);
@@ -284,12 +306,42 @@ export function installMouse(options: InstallMouseOptions = {}): InstalledMouse 
   return {
     stdin: filtered,
     enabled: true,
+    setForwarding: (on: boolean) => {
+      if (on === forwarding) return;
+      forwarding = on;
+      dispatcher.enabled = on;
+      if (on) {
+        stdin.setRawMode?.(true);
+        stdin.on("data", onData);
+        // See the doc comment on `setForwarding`: a readline close or an
+        // inherited-stdin child leaves the stream paused, and a paused stdin
+        // never emits `data` again.
+        stdin.resume?.();
+      } else {
+        stdin.off("data", onData);
+        // The prompt wants a cooked terminal; Ink is not reading anyway.
+        stdin.setRawMode?.(false);
+      }
+      stdout.write(on ? MOUSE_ON : MOUSE_OFF);
+    },
     teardown: () => {
       if (torn) return;
       torn = true;
       stdin.off("data", onData);
       dispatcher.enabled = false;
       stdout.write(MOUSE_OFF);
+      // RELEASE THE REAL STDIN, or the process never exits.
+      //
+      // Ink is handed the FILTERED stream, so the cleanup it does on unmount —
+      // drop raw mode, pause, unref — lands on the PassThrough, not on the TTY
+      // we actually resumed. A resumed TTY stdin is a referenced handle: the
+      // event loop stays alive with nothing drawing on the screen, which is
+      // exactly the `^q` symptom (frame gone, shell not back, only SIGINT
+      // ends it). Removing our `data` listener is not enough; the stream has
+      // to be paused and unreferenced.
+      stdin.setRawMode?.(false);
+      stdin.pause?.();
+      stdin.unref?.();
     },
   };
 }

@@ -167,19 +167,39 @@ function mount(props: Partial<React.ComponentProps<typeof App>> = {}) {
       stdin.write(bytes);
       await tick();
     },
+    /**
+     * Wait for the app to actually be on screen before driving it.
+     *
+     * Ink mounts asynchronously and `<App>` does real work on the way up
+     * (config, snapshot). A fixed `await tick()` before the first keystroke is
+     * a race the suite lost as soon as startup grew: the chunk was written to
+     * a stdin nobody was reading yet, the name box stayed empty, and the
+     * failure surfaced three assertions later as "the wizard never finished".
+     */
+    waitFor: async (predicate: (frame: string) => boolean, ms = 3000) => {
+      const deadline = Date.now() + ms;
+      while (Date.now() < deadline) {
+        if (predicate(stdout.frames[stdout.frames.length - 1] ?? "")) return;
+        await tick();
+      }
+      throw new Error(
+        `waitFor timed out; last frame:\n${stdout.frames[stdout.frames.length - 1] ?? "(nothing rendered)"}`,
+      );
+    },
   };
 }
 
 describe("first run", () => {
   test("completing the wizard leaves an app that can still be quit", async () => {
     const app = mount({ startPersona: undefined });
-    await tick();
+    await app.waitFor((f) => f.includes("What should it be called?"));
 
     // name → brain → channel → memory → voice → done, accepting each step's
     // default. Bounded rather than exact so the test asserts "the wizard
     // completes", not "the wizard has exactly six steps" — the step list is
     // expected to grow.
     await app.press("alice");
+    await app.waitFor((f) => f.includes("alice"));
     for (let i = 0; i < 12 && app.created.length === 0; i++) {
       await app.press("\r");
     }
@@ -190,7 +210,7 @@ describe("first run", () => {
     // is exactly the window the bug lived in. It must still be a real screen.
     const frame = app.frame();
     expect(frame).toContain("alice");
-    expect(frame).toContain("quit");
+    expect(frame).toContain("Quit");
 
     let exited = false;
     void app.instance.waitUntilExit().then(() => void (exited = true));
@@ -229,7 +249,9 @@ describe("first run", () => {
     // And the chat screen is actually mounted, not the placeholder.
     const frame = app.lastFrame();
     expect(frame).not.toContain("opening alice");
-    expect(frame).toContain("interrupt");
+    // Footer items unique to the chat screen (`^c interrupt` left the footer
+    // when the activity line took over announcing it).
+    expect(frame).toContain("Send");
     expect(frame).toContain("settings");
   });
 

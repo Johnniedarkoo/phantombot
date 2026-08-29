@@ -19,9 +19,12 @@
 import React, { useState } from "react";
 import { Box, Text, useInput } from "ink";
 
-import { Frame } from "../components/Frame.tsx";
+import { Frame, Rule } from "../components/Frame.tsx";
+import { scrollWindow } from "../scroll.ts";
+import { useTerminalSize, viewportRows } from "../terminal.ts";
+import { frameChromeRows } from "../chrome.ts";
 import { Selectable } from "../components/Selectable.tsx";
-import { glyph, humanBytes, theme } from "../theme.ts";
+import { badge, glyph, humanBytes, theme } from "../theme.ts";
 import type { HostSnapshot, PersonaSnapshot } from "../snapshot.ts";
 
 function Cell(props: {
@@ -49,7 +52,20 @@ function PersonaRow(props: {
   const complete = p.completeness.complete;
   return (
     <Selectable selected={props.selected} onPress={props.onPress}>
-      <Cell width="16%">{p.name}</Cell>
+      {/* The selection bar — the same three-way signal the menus use: a filled
+          gutter, a bold name, and the row's own colour. */}
+      <Box marginRight={1}>
+        <Text backgroundColor={props.selected ? theme.accent : undefined}> </Text>
+      </Box>
+      <Box width="16%">
+        <Text
+          bold={props.selected}
+          color={props.selected ? theme.accent : undefined}
+          wrap="truncate"
+        >
+          {p.name}
+        </Text>
+      </Box>
       <Cell width="12%">
         <Text color={complete ? theme.ok : theme.warn}>
           {complete ? `${glyph.up} ready` : `${glyph.warn} setup`}
@@ -76,13 +92,14 @@ function PersonaRow(props: {
 
 export function DashboardScreen(props: {
   host: HostSnapshot;
-  onOpen: (persona: string) => void;
+  // Two verbs, because a row is two different things depending on why you came
+  // here: someone to TALK to, or something to CONFIGURE. `↵` takes the common
+  // one (and doubles as the persona switcher the chat screen has no key for);
+  // `c` takes the other. Neither reads the cursor implicitly — both are handed
+  // the row they act on.
   onChat: (persona: string) => void;
+  onConfigure: (persona: string) => void;
   onNew: () => void;
-  onDoctor: () => void;
-  onKeys: (persona: string) => void;
-  onMcp: (persona: string) => void;
-  onRestart: () => void;
   onBack: () => void;
 }): React.ReactElement {
   const [cursor, setCursor] = useState(0);
@@ -94,34 +111,61 @@ export function DashboardScreen(props: {
     if (key.upArrow) setCursor((c) => Math.max(0, c - 1));
     else if (key.downArrow)
       setCursor((c) => Math.min(personas.length - 1, c + 1));
-    else if (key.return && current) props.onOpen(current.name);
-    else if (char === "c" && current) props.onChat(current.name);
+    else if (key.return && current) props.onChat(current.name);
+    else if (char === "c" && current) props.onConfigure(current.name);
     else if (char === "n") props.onNew();
-    else if (char === "d") props.onDoctor();
-    else if (char === "k" && current) props.onKeys(current.name);
-    else if (char === "m" && current) props.onMcp(current.name);
-    else if (char === "r") props.onRestart();
   });
+
+  // A host with more phantoms than rows must show FEWER, not squeezed ones —
+  // Yoga compresses overflow and prints rows on top of each other. See
+  // `scroll.ts`. Chrome: border 2, title 2, PHANTOMS heading 1, header row 1,
+  // three rules 3, overflow marker 1, HOST block 5, footer 1.
+  const size = useTerminalSize();
+  const view = scrollWindow(
+    personas.map(() => 1),
+    viewportRows(size, 14 + frameChromeRows()),
+    cursor,
+  );
 
   return (
     <Frame
       title={["phantombot", "settings"]}
-      status={`${props.host.version} · ${props.host.updateChannel}`}
+      // The header already prints the version — repeating it here gave
+      // `phantombot v1.1.316 ▸ settings ... 1.1.316 · stable`.
+      status={[
+        `channel: ${props.host.updateChannel}`,
+        // The SERVICE's state, not this process's — see HostSnapshot.
+        props.host.serviceActive === undefined
+          ? undefined
+          : props.host.serviceActive
+            ? `${glyph.up} running`
+            : `${glyph.down} stopped`,
+      ]
+        .filter(Boolean)
+        .join(" · ")}
       footer={[
-        { key: "↵", label: "open" },
-        { key: "c", label: "chat" },
-        { key: "n", label: "new" },
-        { key: "r", label: "restart" },
-        { key: "d", label: "doctor" },
-        { key: "k", label: "keys" },
-        { key: "m", label: "mcp" },
-        { key: "esc", label: "back to chat" },
+        { icon: badge.chat, key: "↵", label: "Chat" },
+        { icon: badge.settings, key: "c", label: "Configure" },
+        { icon: badge.new, key: "n", label: "New" },
+        { icon: badge.back, key: "esc", label: "Back" },
       ]}
     >
-      <Text color={theme.dim} bold>
-        PHANTOMS
-      </Text>
       <Box>
+        <Text color={theme.accent} bold>
+          PHANTOMS
+        </Text>
+        <Box flexGrow={1} />
+        <Text color={theme.dim}>
+          {`${props.host.personas.length} on this host`}
+        </Text>
+      </Box>
+      <Rule />
+      <Box>
+        {/* Lead-in matching a row's two gutters — `Selectable`'s pointer and
+            the selection bar — so the header sits over its own columns. */}
+        <Box width={4}>
+          <Text> </Text>
+        </Box>
         <Cell width="16%" dim>
           name
         </Cell>
@@ -144,23 +188,30 @@ export function DashboardScreen(props: {
           {" "}
         </Cell>
       </Box>
+      <Rule />
       {personas.length === 0 ? (
         <Text color={theme.dim}>
           No phantoms yet — press n to make one.
         </Text>
       ) : (
-        personas.map((persona, i) => (
+        personas.slice(view.start, view.end).map((persona) => (
           <PersonaRow
             key={persona.name}
             persona={persona}
-            selected={i === cursor}
-            onPress={() => props.onOpen(persona.name)}
+            selected={personas.indexOf(persona) === cursor}
+            onPress={() => props.onChat(persona.name)}
           />
         ))
       )}
+      {view.below > 0 || view.above > 0 ? (
+        <Text color={theme.dim}>
+          {`${view.above > 0 ? `▲ ${view.above} above  ` : ""}${view.below > 0 ? `▼ ${view.below} below` : ""}`}
+        </Text>
+      ) : null}
+      <Rule />
 
       <Box marginTop={1} flexDirection="column">
-        <Text color={theme.dim} bold>
+        <Text color={theme.accent} bold>
           HOST
         </Text>
         <Box>
@@ -172,6 +223,32 @@ export function DashboardScreen(props: {
             version
           </Cell>
           <Cell width="34%">{props.host.version}</Cell>
+        </Box>
+        <Box>
+          <Cell width="24%" dim>
+            service
+          </Cell>
+          <Cell width="26%">
+            <Text
+              color={
+                props.host.serviceActive === undefined
+                  ? theme.dim
+                  : props.host.serviceActive
+                    ? theme.ok
+                    : theme.warn
+              }
+            >
+              {props.host.serviceActive === undefined
+                ? "unknown"
+                : props.host.serviceActive
+                  ? `${glyph.up} running`
+                  : `${glyph.down} stopped`}
+            </Text>
+          </Cell>
+          <Cell width="16%" dim>
+            default
+          </Cell>
+          <Cell width="34%">{props.host.defaultPersona}</Cell>
         </Box>
         <Box>
           <Cell width="24%" dim>
