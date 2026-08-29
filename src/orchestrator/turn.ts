@@ -60,7 +60,11 @@ import type { ToolCallDetail } from "../harnesses/toolNote.ts";
 import type { MemoryStore, TurnOrigin } from "../memory/store.ts";
 import { DEFAULT_PROMPT_CACHE, type FactSource, type PromptCacheSettings } from "../config.ts";
 import type { ScreenVerdict } from "./screen.ts";
-import { promptCacheEpochs } from "./promptCache.ts";
+import {
+  promptCacheEpochs,
+  reportPromptCacheError,
+  type PromptCacheEpochPlan,
+} from "./promptCache.ts";
 
 export const DEFAULT_HISTORY_LIMIT = 30;
 
@@ -586,7 +590,7 @@ async function* runTurnBody(
     });
   }
   if (input.toolNarration) overlays.push(PRE_TOOL_NARRATION_INSTRUCTION);
-  const systemPrompt =
+  let systemPrompt =
     overlays.length > 0
       ? baseSystemPrompt + "\n\n" + overlays.join("\n\n")
       : baseSystemPrompt;
@@ -601,9 +605,37 @@ async function* runTurnBody(
     turnContext,
     userMessage: input.userMessage,
   };
-  const epochPlan = input.noHistory
-    ? (promptCacheEpochs.bypass(promptCacheInput, "no_history"), undefined)
-    : promptCacheEpochs.prepare(promptCacheInput);
+  let epochPlan: PromptCacheEpochPlan | undefined;
+  if (cacheFriendly) {
+    try {
+      epochPlan = input.noHistory
+        ? (promptCacheEpochs.bypass(promptCacheInput, "no_history"), undefined)
+        : promptCacheEpochs.prepare(promptCacheInput);
+    } catch {
+      try {
+        promptCacheEpochs.discard(input.persona, input.conversation);
+      } catch {
+        reportPromptCacheError(input.persona, input.conversation, "discard");
+      }
+      reportPromptCacheError(input.persona, input.conversation, "prepare");
+
+      // A cache failure must make this request indistinguishable from the
+      // feature-off path. Rebuild the ordinary prompt, including the same
+      // volatile context that the cache-friendly layout had separated out.
+      baseSystemPrompt = buildSystemPrompt(
+        persona,
+        channelCtx,
+        retrievedMemory,
+        durableFacts,
+        dailyRecall,
+      );
+      turnContext = undefined;
+      systemPrompt =
+        overlays.length > 0
+          ? baseSystemPrompt + "\n\n" + overlays.join("\n\n")
+          : baseSystemPrompt;
+    }
+  }
 
   let finalText = "";
   let succeeded = false;
@@ -795,10 +827,23 @@ async function* runTurnBody(
   }
 
   if (epochPlan) {
-    if (succeeded && !input.noHistory) {
-      promptCacheEpochs.complete(epochPlan, finalText);
-    } else {
-      promptCacheEpochs.fail(epochPlan);
+    try {
+      if (succeeded && !input.noHistory) {
+        promptCacheEpochs.complete(epochPlan, finalText);
+      } else {
+        promptCacheEpochs.fail(epochPlan);
+      }
+    } catch {
+      try {
+        promptCacheEpochs.discard(input.persona, input.conversation);
+      } catch {
+        reportPromptCacheError(input.persona, input.conversation, "discard");
+      }
+      reportPromptCacheError(
+        input.persona,
+        input.conversation,
+        succeeded && !input.noHistory ? "complete" : "fail",
+      );
     }
   }
 }

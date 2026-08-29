@@ -25,6 +25,7 @@ import {
   clearPromptCacheEpochs,
   estimatePromptBytes,
   PromptCacheEpochManager,
+  promptCacheEpochs,
 } from "../src/orchestrator/promptCache.ts";
 import { DEFAULT_PROMPT_CACHE } from "../src/config.ts";
 import { openMemoryStore } from "../src/memory/store.ts";
@@ -304,6 +305,176 @@ describe("cache-friendly prompt layout", () => {
       await rm(agentDir, { recursive: true, force: true });
     }
   });
+
+  test(
+    "preparation failure falls back to the legacy prompt and safe telemetry",
+    async () => {
+      const agentDir = await mkdtemp(
+        join(tmpdir(), "phantombot-cache-prepare-error-"),
+      );
+      const memory = await openMemoryStore(":memory:");
+      const harness = new CapturingHarness();
+      const states = (
+        promptCacheEpochs as unknown as {
+          states: Map<string, { epochTurns: unknown[] }>;
+        }
+      ).states;
+      const originalWrite = process.stderr.write;
+      const lines: string[] = [];
+      process.stderr.write = ((chunk: unknown) => {
+        lines.push(String(chunk));
+        return true;
+      }) as typeof process.stderr.write;
+      try {
+        clearPromptCacheEpochs();
+        await writeFile(join(agentDir, "BOOT.md"), "# PhantomBot", "utf8");
+        await collect(
+          runTurn({
+            persona: "phantom",
+            conversation: "cli:prepare-error",
+            userMessage: "seed",
+            agentDir,
+            workingDir: agentDir,
+            memory,
+            harnesses: [harness],
+            idleTimeoutMs: 1_000,
+            promptCache: { enabled: true, maxEpochBytes: 80_000 },
+          }),
+        );
+        const state = states.get("phantom\u0000cli:prepare-error");
+        expect(state).toBeDefined();
+        state!.epochTurns = [{}];
+        await collect(
+          runTurn({
+            persona: "phantom",
+            conversation: "cli:prepare-error",
+            userMessage: "current user secret",
+            agentDir,
+            workingDir: agentDir,
+            memory,
+            harnesses: [harness],
+            idleTimeoutMs: 1_000,
+            promptCache: { enabled: true, maxEpochBytes: 80_000 },
+            retrieve: async () => "retrieval secret",
+            pullFacts: async () => "fact secret",
+          }),
+        );
+      } finally {
+        process.stderr.write = originalWrite;
+        clearPromptCacheEpochs();
+        await memory.close();
+        await rm(agentDir, { recursive: true, force: true });
+      }
+
+      expect(harness.captured?.turnContext).toBeUndefined();
+      expect(harness.captured?.systemPrompt).toContain("retrieval secret");
+      expect(harness.captured?.systemPrompt).toContain("fact secret");
+      expect(harness.captured?.systemPrompt).not.toContain(TURN_CONTEXT_SYSTEM_RULE);
+      const telemetry = lines.join("");
+      expect(telemetry).toContain('"bypass_reason":"cache_error"');
+      expect(telemetry).toContain('"phase":"prepare"');
+      expect(telemetry).not.toContain("current user secret");
+      expect(telemetry).not.toContain("retrieval secret");
+      expect(telemetry).not.toContain("fact secret");
+    },
+  );
+
+  test("invalid epoch state is discarded instead of reused", () => {
+    const manager = new PromptCacheEpochManager();
+    const settings = { enabled: true, maxEpochBytes: 200 };
+    const first = manager.prepare({
+      settings,
+      persona: "phantom",
+      conversation: "cli:corrupt-state",
+      systemPrompt: "stable",
+      history: [],
+      userMessage: "one",
+    })!;
+    manager.complete(first, "answer one");
+
+    (first.state as unknown as { epochTurns: unknown }).epochTurns = [
+      { userMessage: "corrupt" },
+    ];
+    expect(() =>
+      manager.prepare({
+        settings,
+        persona: "phantom",
+        conversation: "cli:corrupt-state",
+        systemPrompt: "stable",
+        history: [
+          { role: "user", text: "one" },
+          { role: "assistant", text: "answer one" },
+        ],
+        userMessage: "two",
+      }),
+    ).toThrow("prompt-cache state is invalid");
+
+    const retry = manager.prepare({
+      settings,
+      persona: "phantom",
+      conversation: "cli:corrupt-state",
+      systemPrompt: "stable",
+      history: [
+        { role: "user", text: "one" },
+        { role: "assistant", text: "answer one" },
+      ],
+      userMessage: "two",
+    })!;
+    expect(retry.event).toBe("new");
+    expect(retry.epochTurns).toHaveLength(0);
+    manager.fail(retry);
+  });
+
+  test(
+    "completion bookkeeping failure cannot fail a successful model turn",
+    async () => {
+      const agentDir = await mkdtemp(
+        join(tmpdir(), "phantombot-cache-complete-error-"),
+      );
+      const memory = await openMemoryStore(":memory:");
+      const harness = new CapturingHarness();
+      const originalComplete = promptCacheEpochs.complete;
+      const originalWrite = process.stderr.write;
+      const lines: string[] = [];
+      promptCacheEpochs.complete = (() => {
+        throw new Error("assistant secret from broken completion state");
+      }) as typeof originalComplete;
+      process.stderr.write = ((chunk: unknown) => {
+        lines.push(String(chunk));
+        return true;
+      }) as typeof process.stderr.write;
+      try {
+        clearPromptCacheEpochs();
+        await writeFile(join(agentDir, "BOOT.md"), "# PhantomBot", "utf8");
+        await collect(
+          runTurn({
+            persona: "phantom",
+            conversation: "cli:complete-error",
+            userMessage: "current user secret",
+            agentDir,
+            workingDir: agentDir,
+            memory,
+            harnesses: [harness],
+            idleTimeoutMs: 1_000,
+            promptCache: { enabled: true, maxEpochBytes: 80_000 },
+          }),
+        );
+      } finally {
+        process.stderr.write = originalWrite;
+        promptCacheEpochs.complete = originalComplete;
+        clearPromptCacheEpochs();
+        await memory.close();
+        await rm(agentDir, { recursive: true, force: true });
+      }
+
+      expect(harness.captured?.userMessage).toBe("current user secret");
+      const telemetry = lines.join("");
+      expect(telemetry).toContain('"bypass_reason":"cache_error"');
+      expect(telemetry).toContain('"phase":"complete"');
+      expect(telemetry).not.toContain("assistant secret from broken completion state");
+      expect(telemetry).not.toContain("current user secret");
+    },
+  );
 
   test("rebases using the rendered UTF-8 byte count", () => {
     const input = {
