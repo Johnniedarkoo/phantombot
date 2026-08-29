@@ -390,7 +390,7 @@ async function* runTurnBody(
   // to "unscreened", never "app down".
   const screening: "screened" | "unscreened" | "trusted" =
     input.trusted === true ? "trusted" : "unscreened";
-  let effectiveScreening = screening;
+  let effectiveScreening: "screened" | "unscreened" | "trusted" = screening;
   if (input.trusted !== true && input.screen) {
     let verdict: ScreenVerdict | undefined;
     try {
