@@ -58,12 +58,14 @@ const request = (turnContext?: string): HarnessRequest => ({
 class CapturingHarness implements Harness {
   readonly id = "fake";
   captured?: HarnessRequest;
+  invocations = 0;
 
   async available(): Promise<boolean> {
     return true;
   }
 
   async *invoke(req: HarnessRequest): AsyncGenerator<HarnessChunk> {
+    this.invocations++;
     this.captured = req;
     yield { type: "done", finalText: "ok" };
   }
@@ -775,6 +777,167 @@ describe("cache-friendly prompt layout", () => {
     manager.fail(oversized);
   });
 
+  test("rebases explicitly on both trust transitions", () => {
+    const manager = new PromptCacheEpochManager();
+    const settings = { enabled: true, maxEpochBytes: 500 };
+    const base = {
+      settings,
+      persona: "phantom",
+      conversation: "cli:trust-boundary",
+      systemPrompt: "same system prompt",
+      history: [] as Array<{ role: "user" | "assistant"; text: string }>,
+      turnContext: "context",
+    };
+
+    const untrusted = manager.prepare({
+      ...base,
+      trusted: false,
+      userMessage: "untrusted one",
+    })!;
+    manager.complete(untrusted, "untrusted answer");
+
+    const trusted = manager.prepare({
+      ...base,
+      trusted: true,
+      history: [
+        { role: "user", text: "untrusted one" },
+        { role: "assistant", text: "untrusted answer" },
+      ],
+      userMessage: "trusted one",
+    })!;
+    expect(trusted.event).toBe("rebase");
+    expect(trusted.reason).toBe("trust_changed");
+    expect(trusted.epochTurns).toHaveLength(0);
+    manager.complete(trusted, "trusted answer");
+
+    const untrustedAgain = manager.prepare({
+      ...base,
+      trusted: false,
+      history: [
+        { role: "user", text: "untrusted one" },
+        { role: "assistant", text: "untrusted answer" },
+        { role: "user", text: "trusted one" },
+        { role: "assistant", text: "trusted answer" },
+      ],
+      userMessage: "untrusted two",
+    })!;
+    expect(untrustedAgain.event).toBe("rebase");
+    expect(untrustedAgain.reason).toBe("trust_changed");
+    expect(untrustedAgain.epochTurns).toHaveLength(0);
+  });
+
+  test("security-surface changes rebase independently of prompt text", () => {
+    const manager = new PromptCacheEpochManager();
+    const first = manager.prepare({
+      settings: { enabled: true, maxEpochBytes: 500 },
+      persona: "phantom",
+      conversation: "cli:security-surface",
+      systemPrompt: "same system prompt",
+      history: [],
+      trusted: true,
+      securityFingerprint: "surface-a",
+      userMessage: "one",
+    })!;
+    manager.complete(first, "answer one");
+
+    const changed = manager.prepare({
+      settings: { enabled: true, maxEpochBytes: 500 },
+      persona: "phantom",
+      conversation: "cli:security-surface",
+      systemPrompt: "same system prompt",
+      history: [
+        { role: "user", text: "one" },
+        { role: "assistant", text: "answer one" },
+      ],
+      trusted: true,
+      securityFingerprint: "surface-b",
+      userMessage: "two",
+    })!;
+    expect(changed.event).toBe("rebase");
+    expect(changed.reason).toBe("security_changed");
+    expect(changed.epochTurns).toHaveLength(0);
+  });
+
+  test("persona A → B → A cannot revive the old A epoch", () => {
+    const manager = new PromptCacheEpochManager();
+    const settings = { enabled: true, maxEpochBytes: 500 };
+    const firstA = manager.prepare({
+      settings,
+      persona: "A",
+      conversation: "shared-conversation",
+      systemPrompt: "A system",
+      history: [],
+      userMessage: "A one",
+    })!;
+    manager.complete(firstA, "A answer");
+
+    const b = manager.prepare({
+      settings,
+      persona: "B",
+      conversation: "shared-conversation",
+      systemPrompt: "B system",
+      history: [],
+      userMessage: "B one",
+    })!;
+    expect(b.event).toBe("rebase");
+    expect(b.reason).toBe("persona_changed");
+    expect(b.epochTurns).toHaveLength(0);
+    manager.complete(b, "B answer");
+
+    const secondA = manager.prepare({
+      settings,
+      persona: "A",
+      conversation: "shared-conversation",
+      systemPrompt: "A system",
+      history: [
+        { role: "user", text: "A one" },
+        { role: "assistant", text: "A answer" },
+      ],
+      userMessage: "A two",
+    })!;
+    expect(secondA.event).toBe("rebase");
+    expect(secondA.reason).toBe("persona_changed");
+    expect(secondA.epochTurns).toHaveLength(0);
+  });
+
+  test("persona tracking does not evict unrelated simultaneous persona state", () => {
+    const manager = new PromptCacheEpochManager();
+    const settings = { enabled: true, maxEpochBytes: 500 };
+    const a = manager.prepare({
+      settings,
+      persona: "A",
+      conversation: "conversation-a",
+      systemPrompt: "A",
+      history: [],
+      userMessage: "one",
+    })!;
+    manager.complete(a, "answer");
+
+    const b = manager.prepare({
+      settings,
+      persona: "B",
+      conversation: "conversation-b",
+      systemPrompt: "B",
+      history: [],
+      userMessage: "one",
+    })!;
+    manager.complete(b, "answer");
+
+    const aAgain = manager.prepare({
+      settings,
+      persona: "A",
+      conversation: "conversation-a",
+      systemPrompt: "A",
+      history: [
+        { role: "user", text: "one" },
+        { role: "assistant", text: "answer" },
+      ],
+      userMessage: "two",
+    })!;
+    expect(aAgain.event).toBe("append");
+    expect(aAgain.epochTurns).toHaveLength(1);
+  });
+
   test("feature-off decisions return no plan and emit no cache telemetry", () => {
     const manager = new PromptCacheEpochManager();
     const lines: string[] = [];
@@ -799,6 +962,83 @@ describe("cache-friendly prompt layout", () => {
       process.stderr.write = originalWrite;
     }
     expect(lines.some((line) => line.includes('"msg":"prompt_cache.epoch"'))).toBe(false);
+  });
+
+  test("a threat hold invalidates the warm epoch before the early return", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "phantombot-cache-hold-"));
+    const memory = await openMemoryStore(":memory:");
+    const harness = new CapturingHarness();
+    const settings = { enabled: true, maxEpochBytes: 80_000 };
+    const input = {
+      persona: "phantom",
+      conversation: "telegram:hold",
+      agentDir,
+      workingDir: agentDir,
+      memory,
+      harnesses: [harness],
+      idleTimeoutMs: 1_000,
+      promptCache: settings,
+      trusted: false,
+    };
+    const pass = async () => ({
+      action: "pass" as const,
+      score: 0,
+      reason: "safe",
+    });
+    const hold = async () => ({
+      action: "hold" as const,
+      score: 90,
+      reason: "injection",
+    });
+    const originalWrite = process.stderr.write;
+    const lines: string[] = [];
+    process.stderr.write = ((chunk: unknown) => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      clearPromptCacheEpochs();
+      await writeFile(join(agentDir, "BOOT.md"), "# PhantomBot", "utf8");
+
+      await collect(runTurn({ ...input, userMessage: "first", screen: pass }));
+      expect(harness.invocations).toBe(1);
+
+      const held: HarnessChunk[] = [];
+      for await (const chunk of runTurn({
+        ...input,
+        userMessage: "held",
+        screen: hold,
+      })) {
+        held.push(chunk);
+      }
+      expect(harness.invocations).toBe(1);
+      expect(held.at(-1)).toMatchObject({
+        type: "done",
+        meta: { screenedHold: true },
+      });
+
+      await collect(runTurn({ ...input, userMessage: "after hold", screen: pass }));
+      expect(harness.invocations).toBe(2);
+      expect(harness.captured?.epochTurns).toBeUndefined();
+
+      const invalidation = lines
+        .filter((line) => line.includes('"event":"invalidate"'))
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(invalidation).toContainEqual(
+        expect.objectContaining({
+          event: "invalidate",
+          invalidation_reason: "threat_hold",
+          persona: "phantom",
+          conversation: "telegram:hold",
+          retain_epoch: false,
+        }),
+      );
+    } finally {
+      process.stderr.write = originalWrite;
+      clearPromptCacheEpochs();
+      await memory.close();
+      await rm(agentDir, { recursive: true, force: true });
+    }
   });
 
   test("logs the safe lifecycle schema and no-history bypass", () => {

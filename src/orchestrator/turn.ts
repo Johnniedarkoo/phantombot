@@ -62,6 +62,7 @@ import { DEFAULT_PROMPT_CACHE, type FactSource, type PromptCacheSettings } from 
 import type { ScreenVerdict } from "./screen.ts";
 import {
   promptCacheEpochs,
+  promptCacheSecurityFingerprint,
   reportPromptCacheError,
   type PromptCacheEpochPlan,
 } from "./promptCache.ts";
@@ -388,6 +389,26 @@ async function* runTurnBody(
       verdict = undefined;
     }
     if (verdict?.action === "hold") {
+      // A held untrusted request never reaches prompt-cache preparation, so
+      // invalidate the prior disposable epoch at the actual hold boundary.
+      // This must remain best-effort: cache bookkeeping cannot weaken or turn
+      // a correctly held request into a failed turn.
+      try {
+        promptCacheEpochs.invalidate(
+          {
+            settings: input.promptCache ?? DEFAULT_PROMPT_CACHE,
+            persona: input.persona,
+            conversation: input.conversation,
+          },
+          "threat_hold",
+        );
+      } catch {
+        reportPromptCacheError(
+          input.persona,
+          input.conversation,
+          "discard",
+        );
+      }
       // NOTE: the screener already did the grounding write — it wrote the
       // held episode (quarantined payload) into the PRINCIPAL'S
       // telegram conversation, which is the correct scope (that's where the
@@ -604,6 +625,18 @@ async function* runTurnBody(
     historyLimit: input.historyLimit ?? DEFAULT_HISTORY_LIMIT,
     turnContext,
     userMessage: input.userMessage,
+    trusted: input.trusted === true,
+    securityFingerprint: promptCacheSecurityFingerprint({
+      trusted: input.trusted === true,
+      screening:
+        input.trusted === true
+          ? "trusted"
+          : input.screen
+            ? "screened"
+            : "unscreened",
+      mcpMode: input.mcpMode ?? "default",
+      tools: input.toolsMode?.allow,
+    }),
   };
   let epochPlan: PromptCacheEpochPlan | undefined;
   if (cacheFriendly) {
