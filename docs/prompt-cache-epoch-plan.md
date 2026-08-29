@@ -105,8 +105,13 @@ manager also discards all persona states for a conversation when its active
 persona changes, so A → B → A cannot resume A's earlier epoch; other
 persona/conversation keys remain independent for normal multi-persona service.
 Effective screening and tool-surface changes use the same explicit security
-boundary. Channel authentication, allowlists, harness/MCP configuration, and
-other security settings are loaded by the long-lived process and their existing
+boundary. Persona entry is observed before screening and before cache
+eligibility, including cache-disabled and no-history turns, so a persona that
+was not cacheable still closes the previous persona's epoch. For untrusted
+turns, only a returned `pass` is `screened`; a missing/throwing screener is
+`unscreened` under the existing fail-open behavior and changes the fingerprint.
+Channel authentication, allowlists, harness/MCP configuration, and other
+security settings are loaded by the long-lived process and their existing
 settings flows require a restart. Since epoch state is process-local, a restart
 already clears it; persona/policy prompt edits remain additionally covered by
 the full system fingerprint.

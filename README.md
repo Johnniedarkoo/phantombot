@@ -627,10 +627,14 @@ telemetry contains safe metadata only and never prompt content.
 
 Security boundaries are explicit cache boundaries too. Trusted/untrusted
 transitions rebase from canonical history even if prompt text would otherwise
-look unchanged. A held untrusted request discards the warm epoch before the
-hold returns, and changing persona within a conversation discards the prior
-persona state so A → B → A cannot revive it. Effective screening and tool
-surface changes also rebase. Channel authentication, allowlists, harness/MCP
+look unchanged. Persona entry is observed before screening and cache
+eligibility, including cache-disabled and no-history turns, so changing persona
+within a conversation discards the prior persona state and A → B → A cannot
+revive it. A held untrusted request discards the warm epoch before the hold
+returns. For untrusted turns, only a returned screen `pass` is fingerprinted as
+screened; a missing or throwing screener remains fail-open but is fingerprinted
+as unscreened, so recovery also crosses a cold boundary. Effective tool-surface
+changes also rebase. Channel authentication, allowlists, harness/MCP
 configuration, and other security settings use the existing restart-required
 configuration lifecycle; a process restart clears all in-process epoch state.
 Persona/policy prompt edits remain additionally covered by the full system
