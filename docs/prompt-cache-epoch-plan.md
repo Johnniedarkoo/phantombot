@@ -211,5 +211,46 @@ the warm fixture reaches the target through a completed prior epoch turn.
 - Retrieved-memory recall returns the same relevant memory on both paths: the
   staging codename is Amber Finch.
 
-No controlled local-model A/B was run: this checkout had no safe existing local
-inference endpoint or local model server available without reconfiguration.
+### Real local-model A/B evidence
+
+On 2026-08-29, a bounded real-model acceptance run used the normal PhantomBot
+`runTurn` → `PiHarness` path with the local Qwen model. The live stack was
+verified before the run: LocalLLM gateway `http://127.0.0.1:8010` reported
+`inference_provider: llamacpp`, and the llama.cpp router at
+`http://127.0.0.1:8080` reported `qwen3.8-27b` loaded. A temporary Pi agent
+directory pointed the otherwise unchanged `llamacpp/qwen3.8-27b` provider/model
+pair at the LocalLLM gateway's `/v1` proxy; the live Pi registry was not edited.
+
+The six comparisons used isolated temporary persona directories and in-memory
+memory stores. Each fixture used the same persona text and the same two-turn
+canonical history. The warm-up turn was run and completed in both conditions;
+the fact/retrieved-memory callback supplied the required value only on the
+target turn in both conditions, so the value was not present only in the
+retained epoch. The accepted run used the same Pi `--no-tools` surface for all
+warm-ups and targets, with the current Qwen profile generation settings and no
+special seed or sampling override.
+
+The captured target requests provide the cache-state proof: every cold target
+had `epochTurns = 0`, while every warm target had `epochTurns = 1` and that
+turn was the completed warm-up. The model/provider identity was
+`llamacpp/qwen3.8-27b` through provider `llamacpp`.
+
+| Case | Run | Cold answer | Warm answer | Cold epoch turns | Warm epoch turns | Result |
+| --- | ---: | --- | --- | ---: | ---: | --- |
+| Durable fact | 1 | The principal's emergency rendezvous city is Delft. | The principal's emergency rendezvous city is Delft. | 0 | 1 | pass |
+| Durable fact | 2 | The principal's emergency rendezvous city is Delft. | The principal's emergency rendezvous city is Delft. | 0 | 1 | pass |
+| Durable fact | 3 | The principal's emergency rendezvous city is Delft. | The principal's emergency rendezvous city is Delft. | 0 | 1 | pass |
+| Retrieved memory | 1 | The project note records the staging codename as Amber Finch. | The project note records the staging codename as Amber Finch. | 0 | 1 | pass |
+| Retrieved memory | 2 | The project note records the staging codename as Amber Finch. | The project note records the staging codename as Amber Finch. | 0 | 1 | pass |
+| Retrieved memory | 3 | The project note records the staging codename as Amber Finch. | The project note records the staging codename as Amber Finch. | 0 | 1 | pass |
+
+Target elapsed times were roughly 3.4–9.0 seconds warm and 4.6–8.9 seconds
+cold; these are incidental acceptance observations, not a performance
+benchmark. An initial exploratory full-capability attempt was excluded because
+Qwen emitted textual tool-call DSL during the warm-up and hit the harness idle
+ceiling. The accepted A/B held the action surface identically at zero tools on
+both sides, and all target answers passed the required-fact criterion.
+
+This supplements, rather than replaces, the deterministic CI evidence above.
+No material behavior shift was observed in these acceptance cases. This is not
+general proof that model quality is unchanged.
