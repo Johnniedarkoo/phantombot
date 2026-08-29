@@ -205,6 +205,11 @@ phantombot/
   rules are security lifecycle controls. Security authority comes from explicit
   trust state, threat screening, security/system policy, and epoch invalidation,
   never from prompt position or token order.
+  Use this primarily for self-hosted/local inference, such as llama.cpp or vLLM,
+  where the operator controls the prefix/KV cache. Hosted-provider users should
+  generally leave it disabled: hosted APIs manage caching differently, and an
+  epoch can lengthen billed input while PhantomBot cannot control provider-side
+  cache behavior.
 - **`workingDir` is REQUIRED on every `runTurn` call** (#387) — the harness subprocess cwd, deliberately with no default. Interactive surfaces (telegram, phantomchat, ask, tick, reactions) pass `homedir()`, because the owner asks for work on repos all over their home dir. Machine-driven background turns (nightly) pass the **persona dir**. This used to silently default to `homedir()` and every background caller took the default, so nightly stages woke up in `$HOME` unable to see their own `memory/` from cwd — and went hunting for it. On macOS those recursive walks cross `~/Library/Containers`, tripping the TCC `kTCCServiceSystemPolicyAppData` prompt ("phantombot would like to access data from other apps") once per spawned date. If you add a `runTurn` caller, decide which tree it may treat as home and say so explicitly.
 
 ## Channel layer (core + adapters)

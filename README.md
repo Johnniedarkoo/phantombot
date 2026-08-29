@@ -609,6 +609,12 @@ enabled = false
 max_epoch_bytes = 80000
 ```
 
+Use this primarily for self-hosted/local inference, such as llama.cpp or vLLM,
+where the operator controls the prefix/KV cache. Hosted-provider users should
+generally leave it disabled: hosted APIs manage caching differently, and an
+epoch can lengthen billed input while PhantomBot cannot control provider-side
+cache behavior.
+
 When enabled, PhantomBot keeps persona, policy, security, and instruction-bearing
 overlay material in the stable system prompt, then places the current
 PhantomBot-provided context and user message after canonical history. This

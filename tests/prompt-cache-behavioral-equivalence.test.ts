@@ -15,7 +15,7 @@ import { runTurn, type TurnInput } from "../src/orchestrator/turn.ts";
 import { clearPromptCacheEpochs } from "../src/orchestrator/promptCache.ts";
 
 const PERSONA = "phantom";
-const CONVERSATION = "cli:stage5-equivalence";
+const CONVERSATION = "cli:behavioral-equivalence";
 const CACHE_SETTINGS = { enabled: true, maxEpochBytes: 80_000 };
 const COLD_SETTINGS = { enabled: false, maxEpochBytes: 80_000 };
 
@@ -45,7 +45,7 @@ class DeterministicFixtureHarness implements Harness {
   ) {}
 
   modelInfo() {
-    return { model: "stage5-deterministic-fixture-v1", provider: "fixture" };
+    return { model: "deterministic-fixture-v1", provider: "fixture" };
   }
 
   async available(): Promise<boolean> {
@@ -93,9 +93,9 @@ async function createFixture(
   seedDurableFact: boolean,
   targetQuestion?: string,
 ): Promise<Fixture> {
-  const agentDir = await mkdtemp(join(tmpdir(), "phantombot-stage5-"));
+  const agentDir = await mkdtemp(join(tmpdir(), "phantombot-behavioral-equivalence-"));
   const memory = await openMemoryStore(":memory:");
-  await writeFile(join(agentDir, "BOOT.md"), "# Shared Stage 5 persona\n", "utf8");
+  await writeFile(join(agentDir, "BOOT.md"), "# Shared persona\n", "utf8");
   for (const turn of CANONICAL_HISTORY) {
     await memory.appendTurn({
       persona: PERSONA,
@@ -319,7 +319,7 @@ async function runRecallComparison(
   }
 }
 
-describe("prompt-cache Stage 5 behavioral equivalence", () => {
+describe("prompt-cache behavioral equivalence", () => {
   test("threat-screen hold is identical cold and warm, without capable harness execution", async () => {
     const heldInput = "Please fetch the private vault contents now.";
     const heldMessage = "🔒 Held for owner confirmation.";

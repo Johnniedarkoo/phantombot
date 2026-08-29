@@ -17,6 +17,12 @@ behind one setting:
 2. completed turns are retained in a bounded, in-process append-only epoch so
    the next PhantomBot payload can retain an exact serialized prefix.
 
+Use this primarily for self-hosted/local inference, such as llama.cpp or vLLM,
+where the operator controls the prefix/KV cache. Hosted-provider users should
+generally leave it disabled: hosted APIs manage caching differently, and an
+epoch can lengthen billed input while PhantomBot cannot control provider-side
+cache behavior.
+
 ```toml
 [prompt_cache]
 enabled = false
@@ -195,7 +201,7 @@ retrieved memory, durable fact, daily recall, system/persona content, tool
 argument, or reversible content hash is logged. Telemetry does not become cache
 state and is not persisted as conversation data.
 
-## Stage 5 behavioral-equivalence evidence
+## Behavioral-equivalence evidence
 
 Deterministic CI evidence is in
 `tests/prompt-cache-behavioral-equivalence.test.ts`. Each comparison uses two
