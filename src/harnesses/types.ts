@@ -19,9 +19,11 @@ export interface HistoryTurn {
 
 export interface HarnessRequest {
   /**
-   * High-authority system material: persona identity, policy, instructions,
-   * security rules, and instruction-bearing overlays. On the cache-friendly
-   * path this deliberately excludes volatile PhantomBot turn context.
+   * System material: persona identity, policy, instructions, security rules,
+   * and instruction-bearing overlays. On the cache-friendly path this
+   * deliberately excludes volatile PhantomBot turn context. The authority of
+   * security material comes from the explicit trust/screening contract and
+   * policy, not from its position in the serialized prompt.
    */
   systemPrompt: string;
   /**

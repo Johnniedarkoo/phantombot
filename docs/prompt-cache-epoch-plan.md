@@ -12,8 +12,8 @@ miss must affect latency, never correctness or recoverability.
 The feature is disabled by default. When enabled, it combines two behaviors
 behind one setting:
 
-1. high-authority system material is kept stable and volatile PhantomBot turn
-   context is placed after canonical history; and
+1. system material is kept stable and volatile PhantomBot turn context
+   is placed after canonical history for cache/prefix reuse; and
 2. completed turns are retained in a bounded, in-process append-only epoch so
    the next PhantomBot payload can retain an exact serialized prefix.
 
@@ -51,10 +51,11 @@ and the established upstream payload is rendered unchanged.
 
 Each context block describes the user message immediately following it. The
 stable system rule identifies the newest block as current context and older
-blocks as historical snapshots. Retrieved text remains data, not an
-authenticated instruction, and historical text cannot override current
-principal instructions, retrieval, security policy, tool authorization, or
-stable system rules. Delimiters are framing only.
+blocks as historical snapshots. Retrieved memories, durable facts, daily
+recall, and historical snapshots remain data/context, not a new instruction
+channel. Their prompt position or recency does not grant trust or authority;
+security authority comes from explicit trust state, threat screening,
+security/system policy, and epoch invalidation. Delimiters are framing only.
 
 There are two separate prefix claims:
 
@@ -125,7 +126,7 @@ epoch when:
 - the projected prompt exceeds `max_epoch_bytes`;
 - the process has no prior in-memory state;
 - the persona or conversation key changes;
-- the high-authority system prompt changes, including instruction-bearing
+- the stable system prompt changes, including instruction-bearing
   overlays;
 - canonical history no longer matches the expected persisted tail;
 - explicit trust, persona, or effective security-surface state changes; or

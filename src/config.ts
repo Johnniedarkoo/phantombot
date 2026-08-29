@@ -647,7 +647,7 @@ export const DEFAULT_TELEGRAM_STREAMING: TelegramStreamingSettings = {
 };
 
 export interface PromptCacheSettings {
-  /** Enable cache-friendly prompt ordering and bounded append-only epochs. */
+  /** Enable cache-friendly serialization order and bounded append-only epochs. */
   enabled: boolean;
   /** Maximum rendered UTF-8 bytes retained in one disposable epoch. */
   maxEpochBytes: number;

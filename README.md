@@ -609,10 +609,12 @@ enabled = false
 max_epoch_bytes = 80000
 ```
 
-When enabled, PhantomBot keeps high-authority persona and security material
-ahead of canonical history, then places the current PhantomBot-provided context
-and user message after that history. Completed turns are appended to a small,
-in-process cache epoch so payload N is an exact textual prefix of payload N+1.
+When enabled, PhantomBot keeps persona, policy, security, and instruction-bearing
+overlay material in the stable system prompt, then places the current
+PhantomBot-provided context and user message after canonical history. This
+ordering is only a cache/prefix-reuse optimization; prompt position does not
+grant trust or authority. Completed turns are appended to a small, in-process
+cache epoch so payload N is an exact textual prefix of payload N+1.
 The epoch is rebuilt from the canonical memory database when its byte budget is
 reached or its identity is no longer valid. That rebase causes one cold turn;
 it does not discard or rewrite durable memory.
@@ -625,6 +627,10 @@ request. A failure while preparing, completing, or discarding cache bookkeeping
 is contained: a valid model response remains a successful user turn. Cache-error
 telemetry contains safe metadata only and never prompt content.
 
+Security authority comes from explicit trust state, threat screening,
+security/system policy, and epoch invalidation; prompt position is not a
+security mechanism. Retrieved memories, durable facts, daily recall, and
+historical snapshots are data/context, not a new instruction channel.
 Security boundaries are explicit cache boundaries too. Trusted/untrusted
 transitions rebase from canonical history even if prompt text would otherwise
 look unchanged. Persona entry is observed before screening and cache

@@ -2,14 +2,16 @@ import type { HistoryTurn } from "./types.ts";
 
 /**
  * Minimal input required to render the user-side payload shared by stateless
- * harnesses. The critical ordering is deliberate:
+ * harnesses. The serialization ordering is deliberate for cache/prefix reuse
+ * only:
  *
  *   stable system prompt (owned by the harness) -> historical turns ->
  *   volatile per-turn context -> current user message
  *
  * Keeping volatile context after historical turns preserves the longest useful
  * serialized prefix available to downstream prompt caches while leaving
- * PhantomBot as the authoritative owner of conversation state. This textual
+ * PhantomBot as the authoritative owner of conversation state. Prompt
+ * position does not grant trust or authority to any content. This textual
  * prefix claim does not guarantee that a stateless harness/model can reuse the
  * immediately preceding generated assistant response: its chat-template role
  * transition may differ on the next request.

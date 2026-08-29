@@ -114,7 +114,7 @@ export interface TurnInput {
   startupTimeoutMs?: number;
   /** Number of prior turns to load. Default 30. */
   historyLimit?: number;
-  /** One opt-in setting for stable ordering and bounded prompt-cache epochs. */
+  /** One opt-in setting for cache-friendly serialization and bounded epochs. */
   promptCache?: PromptCacheSettings;
   /** Skip loading prior turns AND skip persisting this one. Default false. */
   noHistory?: boolean;
@@ -528,13 +528,13 @@ async function* runTurnBody(
   //      plan-then-confirm + 50-word-answer rule, on every interactive
   //      turn whose question a human will actually see.
   //   2. siblingNotice — #391. Sits between the caller's suffix and the
-  //      narration rule: it is a constraint on WHAT the turn may do, so it
-  //      outranks the formatting directive, but it must not displace the
+  //      narration rule: it is a constraint on WHAT the turn may do and stays
+  //      in this deterministic overlay order without displacing the
   //      channel's own framing. Absent (and free) whenever nothing else is
   //      running, which is the overwhelming majority of turns.
-  //   3. PRE_TOOL_NARRATION_INSTRUCTION — opt-in via toolNarration,
-  //      added LAST so its directive sits closest to the user message
-  //      and is the most prominent format-of-reply rule the model sees.
+  //   3. PRE_TOOL_NARRATION_INSTRUCTION — opt-in via toolNarration, added LAST
+  //      to preserve the deterministic existing overlay order. Placement is a
+  //      formatting/layout choice and carries no trust or security meaning.
   const overlays: string[] = [];
   if (input.systemPromptSuffix) overlays.push(input.systemPromptSuffix);
 
