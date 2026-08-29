@@ -978,6 +978,62 @@ describe("cache-friendly prompt layout", () => {
     expect(secondA.epochTurns).toHaveLength(0);
   });
 
+  test("preserves persona_changed telemetry on the production turn path", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "phantombot-cache-persona-"));
+    const memory = await openMemoryStore(":memory:");
+    const harness = new CapturingHarness();
+    const settings = { enabled: true, maxEpochBytes: 80_000 };
+    const input = {
+      persona: "A",
+      conversation: "telegram:persona-telemetry",
+      agentDir,
+      workingDir: agentDir,
+      memory,
+      harnesses: [harness],
+      idleTimeoutMs: 1_000,
+      promptCache: settings,
+      trusted: true,
+    };
+    const originalWrite = process.stderr.write;
+    const lines: string[] = [];
+    process.stderr.write = ((chunk: unknown) => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      clearPromptCacheEpochs();
+      await writeFile(join(agentDir, "BOOT.md"), "# PhantomBot", "utf8");
+      await collect(runTurn({ ...input, userMessage: "A one" }));
+      await collect(runTurn({ ...input, persona: "B", userMessage: "B one" }));
+
+      const bEvents = lines
+        .filter((line) => line.includes('"msg":"prompt_cache.epoch"'))
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter(
+          (event) =>
+            event.persona === "B" &&
+            event.conversation === "telegram:persona-telemetry",
+        );
+      expect(bEvents).toContainEqual(
+        expect.objectContaining({
+          event: "rebase",
+          rebase_reason: "persona_changed",
+        }),
+      );
+      expect(bEvents).not.toContainEqual(
+        expect.objectContaining({
+          event: "new",
+          reason: "no_state",
+        }),
+      );
+    } finally {
+      process.stderr.write = originalWrite;
+      clearPromptCacheEpochs();
+      await memory.close();
+      await rm(agentDir, { recursive: true, force: true });
+    }
+  });
+
   test("feature-off decisions return no plan and emit no cache telemetry", () => {
     const manager = new PromptCacheEpochManager();
     const lines: string[] = [];

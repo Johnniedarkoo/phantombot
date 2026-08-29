@@ -116,11 +116,13 @@ export class PromptCacheEpochManager {
     return personaChanged;
   }
 
-  prepare(input: PreparePromptCacheInput): PromptCacheEpochPlan | undefined {
-    const personaChanged = this.observePersona(
-      input.persona,
-      input.conversation,
-    );
+  prepare(
+    input: PreparePromptCacheInput,
+    observedPersonaChanged?: boolean,
+  ): PromptCacheEpochPlan | undefined {
+    const personaChanged =
+      observedPersonaChanged ??
+      this.observePersona(input.persona, input.conversation);
     if (!input.settings.enabled) return undefined;
 
     const key = cacheKey(input.persona, input.conversation);

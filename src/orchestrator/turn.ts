@@ -362,7 +362,10 @@ async function* runTurnBody(
   // Persona entry is lifecycle bookkeeping, not cache preparation. It must
   // run for cache-disabled and no-history turns so A -> B -> A cannot revive
   // A's disposable epoch after B was served without a cache plan.
-  promptCacheEpochs.observePersona(input.persona, input.conversation);
+  const personaChanged = promptCacheEpochs.observePersona(
+    input.persona,
+    input.conversation,
+  );
   const persona = await loadPersona(input.agentDir);
 
   const history = input.noHistory
@@ -646,7 +649,7 @@ async function* runTurnBody(
     try {
       epochPlan = input.noHistory
         ? (promptCacheEpochs.bypass(promptCacheInput, "no_history"), undefined)
-        : promptCacheEpochs.prepare(promptCacheInput);
+        : promptCacheEpochs.prepare(promptCacheInput, personaChanged);
     } catch {
       try {
         promptCacheEpochs.discard(input.persona, input.conversation);
