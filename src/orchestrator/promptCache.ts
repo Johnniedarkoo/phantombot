@@ -19,7 +19,14 @@ export type PromptCacheReason =
   | "history_changed"
   | "concurrent_turn"
   | "oversized_base"
-  | "no_history";
+  | "no_history"
+  | "cache_error";
+
+export type PromptCacheErrorPhase =
+  | "prepare"
+  | "complete"
+  | "fail"
+  | "discard";
 
 interface EpochState {
   key: string;
@@ -90,6 +97,17 @@ export class PromptCacheEpochManager {
     let state = this.states.get(key);
     let rebased = false;
     let reason: PromptCacheReason | undefined;
+
+    // Epoch state is disposable optimization data. Never trust malformed or
+    // inconsistent state when it is found: discard it and let the caller
+    // degrade this request to the normal feature-off prompt path.
+    if (
+      state !== undefined &&
+      !isValidEpochState(state, key, input.persona, input.conversation)
+    ) {
+      this.states.delete(key);
+      throw new Error("prompt-cache state is invalid");
+    }
 
     if (!state) {
       reason = "no_state";
@@ -237,31 +255,71 @@ export class PromptCacheEpochManager {
 
   complete(plan: PromptCacheEpochPlan, assistantMessage: string): void {
     const state = plan.state;
-    state.active = false;
-    if (this.states.get(state.key) !== state) return;
+    try {
+      state.active = false;
+      if (this.states.get(state.key) !== state) return;
 
-    if (!plan.retainEpoch) {
+      if (
+        !isValidEpochState(
+          state as unknown,
+          state.key,
+          state.persona,
+          state.conversation,
+        ) ||
+        typeof assistantMessage !== "string"
+      ) {
+        this.states.delete(state.key);
+        return;
+      }
+
+      if (!plan.retainEpoch) {
+        this.states.delete(state.key);
+        return;
+      }
+
+      const nextTurn: PromptEpochTurn = {
+        turnContext: plan.turnContext ?? "",
+        userMessage: plan.userMessage,
+        assistantMessage,
+      };
+      state.epochTurns.push(nextTurn);
+      state.canonicalHistory.push(
+        { role: "user", text: plan.userMessage },
+        { role: "assistant", text: assistantMessage },
+      );
+    } catch (error) {
       this.states.delete(state.key);
-      return;
+      throw error;
     }
-
-    const nextTurn: PromptEpochTurn = {
-      turnContext: plan.turnContext ?? "",
-      userMessage: plan.userMessage,
-      assistantMessage,
-    };
-    state.epochTurns.push(nextTurn);
-    state.canonicalHistory.push(
-      { role: "user", text: plan.userMessage },
-      { role: "assistant", text: assistantMessage },
-    );
   }
 
   fail(plan: PromptCacheEpochPlan): void {
-    plan.state.active = false;
-    if (this.states.get(plan.state.key) !== plan.state) return;
-    // A failed request has no durable turn to append. Retain the prior epoch
-    // so an ordinary retry can reuse the same safe prefix.
+    const state = plan.state;
+    try {
+      state.active = false;
+      if (this.states.get(state.key) !== state) return;
+      if (
+        !isValidEpochState(
+          state as unknown,
+          state.key,
+          state.persona,
+          state.conversation,
+        )
+      ) {
+        this.states.delete(state.key);
+        return;
+      }
+      // A failed request has no durable turn to append. Retain the prior epoch
+      // so an ordinary retry can reuse the same safe prefix.
+    } catch (error) {
+      this.states.delete(state.key);
+      throw error;
+    }
+  }
+
+  /** Discard disposable state after any cache bookkeeping failure. */
+  discard(persona: string, conversation: string): void {
+    this.states.delete(cacheKey(persona, conversation));
   }
 
   clear(): void {
@@ -322,6 +380,30 @@ export function clearPromptCacheEpochs(): void {
   promptCacheEpochs.clear();
 }
 
+/**
+ * Emit only safe metadata for a cache failure. Prompt content and raw error
+ * messages are deliberately excluded because this path is allowed to run
+ * while recovering from malformed private state.
+ */
+export function reportPromptCacheError(
+  persona: string,
+  conversation: string,
+  phase: PromptCacheErrorPhase,
+): void {
+  try {
+    log.warn("prompt_cache.epoch", {
+      event: "bypass",
+      persona,
+      conversation,
+      retain_epoch: false,
+      bypass_reason: "cache_error",
+      phase,
+    });
+  } catch {
+    // Cache telemetry is best effort and must never affect the turn.
+  }
+}
+
 /** Rendered UTF-8 byte count used only for the backend-neutral epoch bound. */
 export function estimatePromptBytes(input: {
   systemPrompt: string;
@@ -370,4 +452,71 @@ function historyTail(
   limit: number,
 ): readonly HistoryTurn[] {
   return limit === 0 ? [] : history.slice(-limit);
+}
+
+function isValidEpochState(
+  value: unknown,
+  expectedKey: string,
+  expectedPersona: string,
+  expectedConversation: string,
+): value is EpochState {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Partial<EpochState>;
+  if (
+    state.key !== expectedKey ||
+    state.persona !== expectedPersona ||
+    state.conversation !== expectedConversation ||
+    typeof state.systemFingerprint !== "string" ||
+    !/^[0-9a-f]{64}$/.test(state.systemFingerprint) ||
+    typeof state.active !== "boolean" ||
+    !Array.isArray(state.baseHistory) ||
+    !Array.isArray(state.canonicalHistory) ||
+    !Array.isArray(state.epochTurns) ||
+    !state.baseHistory.every(isHistoryTurn) ||
+    !state.canonicalHistory.every(isHistoryTurn) ||
+    !state.epochTurns.every(isPromptEpochTurn) ||
+    state.canonicalHistory.length !==
+      state.baseHistory.length + state.epochTurns.length * 2 ||
+    !sameHistory(
+      state.baseHistory,
+      state.canonicalHistory.slice(0, state.baseHistory.length),
+    )
+  ) {
+    return false;
+  }
+
+  for (let index = 0; index < state.epochTurns.length; index++) {
+    const epochTurn = state.epochTurns[index];
+    if (!epochTurn) return false;
+    const canonicalIndex = state.baseHistory.length + index * 2;
+    if (
+      state.canonicalHistory[canonicalIndex]?.role !== "user" ||
+      state.canonicalHistory[canonicalIndex]?.text !== epochTurn.userMessage ||
+      state.canonicalHistory[canonicalIndex + 1]?.role !== "assistant" ||
+      state.canonicalHistory[canonicalIndex + 1]?.text !==
+        epochTurn.assistantMessage
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isHistoryTurn(value: unknown): value is HistoryTurn {
+  if (!value || typeof value !== "object") return false;
+  const turn = value as Partial<HistoryTurn>;
+  return (
+    (turn.role === "user" || turn.role === "assistant") &&
+    typeof turn.text === "string"
+  );
+}
+
+function isPromptEpochTurn(value: unknown): value is PromptEpochTurn {
+  if (!value || typeof value !== "object") return false;
+  const turn = value as Partial<PromptEpochTurn>;
+  return (
+    typeof turn.turnContext === "string" &&
+    typeof turn.userMessage === "string" &&
+    typeof turn.assistantMessage === "string"
+  );
 }
