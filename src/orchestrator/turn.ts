@@ -359,6 +359,10 @@ async function* runTurnBody(
 ): AsyncGenerator<HarnessChunk> {
   const origin: TurnOrigin = input.origin ?? "channel";
   const startedAt = new Date();
+  // Persona entry is lifecycle bookkeeping, not cache preparation. It must
+  // run for cache-disabled and no-history turns so A -> B -> A cannot revive
+  // A's disposable epoch after B was served without a cache plan.
+  promptCacheEpochs.observePersona(input.persona, input.conversation);
   const persona = await loadPersona(input.agentDir);
 
   const history = input.noHistory
@@ -381,10 +385,14 @@ async function* runTurnBody(
   // authenticated principal is the gate). The screen contracts not to throw;
   // the catch is belt-and-suspenders and fails OPEN so a judge outage degrades
   // to "unscreened", never "app down".
+  const screening: "screened" | "unscreened" | "trusted" =
+    input.trusted === true ? "trusted" : "unscreened";
+  let effectiveScreening = screening;
   if (input.trusted !== true && input.screen) {
     let verdict: ScreenVerdict | undefined;
     try {
       verdict = await input.screen(input.userMessage, input.signal);
+      if (verdict?.action === "pass") effectiveScreening = "screened";
     } catch {
       verdict = undefined;
     }
@@ -628,12 +636,7 @@ async function* runTurnBody(
     trusted: input.trusted === true,
     securityFingerprint: promptCacheSecurityFingerprint({
       trusted: input.trusted === true,
-      screening:
-        input.trusted === true
-          ? "trusted"
-          : input.screen
-            ? "screened"
-            : "unscreened",
+      screening: effectiveScreening,
       mcpMode: input.mcpMode ?? "default",
       tools: input.toolsMode?.allow,
     }),

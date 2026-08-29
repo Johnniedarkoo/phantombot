@@ -102,7 +102,25 @@ export class PromptCacheEpochManager {
   /** The current persona for each conversation served by this process. */
   private readonly activePersonas = new Map<string, string>();
 
+  /**
+   * Observe persona lifecycle independently of cache eligibility. A persona
+   * with caching disabled, or a no-history turn, must still close the prior
+   * persona's disposable epoch before that persona can return.
+   */
+  observePersona(persona: string, conversation: string): boolean {
+    const previousPersona = this.activePersonas.get(conversation);
+    const personaChanged =
+      previousPersona !== undefined && previousPersona !== persona;
+    if (personaChanged) this.deleteConversationStates(conversation);
+    this.activePersonas.set(conversation, persona);
+    return personaChanged;
+  }
+
   prepare(input: PreparePromptCacheInput): PromptCacheEpochPlan | undefined {
+    const personaChanged = this.observePersona(
+      input.persona,
+      input.conversation,
+    );
     if (!input.settings.enabled) return undefined;
 
     const key = cacheKey(input.persona, input.conversation);
@@ -114,13 +132,6 @@ export class PromptCacheEpochManager {
     const trusted = input.trusted === true;
     const securityFingerprint =
       input.securityFingerprint ?? (trusted ? "trusted" : "untrusted");
-    const previousPersona = this.activePersonas.get(input.conversation);
-    const personaChanged =
-      previousPersona !== undefined && previousPersona !== input.persona;
-    if (personaChanged) {
-      this.deleteConversationStates(input.conversation);
-    }
-    this.activePersonas.set(input.conversation, input.persona);
     let state = this.states.get(key);
     let rebased = false;
     let reason: PromptCacheReason | undefined;

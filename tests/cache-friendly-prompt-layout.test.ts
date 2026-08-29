@@ -938,6 +938,46 @@ describe("cache-friendly prompt layout", () => {
     expect(aAgain.epochTurns).toHaveLength(1);
   });
 
+  test("observes a disabled persona turn before A can return", () => {
+    const manager = new PromptCacheEpochManager();
+    const enabled = { enabled: true, maxEpochBytes: 500 };
+    const firstA = manager.prepare({
+      settings: enabled,
+      persona: "A",
+      conversation: "shared-conversation",
+      systemPrompt: "A",
+      history: [],
+      userMessage: "A one",
+    })!;
+    manager.complete(firstA, "A answer");
+
+    expect(
+      manager.prepare({
+        settings: { enabled: false, maxEpochBytes: 500 },
+        persona: "B",
+        conversation: "shared-conversation",
+        systemPrompt: "B",
+        history: [],
+        userMessage: "B one",
+      }),
+    ).toBeUndefined();
+
+    const secondA = manager.prepare({
+      settings: enabled,
+      persona: "A",
+      conversation: "shared-conversation",
+      systemPrompt: "A",
+      history: [
+        { role: "user", text: "A one" },
+        { role: "assistant", text: "A answer" },
+      ],
+      userMessage: "A two",
+    })!;
+    expect(secondA.event).toBe("rebase");
+    expect(secondA.reason).toBe("persona_changed");
+    expect(secondA.epochTurns).toHaveLength(0);
+  });
+
   test("feature-off decisions return no plan and emit no cache telemetry", () => {
     const manager = new PromptCacheEpochManager();
     const lines: string[] = [];
@@ -1035,6 +1075,52 @@ describe("cache-friendly prompt layout", () => {
       );
     } finally {
       process.stderr.write = originalWrite;
+      clearPromptCacheEpochs();
+      await memory.close();
+      await rm(agentDir, { recursive: true, force: true });
+    }
+  });
+
+  test("fail-open screening changes the cache security state", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "phantombot-cache-screen-"));
+    const memory = await openMemoryStore(":memory:");
+    const harness = new CapturingHarness();
+    const settings = { enabled: true, maxEpochBytes: 80_000 };
+    const input = {
+      persona: "phantom",
+      conversation: "telegram:screen-failure",
+      agentDir,
+      workingDir: agentDir,
+      memory,
+      harnesses: [harness],
+      idleTimeoutMs: 1_000,
+      promptCache: settings,
+      trusted: false,
+    };
+    const pass = async () => ({
+      action: "pass" as const,
+      score: 0,
+      reason: "safe",
+    });
+    const fail = async () => {
+      throw new Error("judge unavailable");
+    };
+    try {
+      clearPromptCacheEpochs();
+      await writeFile(join(agentDir, "BOOT.md"), "# PhantomBot", "utf8");
+
+      await collect(runTurn({ ...input, userMessage: "first", screen: pass }));
+      expect(harness.captured?.epochTurns).toBeUndefined();
+
+      await collect(runTurn({ ...input, userMessage: "judge down", screen: fail }));
+      expect(harness.captured?.epochTurns).toBeUndefined();
+
+      await collect(runTurn({ ...input, userMessage: "recovered", screen: pass }));
+      expect(harness.captured?.epochTurns).toBeUndefined();
+
+      await collect(runTurn({ ...input, userMessage: "warm again", screen: pass }));
+      expect(harness.captured?.epochTurns).toHaveLength(1);
+    } finally {
       clearPromptCacheEpochs();
       await memory.close();
       await rm(agentDir, { recursive: true, force: true });
