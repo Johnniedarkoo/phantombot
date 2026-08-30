@@ -220,12 +220,9 @@ the warm fixture reaches the target through a completed prior epoch turn.
 ### Real local-model A/B evidence
 
 On 2026-08-29, a bounded real-model acceptance run used the normal PhantomBot
-`runTurn` → `PiHarness` path with the local Qwen model. The live stack was
-verified before the run: LocalLLM gateway `http://127.0.0.1:8010` reported
-`inference_provider: llamacpp`, and the llama.cpp router at
-`http://127.0.0.1:8080` reported `qwen3.8-27b` loaded. A temporary Pi agent
-directory pointed the otherwise unchanged `llamacpp/qwen3.8-27b` provider/model
-pair at the LocalLLM gateway's `/v1` proxy; the live Pi registry was not edited.
+`runTurn` → `PiHarness` path against Qwen3.8-27B served locally by llama.cpp
+through an OpenAI-compatible endpoint. The same provider/model and generation
+settings were used for both cold and warm conditions.
 
 The six comparisons used isolated temporary persona directories and in-memory
 memory stores. Each fixture used the same persona text and the same two-turn
