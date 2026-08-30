@@ -24,59 +24,57 @@ import {
   applyAutostart,
   applyDefaultPersona,
   applyEmbedding,
+  applyUpdateChannel,
   applyVoice,
   describeAutostartChange,
   describeDefaultPersonaChange,
   describeEmbeddingChange,
+  describeUpdateChannelChange,
   describeVoiceChange,
-  openInEditor,
   setSecret,
   unsetSecret,
   type Consequence,
 } from "./actions.ts";
 import { Frame } from "./components/Frame.tsx";
-import {
-  withPromptTerminal,
-} from "./prompts.ts";
 import { ConfirmScreen, type ConfirmRequest } from "./screens/Confirm.tsx";
+import {
+  FileEditorScreen,
+  type FileEditorResult,
+} from "./screens/FileEditor.tsx";
 import { AskScreen, type AskRequest } from "./screens/Ask.tsx";
 import { ChooseScreen, type ChooseRequest } from "./screens/Choose.tsx";
+import {
+  SearchListScreen,
+  type SearchListRequest,
+} from "./screens/SearchList.tsx";
 import { ReembedScreen, type ReembedState } from "./screens/Reembed.tsx";
-import type { EmbeddingConfigUpdate } from "../cli/embedding.ts";
 import { openChat, type ChatSession } from "./chatSession.ts";
 import { ChatScreen } from "./screens/Chat.tsx";
 import { DashboardScreen } from "./screens/Dashboard.tsx";
 import { PersonaDetailScreen } from "./screens/PersonaDetail.tsx";
 import { KeysScreen } from "./screens/Keys.tsx";
-import { MemoryScreen, type SearchHit } from "./screens/Memory.tsx";
-import { VoiceScreen } from "./screens/Voice.tsx";
 import { DoctorScreen } from "./screens/Doctor.tsx";
 import { gatherStatus, type StatusRows } from "./status.ts";
 import { McpScreen } from "./screens/Mcp.tsx";
 import { LogsScreen } from "./screens/Logs.tsx";
 import { WizardScreen, type WizardAnswers } from "./screens/Wizard.tsx";
 import { theme } from "./theme.ts";
-import { mouse } from "./mouse.ts";
 import { logBuffer } from "./logBuffer.ts";
 import { TerminalSizeContext, renderRows, terminalSize } from "./terminal.ts";
 import { loadConfigForPersona, type Config } from "../config.ts";
-import { runMemorySearch } from "../cli/memory.ts";
-
 import { runDoctor, type DoctorReport } from "../cli/doctor.ts";
 import type { WizardStep } from "../lib/personaComplete.ts";
-import type { VoiceProvider } from "../lib/voice.ts";
 
 type Screen =
   | "chat"
   | "dashboard"
   | "persona"
   | "keys"
-  | "memory"
-  | "voice"
   | "doctor"
   | "mcp"
   | "logs"
-  | "wizard";
+  | "wizard"
+  | "editor";
 
 export interface AppProps {
   host: HostSnapshot;
@@ -97,6 +95,13 @@ export interface AppProps {
     config: Config;
     persona: string;
   }) => Promise<ChatSession>;
+  /**
+   * Seam for tests, same reason as `openSession`: the settings screen runs
+   * the doctor when it opens, and the real checks need a real persona on
+   * disk. Injectable so a screen-level test can pin the DOCTOR telemetry
+   * block with a well-formed report instead of a failure notice.
+   */
+  runDoctorImpl?: typeof runDoctor;
 }
 
 export function App(props: AppProps): React.ReactElement {
@@ -145,7 +150,14 @@ export function App(props: AppProps): React.ReactElement {
   const [doctorReport, setDoctorReport] = useState<DoctorReport | undefined>();
   const [doctorStatus, setDoctorStatus] = useState<StatusRows | undefined>();
   const [doctorRunning, setDoctorRunning] = useState(false);
+  // The settings screen's live /status reading for the persona it is open on.
+  // Undefined = still gathering; the descriptions read `…` until this lands.
+  const [detailStatus, setDetailStatus] = useState<StatusRows | undefined>();
+  // Bumped whenever settings-affecting writes happen, so the reading refreshes
+  // instead of describing the config as it was before the edit.
+  const [detailNonce, setDetailNonce] = useState(0);
   const [notice, setNotice] = useState<string | undefined>();
+  const [editorPath, setEditorPath] = useState<string | null>(null);
   /**
    * True while a `@clack` prompt owns the terminal.
    *
@@ -178,10 +190,12 @@ export function App(props: AppProps): React.ReactElement {
   const [choose, setChoose] = useState<
     (ChooseRequest & { resolve: (value: string | undefined) => void }) | undefined
   >();
+  const [searchAsk, setSearchAsk] = useState<
+    (SearchListRequest & { resolve: (value: string | undefined) => void }) | undefined
+  >();
   const [reembed, setReembed] = useState<
     { space: string; state: ReembedState } | undefined
   >();
-  const [voiceProvider, setVoiceProvider] = useState<VoiceProvider>("none");
   /**
    * The window, measured HERE and nowhere else.
    *
@@ -257,6 +271,15 @@ export function App(props: AppProps): React.ReactElement {
     return value;
   }, []);
 
+  /** Ask with the searchable list screen (long catalogues). Same contract. */
+  const askSearch = useCallback(async (input: SearchListRequest) => {
+    const value = await new Promise<string | undefined>((resolve) => {
+      setSearchAsk({ ...input, resolve });
+    });
+    setSearchAsk(undefined);
+    return value;
+  }, []);
+
   // One chat session per persona, opened lazily and kept across screen
   // switches so `^s` then `esc` returns to the same thread.
   useEffect(() => {
@@ -303,7 +326,30 @@ export function App(props: AppProps): React.ReactElement {
 
   const refresh = useCallback(async () => {
     setHost(await hostSnapshot());
+    // Any refresh follows a write; the settings screen's /status reading
+    // must not keep describing the pre-write config. The gather effect
+    // no-ops when the settings screen is not open, so the bump is free.
+    setDetailNonce((n) => n + 1);
   }, []);
+
+  // The settings screen's live probes. Gathered off the render path (they
+  // reach the network, 5s deadline) and shown as `…` until they land, so the
+  // screen paints instantly and fills in.
+  useEffect(() => {
+    if (screen !== "persona") return;
+    let cancelled = false;
+    setDetailStatus(undefined);
+    gatherStatus({ persona: personaName })
+      .then((rows) => {
+        if (!cancelled) setDetailStatus(rows);
+      })
+      .catch(() => {
+        /* leave the cells at `…`; a failed probe must not blank the screen */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [screen, personaName, detailNonce]);
 
   /**
    * The service state, probed off the render path. See `probeServiceActive`:
@@ -326,17 +372,6 @@ export function App(props: AppProps): React.ReactElement {
 
   const persona =
     host.personas.find((p) => p.name === personaName) ?? host.personas[0];
-
-  // Mouse clicks are routed centrally to the topmost registered rect. A click
-  // that hits nothing is simply ignored — it must never fall through to a
-  // keyboard handler.
-  useEffect(() => {
-    if (!mouse.enabled) return;
-    return mouse.onMouse((event) => {
-      if (event.kind !== "down") return;
-      mouse.click(event.column, event.row);
-    });
-  }, []);
 
   useInput((char, key) => {
     // While a clack prompt owns the terminal the app is not on screen. Acting
@@ -376,45 +411,19 @@ export function App(props: AppProps): React.ReactElement {
     // has opened. `exitOnCtrlC: false` means Ink will not rescue us either, so
     // without this the window between "wizard finished" and "session ready" —
     // or a session that never opens because the harness is gone — is
-    // unquittable except by killing the terminal, with mouse reporting still on.
+    // unquittable except by killing the terminal.
     if (screen === "chat" && !session) {
       if ((key.ctrl && (char === "q" || char === "c")) || key.escape) exit();
     }
   });
 
-  const search = useCallback(
-    async (query: string): Promise<SearchHit[]> => {
-      // Reuse the SUBCOMMAND's search rather than reimplementing scoring, so
-      // the two surfaces can never disagree about what recall returns.
-      let buffer = "";
-      await runMemorySearch({
-        query,
-        persona: personaName,
-        limit: 5,
-        out: { write: (chunk: string) => void (buffer += chunk) },
-      });
-      try {
-        const parsed = JSON.parse(buffer) as {
-          results?: Array<{
-            path: string;
-            ftsScore?: number;
-            vecScore?: number;
-          }>;
-        };
-        return parsed.results ?? [];
-      } catch {
-        return [];
-      }
-    },
-    [personaName],
-  );
-
-  const runTheDoctor = useCallback(async () => {
+  const runTheDoctor = useCallback(async (who?: string) => {
+    const target = who ?? personaName;
     setDoctorRunning(true);
     try {
       let buffer = "";
-      await runDoctor({
-        persona: personaName,
+      await (props.runDoctorImpl ?? runDoctor)({
+        persona: target,
         json: true,
         // Read-only: opening a health screen must not repair anything behind
         // the user's back.
@@ -427,7 +436,10 @@ export function App(props: AppProps): React.ReactElement {
       // must not cost the user the report that already succeeded.
       try {
         setDoctorStatus(
-          await gatherStatus({ persona: personaName, chain: persona?.chain }),
+          await gatherStatus({
+            persona: target,
+            chain: host.personas.find((p) => p.name === target)?.chain,
+          }),
         );
       } catch {
         setDoctorStatus(undefined);
@@ -437,82 +449,121 @@ export function App(props: AppProps): React.ReactElement {
     } finally {
       setDoctorRunning(false);
     }
-  }, [personaName]);
+  }, [personaName, host]);
+
+  // The settings screen no longer runs the doctor — its telemetry block shows
+  // the persona's /status reading only. The full Doctor screen (from the
+  // phantoms list) still gathers its report via runTheDoctor on open.
 
   /**
-   * The harness chain, on screens.
+   * The Brain row, as the redesigned flow (`brainFlow.ts`).
    *
-   * `runHarness` is the SAME function `phantombot harness` runs — it writes the
-   * chain, Pi's routing, the provider key and the "use Pi's own config"
-   * tombstone, and none of that is worth a second implementation. Only the
-   * ASKING is swapped: every question becomes one of this app's own screens, so
-   * the flow keeps the frame and never hands the terminal over.
+   * The flow owns the ASKING (primary → fallback → Pi's provider/model slots,
+   * all on searchable screens); this callback owns the DEPS — every write goes
+   * through the same functions the CLI harness command uses, so the TUI and
+   * the CLI cannot write different shapes of the same files.
    */
   const changeBrain = useCallback(
     async (target: PersonaSnapshot) => {
       setPrompting(true);
       try {
-        // Imported ON DEMAND: pulling the whole `harness` subcommand graph in at
-        // module scope delayed the app's first render enough that the opening
-        // keystrokes were dropped — the first-run test caught it as a wizard
-        // whose name box stayed empty.
-        const { runHarness } = await import("../cli/harness.ts");
-        const firstLine = (text: string) =>
-          text.split("\n").find((l) => l.trim().length > 0) ?? "";
-        await runHarness({
-          persona: target.name,
-          prompts: {
-            // The Pi installer inherits stdin and paints its own onboarding:
-            // a hand-over mid-render, which is the wedge this port removes.
-            canRunInteractiveInstaller: false,
-            select: async (input) =>
-              (await askChoice({
-                title: input.message,
-                options: input.options.map((o) => ({
-                  value: o.value,
-                  label: o.label,
-                  hint: o.hint,
-                })),
-                initial: input.initialValue,
-              })) as never,
-            text: async (input) =>
-              await askValue({
-                title: input.message,
-                hint: input.placeholder,
-                initial: input.initialValue ?? input.defaultValue,
-                // "blank = keep current / none" is a real answer in this flow.
-                allowEmpty: true,
-              }),
-            password: async (input) =>
-              await askValue({
-                title: input.message,
-                hint: "stored in this phantom's vault, never displayed again",
-                masked: true,
-                allowEmpty: true,
-              }),
-            // The flow's own wording is the whole question — repeating it as a
-            // "consequence" said the same sentence twice, and a fixed detail
-            // line would be wrong for at least one of the questions asked here.
-            confirm: async (input) =>
-              await askConfirmValue({
-                title: input.message,
-                consequence: {
-                  summary: "",
-                  detail: "",
-                  longRunning: false,
-                  restarts: false,
-                },
-              }),
-            // Clack panels have nowhere to live on a framed screen, so a note
-            // becomes the notice line. The body's first line carries the fact;
-            // the rest is the CLI's prose.
-            note: (body, title) =>
-              setNotice(title ? `${title}: ${firstLine(body)}` : firstLine(body)),
-            intro: () => {},
-            outro: () => {},
-            cancel: () => setNotice("brain unchanged"),
+        // Imported ON DEMAND: pulling the harness graph in at module scope
+        // delayed the app's first render enough that the opening keystrokes
+        // were dropped — the first-run test caught it as a wizard whose name
+        // box stayed empty.
+        const { configureBrain } = await import("./brainFlow.ts");
+        const { loadConfig } = await import("../config.ts");
+        const { ENV_PI_API_KEY } = await import("../lib/piRouting.ts");
+        const {
+          applyHarnessChain,
+          applyRouting,
+          clearPiRouting,
+          detectAvailability,
+          maybePromptRestart,
+          piInstallCommand,
+        } = await import("../cli/harness.ts");
+        const { resolveHarnessWriteTarget } = await import(
+          "../lib/harnessWriteTarget.ts"
+        );
+        const { harnessChainIds } = await import("../harnesses/buildChain.ts");
+        const { listPiModels } = await import("../lib/piModels.ts");
+        const {
+          getPersonaSecret,
+          setPersonaSecret,
+          unsetPersonaSecret,
+        } = await import("../lib/vaultSecrets.ts");
+        const { writePiApiKey } = await import("../lib/piAuthStore.ts");
+        const { defaultServiceControl } = await import("../lib/platform.ts");
+
+        const persona = target.name;
+        // Read the EFFECTIVE config: the picker pre-selects the chain and
+        // routing this persona actually runs with, not the host default's.
+        const config = await loadConfig(persona);
+        const chainIds = harnessChainIds(config, persona);
+        const availability = await detectAvailability(config);
+        const writeTarget = await resolveHarnessWriteTarget(config, persona);
+        const routing = config.harnesses.pi.routing ?? {};
+
+        const notice = await configureBrain(
+          {
+            choose: askChoice,
+            search: askSearch,
+            value: askValue,
+            note: (title, body) => setNotice(`${title}: ${body.split("\n")[0]}`),
           },
-        });
+          {
+            persona,
+            chain: chainIds,
+            availability,
+            routing: {
+              provider: routing.provider,
+              primaryModel: routing.primaryModel,
+              imageModel: routing.imageModel,
+              codingModel: routing.codingModel,
+            },
+            storedKey: await getPersonaSecret(config, ENV_PI_API_KEY, persona),
+            targetPath: writeTarget.path,
+            personaScope: writeTarget.scope === "persona",
+            piBin: availability.pi,
+            installCommand: piInstallCommand().join(" "),
+            listModels: (extraEnv) =>
+              listPiModels(availability.pi!, undefined, extraEnv),
+            setSecret: (value) => setPersonaSecret(config, ENV_PI_API_KEY, value, persona),
+            unsetSecret: () => unsetPersonaSecret(config, ENV_PI_API_KEY, persona),
+            writeAuth: (provider, value) => writePiApiKey(provider, value),
+            applyChain: (chain) =>
+              applyHarnessChain(writeTarget.path, chain as never, persona, writeTarget.scope),
+            applyRouting: (choices) => applyRouting(writeTarget.path, choices),
+            clearRouting: async (opts) => {
+              await clearPiRouting(writeTarget.path, opts);
+            },
+          },
+        );
+        setNotice(notice);
+
+        // Same post-apply hook the CLI runs: offer the restart when the
+        // service is live, since a chain change only bites on the next spawn.
+        // A cancel that left the config untouched ("brain unchanged") must NOT
+        // offer one — the restart belongs to a change, not to a visit.
+        // The q shim only needs `note` (unit upgrades, the skip message);
+        // `confirm` is passed explicitly, mapped onto our own confirm screen.
+        if (notice !== "brain unchanged") await maybePromptRestart(
+          defaultServiceControl(),
+          async (message) =>
+            await askConfirmValue({
+              title: message,
+              consequence: {
+                summary: "",
+                detail: "",
+                longRunning: false,
+                restarts: true,
+              },
+            }),
+          {
+            note: (body: string, title?: string) =>
+              setNotice(title ? `${title}: ${body.split("\n")[0]}` : body),
+          } as never,
+        );
       } catch (e) {
         setNotice(`brain failed: ${(e as Error).message}`);
       } finally {
@@ -520,7 +571,7 @@ export function App(props: AppProps): React.ReactElement {
         await refresh();
       }
     },
-    [refresh, askChoice, askValue, askConfirmValue],
+    [refresh, askChoice, askSearch, askValue, askConfirmValue],
   );
 
   /**
@@ -539,15 +590,15 @@ export function App(props: AppProps): React.ReactElement {
         // drop opening keystrokes.
         const { applyTelegramConfig } = await import("../cli/telegram.ts");
         const { telegramGetMe } = await import("../lib/telegramApi.ts");
+        const { maybePromptRestart } = await import("../cli/harness.ts");
+        const { defaultServiceControl } = await import("../lib/platform.ts");
         const { loadConfig, personaDir } = await import("../config.ts");
         const { resolvePersonaWriteTarget } = await import(
           "../lib/personaConfig.ts"
         );
-        const {
-          configurePhantomchat,
-          configureTelegram,
-          offerChannel,
-        } = await import("./channelsFlow.ts");
+        const { configurePhantomchat, configureTelegram } = await import(
+          "./channelsFlow.ts"
+        );
         const {
           ensurePhantomchatIdentity,
           savePhantomchatAllowlist,
@@ -563,22 +614,56 @@ export function App(props: AppProps): React.ReactElement {
         };
         const global = await loadConfig();
         const agentDir = personaDir(global, target.name);
-
-        // Same order as `phantombot init`: phantomchat, then telegram. BOTH are
-        // optional and each one is gated on its own choice, so a phantom that
-        // already has a channel is never walked back through its setup to reach
-        // the other one.
         const chat = loadPhantomchatPersonaConfig(agentDir);
-        if (
-          await offerChannel(questions, {
-            title: `PhantomChat for ${target.name}`,
-            configured: chat
-              ? chat.allowedNpubs.length > 0
-                ? `${chat.allowedNpubs.length} allowed npub(s)`
-                : "trust-on-first-use armed"
-              : undefined,
-          })
-        ) {
+        const personaConfig = await loadConfig(target.name);
+        const writeTarget = await resolvePersonaWriteTarget({
+          configPath: global.configPath,
+          personasDir: global.personasDir,
+          persona: target.name,
+        });
+        // Read the way the daemon reads: the persona's own layered block
+        // first, and only then the legacy per-persona routing table.
+        const existing =
+          personaConfig.channels.telegram ??
+          global.channels.telegramPersonas?.[target.name];
+
+        // Which channel to walk? The Choose screen — the same picker the
+        // Brain and Identity flows use. The current state sits in each row's
+        // hint so the pick is an informed one.
+        const which = await askChoice({
+          title: `Chat channel for ${target.name}`,
+          description: "which chat surface this phantom answers on",
+          options: [
+            {
+              value: "phantomchat",
+              label: "PhantomChat",
+              hint: chat
+                ? chat.allowedNpubs.length > 0
+                  ? `${chat.allowedNpubs.length} allowed npub(s)`
+                  : "trust-on-first-use armed"
+                : "not set up",
+            },
+            {
+              value: "telegram",
+              label: "Telegram",
+              hint: existing?.token
+                ? `${existing.allowedUserIds?.length ?? 0} allowed user(s)`
+                : "not set up",
+            },
+          ],
+        });
+        // esc on the picker is "did nothing" — no gate, no walkthrough.
+        if (!which) {
+          setNotice("channels unchanged");
+          return;
+        }
+
+        // The user PICKED the channel, so there is no offer/skip gate here —
+        // this is the same walkthrough `phantombot phantomchat --persona` or
+        // `phantombot telegram --persona` runs, asked on screens instead of
+        // @clack. The WRITE paths are those commands' own, so the TUI and the
+        // CLI cannot write different shapes of the same block.
+        if (which === "phantomchat") {
           notices.push(
             await configurePhantomchat(target.name, questions, {
               identity: async () => {
@@ -600,28 +685,7 @@ export function App(props: AppProps): React.ReactElement {
               },
             }),
           );
-        }
-
-        const personaConfig = await loadConfig(target.name);
-        const writeTarget = await resolvePersonaWriteTarget({
-          configPath: global.configPath,
-          personasDir: global.personasDir,
-          persona: target.name,
-        });
-        // Read the way the daemon reads: the persona's own layered block
-        // first, and only then the legacy per-persona routing table.
-        const existing =
-          personaConfig.channels.telegram ??
-          global.channels.telegramPersonas?.[target.name];
-
-        if (
-          await offerChannel(questions, {
-            title: `Telegram for ${target.name}`,
-            configured: existing?.token
-              ? `${existing.allowedUserIds?.length ?? 0} allowed user(s)`
-              : undefined,
-          })
-        ) {
+        } else {
           notices.push(
             await configureTelegram(target.name, questions, {
               existing: existing?.token
@@ -644,6 +708,29 @@ export function App(props: AppProps): React.ReactElement {
         }
 
         setNotice(notices.join(" · ") || "channels unchanged");
+
+        // Same post-apply hook the Brain flow runs: a channel change (token,
+        // allowlist, identity) only bites on the next service spawn, so offer
+        // the restart here — but only when something was actually SAVED.
+        if (notices.some((n) => n.includes("saved"))) {
+          await maybePromptRestart(
+            defaultServiceControl(),
+            async (message) =>
+              await askConfirmValue({
+                title: message,
+                consequence: {
+                  summary: "",
+                  detail: "",
+                  longRunning: false,
+                  restarts: true,
+                },
+              }),
+            {
+              note: (body: string, title?: string) =>
+                setNotice(title ? `${title}: ${body.split("\n")[0]}` : body),
+            } as never,
+          );
+        }
       } catch (e) {
         setNotice(`channels failed: ${(e as Error).message}`);
       } finally {
@@ -655,16 +742,254 @@ export function App(props: AppProps): React.ReactElement {
   );
 
   /**
-   * Pick one of the prompt files and open it in `$EDITOR`.
+   * The Memory row, as the embeddings flow (`memoryFlow.ts`).
    *
-   * A missing file is offered too, and creating it by opening it is the
-   * correct behaviour: a persona with no USER.md is a persona that has never
-   * been told who it works for, and the way to fix that is to write one.
+   * The clack wizard's walkthrough — provider, key/endpoint validation,
+   * defaults prefilled from the live config — asked on screens; the WRITE
+   * path stays `applyEmbedding` (the same `applyEmbeddingConfig` the CLI
+   * calls, plus the in-app re-embed when the space changes). No test screen:
+   * recall is judged by using the phantom. Setup is IDEMPOTENT — re-running
+   * the flow and keeping every answer writes nothing.
    */
-  const editIdentity = useCallback(
+  const changeMemory = useCallback(
     async (target: PersonaSnapshot) => {
       setPrompting(true);
       try {
+        const { configureMemory, embeddingUpdateEquals } = await import(
+          "./memoryFlow.ts"
+        );
+        const { geminiEmbed } = await import("../lib/geminiEmbed.ts");
+        const { openaiCompatibleEmbed } = await import(
+          "../lib/openaiCompatibleEmbed.ts"
+        );
+        const { config } = await loadConfigForPersona(target.name);
+        const chosen = await configureMemory(
+          target.name,
+          { choose: askChoice, value: askValue },
+          {
+            existing: config.embeddings,
+            validateGemini: (key) =>
+              geminiEmbed(key, "phantombot key validation test", {
+                model: "gemini-embedding-001",
+                dims: 1536,
+              }),
+            validateOpenAI: (settings) =>
+              openaiCompatibleEmbed(
+                "phantombot embedding validation test",
+                settings,
+              ),
+          },
+        );
+        if (!chosen) return setNotice("memory unchanged");
+        if ("rejected" in chosen)
+          return setNotice(`memory unchanged — rejected: ${chosen.rejected}`);
+        if (embeddingUpdateEquals(config.embeddings, chosen.update))
+          return setNotice("memory unchanged — already set");
+
+        const change = {
+          next: chosen.update,
+          indexedChunks: target.memory.indexedTotal,
+        };
+        await askConfirm({
+          title: `Change ${target.name}'s embeddings to ${chosen.summary}?`,
+          consequence: describeEmbeddingChange(config, change),
+          run: async () => {
+            const space =
+              target.memory.embedding?.fingerprint ?? "new space";
+            setReembed({
+              space,
+              state: {
+                done: 0,
+                total: target.memory.indexedTotal ?? 0,
+                path: "",
+                startedAt: Date.now(),
+                errors: 0,
+              },
+            });
+            const r = await applyEmbedding({
+              config,
+              persona: target.name,
+              change,
+              onProgress: (progress) =>
+                setReembed((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        state: {
+                          ...prev.state,
+                          done: progress.done,
+                          total: progress.total,
+                          path: progress.path,
+                        },
+                      }
+                    : prev,
+                ),
+            });
+            setReembed(undefined);
+            setNotice(
+              r.ok
+                ? r.reembedded
+                  ? "embeddings changed and the index is back in sync"
+                  : "embedding settings saved; no re-embed was needed"
+                : `failed: ${r.error}`,
+            );
+            await refresh();
+          },
+        });
+      } catch (e) {
+        setNotice(`memory failed: ${(e as Error).message}`);
+      } finally {
+        setPrompting(false);
+        await refresh();
+      }
+    },
+    [refresh, askChoice, askValue, askConfirmValue],
+  );
+
+  /**
+   * The Voice row, as a flow — the `phantombot voice` clack walkthrough
+   * (provider picker, key keep/replace, voice selection) asked on screens.
+   * The WRITE path stays `applyVoice` (`applyVoiceConfig`). No preview:
+   * the phantom's first spoken turn is the audition. Setup is idempotent —
+   * esc or keeping the offered defaults leaves the config untouched.
+   */
+  const changeVoice = useCallback(
+    async (target: PersonaSnapshot) => {
+      setPrompting(true);
+      try {
+        const { configureVoice } = await import("./voiceFlow.ts");
+        const {
+          ENV_KEY_FOR_PROVIDER,
+          validateElevenLabsKey,
+          validateOpenAIKey,
+        } = await import("../lib/voice.ts");
+        const { maybePromptRestart } = await import("../cli/harness.ts");
+        const { defaultServiceControl } = await import("../lib/platform.ts");
+        const { config } = await loadConfigForPersona(target.name);
+
+        const provider = await askChoice({
+          title: `Voice for ${target.name}`,
+          description: "how this phantom speaks and hears voice notes",
+          options: [
+            {
+              value: "elevenlabs",
+              label: "ElevenLabs",
+              hint:
+                config.voice.provider === "elevenlabs"
+                  ? "current · premium · paid (API key required)"
+                  : "premium · paid (API key required)",
+            },
+            {
+              value: "openai",
+              label: "OpenAI",
+              hint:
+                config.voice.provider === "openai"
+                  ? "current · 6 built-in voices · paid (API key required)"
+                  : "6 built-in voices · paid (API key required)",
+            },
+            {
+              value: "azure_edge",
+              label: "Azure Edge TTS",
+              hint:
+                config.voice.provider === "azure_edge"
+                  ? "current · free · no key · speaks only"
+                  : "free · no key · speaks only",
+            },
+            {
+              value: "none",
+              label: "None — disable TTS/STT",
+              hint:
+                config.voice.provider === "none"
+                  ? "current · text only"
+                  : "text only",
+            },
+          ],
+          initial: config.voice.provider,
+        });
+        // esc on the picker is "did nothing".
+        if (!provider) return setNotice("voice unchanged");
+
+        const chosen = await configureVoice(
+          target.name,
+          provider as "openai" | "elevenlabs" | "azure_edge" | "none",
+          { choose: askChoice, value: askValue, confirm: askConfirmValue },
+          {
+            existing: config.voice,
+            hasKey: (p) => {
+              const envVar = ENV_KEY_FOR_PROVIDER[p as "openai" | "elevenlabs"];
+              return Boolean(envVar && process.env[envVar]);
+            },
+            validateKey: (p, key) =>
+              p === "openai"
+                ? validateOpenAIKey(key)
+                : validateElevenLabsKey(key),
+          },
+        );
+        if (!chosen) return setNotice("voice unchanged");
+        if ("rejected" in chosen)
+          return setNotice(`voice unchanged — key rejected: ${chosen.rejected}`);
+
+        // The restart offer below belongs to a SAVE, not to a visit — a
+        // cancelled confirm must not fire it.
+        let saved = false;
+        await askConfirm({
+          title: `Set ${target.name}'s voice to ${chosen.summary}?`,
+          consequence: describeVoiceChange(chosen.voice),
+          run: async () => {
+            const r = await applyVoice({
+              config,
+              persona: target.name,
+              voice: chosen.voice,
+              apiKey: chosen.apiKey,
+            });
+            saved = r.ok;
+            setNotice(
+              r.ok ? `voice saved: ${chosen.summary}` : `failed: ${r.error}`,
+            );
+            await refresh();
+          },
+        });
+
+        // Same post-apply hook the CLI runs: the voice block is read on the
+        // next service spawn, so offer the restart when something was saved.
+        if (saved)
+          await maybePromptRestart(
+          defaultServiceControl(),
+          async (message) =>
+            await askConfirmValue({
+              title: message,
+              consequence: {
+                summary: "",
+                detail: "",
+                longRunning: false,
+                restarts: true,
+              },
+            }),
+          {
+            note: (body: string, title?: string) =>
+              setNotice(title ? `${title}: ${body.split("\n")[0]}` : body),
+          } as never,
+        );
+      } catch (e) {
+        setNotice(`voice failed: ${(e as Error).message}`);
+      } finally {
+        setPrompting(false);
+        await refresh();
+      }
+    },
+    [refresh, askChoice, askValue, askConfirmValue],
+  );
+
+  /**
+   * Pick one of the prompt files and edit it in the app's own editor.
+   *
+   * A missing file is offered too, and creating it by opening it is the
+   * correct behaviour: a persona with no IDENTITY.md is a persona that has
+   * never been told who it is, and the way to fix that is to write one.
+   */
+  const editIdentity = useCallback(
+    (target: PersonaSnapshot) => {
+      void (async () => {
         const choice = await askChoice({
           title: `Which file for ${target.name}?`,
           options: target.identity.files.map((f) => ({
@@ -674,21 +999,11 @@ export function App(props: AppProps): React.ReactElement {
           })),
         });
         if (!choice) return;
-        const r = await withPromptTerminal(() => openInEditor(choice));
-        const file = choice.split("/").pop();
-        setNotice(
-          !r.ok
-            ? `editor failed: ${r.error}`
-            : r.changed
-              ? `${file} saved — restart to load it`
-              : `${file} unchanged`,
-        );
-      } finally {
-        setPrompting(false);
-        await refresh();
-      }
+        setEditorPath(choice);
+        go("editor");
+      })();
     },
-    [refresh, askChoice],
+    [askChoice, go],
   );
 
   const body = (() => {
@@ -721,6 +1036,30 @@ export function App(props: AppProps): React.ReactElement {
             } catch (e) {
               setNotice(`could not create ${answers.name}: ${(e as Error).message}`);
             }
+          }}
+        />
+      );
+    }
+
+    if (screen === "editor" && editorPath !== null) {
+      const editing = host.personas.find((p) => editorPath.includes(p.name));
+      return (
+        <FileEditorScreen
+          path={editorPath}
+          personaName={editing?.name ?? ""}
+          onBack={(r: FileEditorResult) => {
+            const file = editorPath.split("/").pop();
+            setNotice(
+              r.error
+                ? `save failed: ${r.error}`
+                : r.saved
+                  ? `${file} saved — restart to load it`
+                  : r.changed
+                    ? `${file} discarded`
+                    : `${file} unchanged`,
+            );
+            setEditorPath(null);
+            back();
           }}
         />
       );
@@ -782,6 +1121,16 @@ export function App(props: AppProps): React.ReactElement {
             go("persona");
           }}
           onNew={() => go("wizard")}
+          onLogs={() => go("logs")}
+          onDoctor={(name) => {
+            setPersonaName(name);
+            // A stale report from a previous run must not flash as THIS
+            // persona's — clear, then gather.
+            setDoctorReport(undefined);
+            setDoctorStatus(undefined);
+            go("doctor");
+            void runTheDoctor(name);
+          }}
           onBack={back}
         />
       );
@@ -799,8 +1148,8 @@ export function App(props: AppProps): React.ReactElement {
       return (
         <PersonaDetailScreen
           persona={persona}
+          status={detailStatus}
           onBack={back}
-          onLogs={() => go("logs")}
           onEditIdentity={() => void editIdentity(persona)}
           onChangeBrain={() => void changeBrain(persona)}
           onChangeChannels={() => void changeChannels(persona)}
@@ -819,6 +1168,30 @@ export function App(props: AppProps): React.ReactElement {
                 setNotice(
                   r.ok
                     ? `autostart: ${r.list.join(", ") || "none"}`
+                    : `failed: ${r.error}`,
+                );
+                await refresh();
+              },
+            });
+          }}
+          releaseChannel={host.updateChannel}
+          canSetDefault={host.personas.length > 1}
+          canSetRelease={!process.env.PHANTOMBOT_PERSONA?.trim()}
+          onToggleRelease={() => {
+            const next =
+              host.updateChannel === "preview" ? "stable" : "preview";
+            void askConfirm({
+              title: `Follow the ${next} release channel?`,
+              consequence: describeUpdateChannelChange(next),
+              run: async () => {
+                const { config } = await loadConfigForPersona(persona.name);
+                const r = await applyUpdateChannel({
+                  config,
+                  channel: next,
+                });
+                setNotice(
+                  r.ok
+                    ? `release channel: ${host.updateChannel} → ${next}`
                     : `failed: ${r.error}`,
                 );
                 await refresh();
@@ -861,12 +1234,10 @@ export function App(props: AppProps): React.ReactElement {
             });
           }}
           onOpen={(target) => {
-            if (target === "doctor") {
-              go("doctor");
-              void runTheDoctor();
-            } else {
-              go(target);
-            }
+            // Memory and Voice are FLOWS now, not screens — the same clack
+            // walkthroughs the Brain and Channels rows run.
+            if (target === "memory") void changeMemory(persona);
+            else void changeVoice(persona);
           }}
         />
       );
@@ -932,164 +1303,9 @@ export function App(props: AppProps): React.ReactElement {
       );
     }
 
-    if (screen === "memory") {
-      return (
-        <MemoryScreen
-          persona={persona}
-          onSearch={search}
-          onChangeEmbedding={async () => {
-            // Demonstrates the whole rule: the change states its consequence,
-            // then PERFORMS it. There is no "now go and run" anywhere here.
-            const { config } = await loadConfigForPersona(persona.name);
-            const next: EmbeddingConfigUpdate = {
-              provider: "openai-compatible",
-              openaiCompatible: {
-                // Default to OpenAI proper. The base URL is an ADVANCED field
-                // (blank unless the user fills it) — today's CLI pre-fills a
-                // local llama-server, which assumes an endpoint most users do
-                // not run.
-                baseUrl: "https://api.openai.com/v1",
-                model: "text-embedding-3-small",
-                dims: 1536,
-              },
-            };
-            const consequence = describeEmbeddingChange(config, {
-              next,
-              indexedChunks: persona.memory.indexedTotal,
-            });
-            void askConfirm({
-              title: "Change the embedding provider?",
-              consequence,
-              run: async () => {
-                const space = persona.memory.embedding?.fingerprint ?? "new space";
-                setReembed({
-                  space,
-                  state: {
-                    done: 0,
-                    total: persona.memory.indexedTotal ?? 0,
-                    path: "",
-                    startedAt: Date.now(),
-                    errors: 0,
-                  },
-                });
-                const r = await applyEmbedding({
-                  config,
-                  persona: persona.name,
-                  change: { next, indexedChunks: persona.memory.indexedTotal },
-                  onProgress: (progress) =>
-                    setReembed((prev) =>
-                      prev
-                        ? {
-                            ...prev,
-                            state: {
-                              ...prev.state,
-                              done: progress.done,
-                              total: progress.total,
-                              path: progress.path,
-                            },
-                          }
-                        : prev,
-                    ),
-                });
-                setReembed(undefined);
-                setNotice(
-                  r.ok
-                    ? r.reembedded
-                      ? "embeddings changed and the index is back in sync"
-                      : "embedding settings saved; no re-embed was needed"
-                    : `failed: ${r.error}`,
-                );
-                await refresh();
-              },
-            });
-          }}
-          onReindex={() => setNotice("reindex queued")}
-          onBack={back}
-        />
-      );
-    }
-
-    if (screen === "voice") {
-      return (
-        <VoiceScreen
-          personaName={persona.name}
-          provider={voiceProvider}
-          onChangeProvider={setVoiceProvider}
-          onPreview={() =>
-            setNotice(
-              voiceProvider === "none"
-                ? "nothing to play — pick a provider first"
-                : `previewing ${voiceProvider}`,
-            )
-          }
-          onSave={() => {
-            void (async () => {
-              setPrompting(true);
-              try {
-                // Saving a provider ALONE used to write `[voice] provider =
-                // "openai"` with no key and no voice: a phantom that reads as
-                // configured and is mute on its first turn. The rest of the
-                // questions `phantombot voice` asks are asked here first.
-                const { configureVoice } = await import("./voiceFlow.ts");
-                const { ENV_KEY_FOR_PROVIDER, validateElevenLabsKey, validateOpenAIKey } =
-                  await import("../lib/voice.ts");
-                const { config } = await loadConfigForPersona(persona.name);
-                const chosen = await configureVoice(
-                  persona.name,
-                  voiceProvider,
-                  { choose: askChoice, value: askValue, confirm: askConfirmValue },
-                  {
-                    existing: config.voice,
-                    hasKey: (provider) => {
-                      const envVar =
-                        ENV_KEY_FOR_PROVIDER[
-                          provider as "openai" | "elevenlabs"
-                        ];
-                      return Boolean(envVar && process.env[envVar]);
-                    },
-                    validateKey: (provider, key) =>
-                      provider === "openai"
-                        ? validateOpenAIKey(key)
-                        : validateElevenLabsKey(key),
-                  },
-                );
-                if (!chosen) return setNotice("voice unchanged");
-                if ("rejected" in chosen)
-                  return setNotice(`voice unchanged — key rejected: ${chosen.rejected}`);
-
-                await askConfirm({
-                  title: `Set ${persona.name}'s voice to ${chosen.summary}?`,
-                  consequence: describeVoiceChange(chosen.voice),
-                  run: async () => {
-                    const r = await applyVoice({
-                      config,
-                      persona: persona.name,
-                      voice: chosen.voice,
-                      apiKey: chosen.apiKey,
-                    });
-                    setNotice(
-                      r.ok
-                        ? `voice saved: ${chosen.summary}`
-                        : `failed: ${r.error}`,
-                    );
-                    await refresh();
-                    back();
-                  },
-                });
-              } finally {
-                setPrompting(false);
-              }
-            })();
-          }}
-          onBack={back}
-        />
-      );
-    }
-
     if (screen === "logs") {
       return (
         <LogsScreen
-          personaName={personaName}
           onBack={back}
         />
       );
@@ -1147,6 +1363,19 @@ export function App(props: AppProps): React.ReactElement {
       <TerminalSizeContext.Provider value={size}>
         <Box flexDirection="column" height={renderRows(size)}>
           <ChooseScreen request={choose} onAnswer={(v) => choose.resolve(v)} />
+        </Box>
+      </TerminalSizeContext.Provider>
+    );
+  }
+
+  if (searchAsk) {
+    return (
+      <TerminalSizeContext.Provider value={size}>
+        <Box flexDirection="column" height={renderRows(size)}>
+          <SearchListScreen
+            request={searchAsk}
+            onAnswer={(v) => searchAsk.resolve(v)}
+          />
         </Box>
       </TerminalSizeContext.Provider>
     );

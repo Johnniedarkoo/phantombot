@@ -36,6 +36,10 @@ import type { EmbeddingConfigUpdate } from "../cli/embedding.ts";
 import { applyVoiceConfig } from "../cli/voice.ts";
 import { runMemoryIndex } from "../cli/memory.ts";
 import type { EmbedProgress } from "../lib/embedJob.ts";
+import {
+  updateConfigToml,
+  type TomlObject,
+} from "../lib/configWriter.ts";
 import { writeAutostartPersonas } from "../lib/personaDefault.ts";
 import { setPersonaSecret } from "../lib/vaultSecrets.ts";
 import { openPersonaVault } from "../lib/vault.ts";
@@ -292,6 +296,57 @@ export async function applyAutostart(input: {
     : { ok: false, list, error: r.stderr ?? "restart failed" };
 }
 
+export function describeUpdateChannelChange(to: string): Consequence {
+  return {
+    summary: `this host follows the ${to} release ring`,
+    detail:
+      "update_channel is a HOST setting in the global config.toml. " +
+      (to === "preview"
+        ? "'preview' installs every merge to main, within an hour of it landing."
+        : "'stable' only moves when a preview build is promoted, so it lags main by days."),
+    longRunning: false,
+    restarts: false,
+  };
+}
+
+/**
+ * Point the host's release ring at "stable" or "preview".
+ *
+ * WRITES the global config.toml (`update_channel`), not a persona file — the
+ * ring is per-host (#432). "stable" is the resolved default, so choosing it
+ * DELETES the key rather than writing it: an explicit value that equals the
+ * default is just noise for every later reader.
+ *
+ * Mirrors `applyDefaultPersona`'s refusal under `PHANTOMBOT_PERSONA`: a
+ * persona agent must not be able to change the release ring the whole box
+ * follows (personaConfig.ts doctrine: a persona cannot "change the release
+ * ring the box follows"), and the TUI is reachable from one.
+ */
+export async function applyUpdateChannel(input: {
+  config: Config;
+  channel: "stable" | "preview";
+}): Promise<{ ok: boolean; error?: string }> {
+  const agentPersona = process.env.PHANTOMBOT_PERSONA?.trim();
+  if (agentPersona) {
+    return {
+      ok: false,
+      error:
+        `refusing to set update_channel to '${input.channel}': running as ` +
+        `persona '${agentPersona}' (PHANTOMBOT_PERSONA).`,
+    };
+  }
+  try {
+    await updateConfigToml(input.config.configPath, (toml: TomlObject) => {
+      if (input.channel === "stable") delete toml.update_channel;
+      else toml.update_channel = input.channel;
+    });
+    input.config.updateChannel = input.channel;
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
 export function describeDefaultPersonaChange(
   from: string,
   to: string,
@@ -392,94 +447,3 @@ export async function unsetSecret(input: {
   }
 }
 
-export const FRIENDLY_EDITORS = ["nano", "micro", "pico", "vi"] as const;
-
-/**
- * First entry of {@link FRIENDLY_EDITORS} present on PATH, or `vi`.
- *
- * `onPath` is injectable so tests do not depend on what this machine happens
- * to have installed.
- */
-export function resolveFallbackEditor(
-  onPath: (cmd: string) => boolean = (cmd) => Bun.which(cmd) !== null,
-): string {
-  for (const candidate of FRIENDLY_EDITORS) {
-    if (onPath(candidate)) return candidate;
-  }
-  return "vi";
-}
-
-/**
- * A cheap identity for a file: size and mtime, or `null` when it is absent.
- *
- * Used to tell "saved" from "looked at and quit". Claiming a file was saved —
- * and telling the user to restart for it — when they changed nothing is worse
- * than saying nothing: it invites a pointless restart and teaches them the
- * message means nothing. Absent counts as a stamp of its own, so creating a
- * file by opening it reads as a change.
- */
-async function fileStamp(path: string): Promise<string | null> {
-  try {
-    const f = Bun.file(path);
-    if (!(await f.exists())) return null;
-    return `${f.size}:${f.lastModified}`;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Open a persona's prompt file in the user's editor.
- *
- * SOUL.md, IDENTITY.md and USER.md are the only settings whose value is prose,
- * and prose is not something to edit inside a list row: it is multi-kilobyte
- * markdown the user already has an editor for. So the TUI's job is to hand the
- * terminal over cleanly and take it back — the caller runs this inside the
- * prompt bracket (`withPromptTerminal`), which leaves the alternate screen and
- * stops forwarding keystrokes to Ink first.
- *
- * `$VISUAL` wins over `$EDITOR` because that is what the variables mean: VISUAL
- * is the full-screen editor, EDITOR the line editor of last resort. When
- * NEITHER is set we do NOT go straight to `vi`: an unset $EDITOR means the user
- * never chose one, and dropping a first-time user into modal vi to edit prose
- * is a trap they cannot even quit. So we probe for a friendly modeless editor
- * first (nano, micro, pico) and keep `vi` as the last resort, since POSIX
- * requires it to exist. An explicitly configured $VISUAL/$EDITOR always wins —
- * this only decides what to do in the absence of a choice.
- */
-export async function openInEditor(
-  path: string,
-  spawn?: (
-    command: string,
-    args: string[],
-  ) => Promise<{ exitCode: number }>,
-): Promise<{ ok: boolean; error?: string; changed?: boolean }> {
-  const editor =
-    process.env.VISUAL || process.env.EDITOR || resolveFallbackEditor();
-  // Editors are habitually configured with flags ("code --wait", "emacs -nw"),
-  // so the variable is a COMMAND LINE, not a program name.
-  const parts = editor.split(/\s+/).filter(Boolean);
-  const command = parts[0]!;
-  const args = [...parts.slice(1), path];
-  try {
-    const run =
-      spawn ??
-      (async (cmd: string, argv: string[]) => {
-        const proc = Bun.spawn([cmd, ...argv], {
-          stdin: "inherit",
-          stdout: "inherit",
-          stderr: "inherit",
-        });
-        return { exitCode: await proc.exited };
-      });
-    const before = await fileStamp(path);
-    const { exitCode } = await run(command, args);
-    if (exitCode !== 0) {
-      return { ok: false, error: `${command} exited ${exitCode}` };
-    }
-    const after = await fileStamp(path);
-    return { ok: true, changed: after !== before };
-  } catch (e) {
-    return { ok: false, error: (e as Error).message };
-  }
-}

@@ -2,11 +2,16 @@
  * A screen taller than the window must SHOW FEWER ROWS, not squeezed ones.
  *
  * Reported as "it deforms": on a 20-row terminal the settings screen drew all
- * ten of its sections regardless, and Yoga made them fit by compressing —
- * two readings printed on the same line (`indexedngs  12,904 … in sync001 ·
+ * of its sections regardless, and Yoga made them fit by compressing — two
+ * readings printed on the same line (`indexedngs  12,904 … in sync001 ·
  * 1536`) and the bottom border came out as `╰─ ─ ─✚─Doctor────────run the
  * checks───────╯`. Clipping the frame body stops the border tearing; only
  * windowing the content stops the rows colliding, so this test asserts BOTH.
+ *
+ * Since the Dashboard re-skin the table also gained a framed header (rule,
+ * dim `setting · configured · state` row, rule), a rule under the rows, and
+ * the DOCTOR telemetry block where the Doctor menu row used to be — so the
+ * screen is taller and windowing returns in short windows.
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
@@ -19,6 +24,7 @@ import { render } from "ink";
 
 import { App } from "../src/tui/App.tsx";
 import type { HostSnapshot, PersonaSnapshot } from "../src/tui/snapshot.ts";
+import type { DoctorReport } from "../src/cli/doctor.ts";
 import { stripAnsi } from "./helpers/ansi.ts";
 
 function fakeStdin() {
@@ -35,7 +41,7 @@ function fakeStdin() {
   return s;
 }
 
-function fakeStdout(rows: number) {
+function fakeStdout(rows: number, columns = 100) {
   const frames: string[] = [];
   const s = new EventEmitter() as EventEmitter & {
     columns: number;
@@ -43,10 +49,10 @@ function fakeStdout(rows: number) {
     write: (c: string) => void;
     frames: string[];
   };
-  s.columns = 100;
+  s.columns = columns;
   s.rows = rows;
-  s.frames = frames;
   s.write = (c: string) => void frames.push(c);
+  s.frames = frames;
   return s;
 }
 
@@ -65,7 +71,7 @@ const ALICE: PersonaSnapshot = {
     files: [
       { name: "SOUL.md", path: "/x/SOUL.md", present: true },
       { name: "IDENTITY.md", path: "/x/IDENTITY.md", present: true },
-      { name: "USER.md", path: "/x/USER.md", present: false },
+      { name: "AGENTS.md", path: "/x/AGENTS.md", present: false },
     ],
     description: "a test phantom",
   },
@@ -110,6 +116,45 @@ const HOST: HostSnapshot = {
   personas: [ALICE],
 };
 
+// The settings screen runs the doctor when it opens (the DOCTOR telemetry
+// block under the table). The fixture persona has no directory, so the real
+// checks would fail — inject a well-formed report instead, via App's
+// `runDoctorImpl` seam (a module-level mock would leak into every other
+// test file in the suite's process).
+const FAKE_REPORT: DoctorReport = {
+  persona: "alice",
+  telegram: { healthy: true, listeners: 2, personas: [] },
+  memory_db: {
+    path: "/x/db",
+    healthy: true,
+    detail: "integrity ok",
+    bytes: 44040192,
+    restore_points: [],
+    unretired_drawers: [],
+  },
+  nightly: {
+    age_hours: 2,
+    health: "ok",
+    detail: "no backlog",
+    backlog: 0,
+  },
+  capture: { window_hours: 24, user_turns: 10, captures: 9, dry_day: false },
+  embeddings: { provider: "gemini", semantic_search: true },
+  update: { channel: "stable", version: "0.0.0-test" },
+  default_persona: {
+    resolved: "alice",
+    provenance: "config" as const,
+    exists: true,
+    served: true,
+    defect: null,
+    mcp_servers: 0,
+    mcp_elsewhere: [],
+    healthy: true,
+    detail: "resolved from config.toml",
+  },
+
+};
+
 const saved: Record<string, string | undefined> = {};
 const ENV = [
   "PHANTOMBOT_CONFIG",
@@ -142,13 +187,17 @@ afterEach(() => {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function openSettings(rows: number) {
+async function openSettings(rows: number, columns = 100) {
   const stdin = fakeStdin();
-  const stdout = fakeStdout(rows);
+  const stdout = fakeStdout(rows, columns);
   const instance = render(
     <App
       host={HOST}
       startPersona="alice"
+      runDoctorImpl={async (opts) => {
+        opts?.out?.write(JSON.stringify(FAKE_REPORT));
+        return 0;
+      }}
       onCreatePersona={async () => {}}
       openSession={async ({ persona }) => ({
         persona,
@@ -174,33 +223,45 @@ async function openSettings(rows: number) {
   stdin.write("\x13"); // ^s — the phantom table
   await sleep(80);
   stdin.write("c"); // Configure the selected phantom
-  await sleep(80);
+  // The configure screen opens async, and its /status probes gather off-render.
+  // Poll for the settled frame instead of sleeping a fixed interval — a loaded
+  // runner can easily miss a fixed sleep and the STATUS block would still read
+  // `gathering…` (or the screen not have opened at all).
+  for (let i = 0; i < 120; i++) {
+    const frame = stripAnsi(stdout.frames.at(-1) ?? "");
+    if (frame.includes("description") && !frame.includes("gathering…")) break;
+    await sleep(50);
+  }
   // Colour codes out: chalk is on in CI (and a sibling suite forces it on
   // the shared singleton), so assert on the text a user reads.
   return stripAnsi(stdout.frames.at(-1) ?? "").split("\n");
 }
 
 describe("settings screen in a short window", () => {
-  test("the boxed frame survives and the hidden rows are announced", async () => {
-    // The border only exists in `boxed`, so this — the original shearing
-    // regression — has to be asserted in that variant explicitly. The default
-    // `bare` frame is covered by the next test: it has no border to shear,
-    // but it can still push its own footer off the window.
+  // The framed header + DOCTOR block make the screen taller than it was, so
+  // a 20-row boxed window windows the rows. The frame must survive that.
+  test("the boxed frame survives, windowing announced", async () => {
     process.env.PHANTOMBOT_TUI_FRAME = "boxed";
     const lines = await openSettings(20);
     delete process.env.PHANTOMBOT_TUI_FRAME;
+
+    const text = lines.join("\n");
 
     // The bottom border is a border: nothing from a row may be drawn INTO it.
     const bottom = lines.find((l) => l.trimStart().startsWith("╰"))!;
     expect(bottom).toBeDefined();
     expect(/^╰─+╯$/.test(bottom.trim())).toBe(true);
 
-    // Content was dropped rather than compressed, and the screen says so.
-    expect(lines.join("\n")).toContain("more below");
-    expect(lines.join("\n")).not.toContain("indexedngs");
+    // Rows are dropped, not squeezed — and the screen says so.
+    expect(text).toContain("more below");
+    // No collision signature: a row's label must never share a line with
+    // another row's (the Brainity / chainel shear the budget math once
+    // under-counted the bottom block).
+    expect(text).not.toContain("Brainity");
+    expect(text).not.toContain("chainel");
   });
 
-  test("the bare frame keeps its footer and drops rows instead", async () => {
+  test("the bare frame keeps its footer below the table", async () => {
     const lines = await openSettings(20);
 
     // The footer is the last thing on screen — if the body overflowed it
@@ -209,15 +270,68 @@ describe("settings screen in a short window", () => {
     const last = lines.filter((l) => l.trim().length > 0).at(-1) ?? "";
     expect(last).toContain("Back");
 
-    // Content was dropped rather than compressed, and the screen says so.
-    expect(lines.join("\n")).toContain("more below");
-    // The collision signature: two readings sharing one line.
+    // The collision signature of the original bug: two readings sharing a
+    // line. Still asserted even though the layout that caused it is gone.
     expect(lines.join("\n")).not.toContain("indexedngs");
   });
 
-  test("a tall window needs no marker", async () => {
+  test("a narrow window wraps descriptions and keeps the frame intact", async () => {
+    // At 60 columns the identity marks and probe lines no longer fit on one
+    // line — descriptions wrap, rows grow, and the screen is taller again.
+    process.env.PHANTOMBOT_TUI_FRAME = "boxed";
+    const lines = await openSettings(30, 60);
+    delete process.env.PHANTOMBOT_TUI_FRAME;
+
+    const bottom = lines.find((l) => l.trimStart().startsWith("╰"))!;
+    expect(bottom).toBeDefined();
+    expect(/^╰─+╯$/.test(bottom.trim())).toBe(true);
+  });
+
+  test("a tall window shows the whole screen, status included", async () => {
     const lines = await openSettings(44);
-    expect(lines.join("\n")).toContain("Doctor");
-    expect(lines.join("\n")).not.toContain("more below");
+    const text = lines.join("\n");
+
+    expect(text).not.toContain("more below");
+
+    // The Dashboard skeleton: dim header row between two rules, a rule under
+    // the rows, and the STATUS telemetry block below that. The doctor is NOT
+    // on this screen — its full report is a `d` away on the phantoms list.
+    expect(text).toContain("setting");
+    expect(text).toContain("description");
+    expect(text).toContain("state");
+    expect(text).toContain("STATUS");
+    expect(text).toContain("phantom");
+    expect(text).toContain("chain");
+    expect(text).toContain("memory");
+    expect(text).not.toContain("DOCTOR");
+
+    // The Doctor menu row is gone — no old description, no leading ✚.
+    expect(text).not.toContain("run the checks");
+  });
+
+  test("the table reads as name · description · state", async () => {
+    const lines = await openSettings(44);
+    const text = lines.join("\n");
+
+    // The channels row is "Chat Channels" now, and the description column is
+    // a STATIC one-liner on what the setting is for — the live /status output
+    // lives in the STATUS block below, not in the table.
+    expect(text).toContain("Chat Channels");
+    expect(text).toContain("the chat surfaces this phantom answers on");
+    expect(text).not.toContain("harness_bins");
+    expect(text).not.toContain("env > config.toml");
+    expect(text).not.toContain("persona override");
+
+    // The fixture's identity is missing only AGENTS.md, which is an optional
+    // tools-hints file (loader.ts) — so the badge must NOT say required.
+    expect(text).toContain("configured");
+    expect(text).not.toContain("required");
+
+    // The informational group shows VALUES where badges sit: on|off, yes|no,
+    // stable|preview — dim, no glyph, no red/green.
+    const autostart = lines.find((l) => l.includes("Autostart"))!;
+    expect(autostart.trimEnd().endsWith("on")).toBe(true);
+    const release = lines.find((l) => l.includes("Release Channel"))!;
+    expect(release).toContain("stable");
   });
 });

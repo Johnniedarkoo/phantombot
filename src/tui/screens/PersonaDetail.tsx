@@ -1,56 +1,95 @@
 /**
  * Screen 3 — the SETTINGS screen for one phantom, reached with `^s` from chat.
  *
- * This is the screen that does not exist today in any form. Every line is a
- * current reading, and `↵` on a row opens the thing that changes it. Settings
- * as VALUES, not questions.
+ * One invisible, squared table — three aligned columns on every row:
+ *
+ *   name        one-liner on what the setting is for            state badge
+ *
+ * The first cut hung detail lines under each row and showed WHERE every value
+ * came from (`env > config.toml > state.json`); that read like diagnostics,
+ * not settings, and it made the screen a wall of dim text. Now the middle
+ * column is literally what `/status` prints — the SAME probe results the
+ * slash command produces, gathered through `gatherStatus`, so the TUI and
+ * /status can never disagree — and where a value came from is Doctor's job,
+ * not the settings list's.
+ *
+ * The badge column speaks three states: red `required` (missing but
+ * mandatory), yellow `optional` (not configured but nothing is wrong), green
+ * `✓ …` (configured and healthy).
+ *
+ * The table is framed in the Dashboard's exact design language — a `Rule`
+ * above and below a dim header row (`setting · configured · state`) and a
+ * third rule under the rows — and the Doctor menu row is gone: the bottom
+ * telemetry block carries the persona's full /status reading, the way the
+ * Dashboard renders HOST.
  *
  * Scoped to ONE persona on purpose. `^s` from a conversation means "the
  * settings of the phantom I am talking to" — it does not mean a host-wide list,
- * which is what `^p` is for. The first cut wired both keys to the dashboard, so
- * a user pressing the settings key for a specific phantom got a table of every
- * phantom on the box and had to find their way back down to the one they were
- * already in.
- *
- * Each row carries its own detail lines underneath, so the screen answers
- * "what is this set to?" without a single keypress. The brain block
- * deliberately shows the THREE-LAYER resolution (`state.json harness_bins` >
- * `config.toml [harnesses.<h>] bin` > code default): a stale absolute path
- * cached in state.json survives deleting config.toml and looks exactly like a
- * bad default, so showing where the value came from makes that diagnosable on
- * screen instead of by experiment.
+ * which is what `^p` is for.
  */
 
 import React, { useState } from "react";
 import { Box, Text, useInput } from "ink";
 
-import { Frame } from "../components/Frame.tsx";
+import { Frame, Rule } from "../components/Frame.tsx";
 import { MenuItem } from "../components/Menu.tsx";
-import {
-  badge,
-  glyph,
-  humanBytes,
-  humanCount,
-  humanWhen,
-  theme,
-} from "../theme.ts";
+import { badge, glyph, theme } from "../theme.ts";
 import { scrollWindow } from "../scroll.ts";
 import { useTerminalSize, viewportRows } from "../terminal.ts";
-import { frameChromeRows } from "../chrome.ts";
-import { providerHearsVoice } from "../../lib/voice.ts";
-import type { ChannelDetail, PersonaSnapshot } from "../snapshot.ts";
-import type { VoiceProvider } from "../../lib/voice.ts";
+import { frameChromeColumns, frameChromeRows } from "../chrome.ts";
+import type { PersonaSnapshot } from "../snapshot.ts";
+import type { StatusRows } from "../status.ts";
 
-function sourceLabel(
-  source: "persona" | "global" | "default" | undefined,
-): string {
-  if (source === "persona") return "persona override";
-  if (source === "global") return "inherited from global config";
-  return "built-in default (no key set)";
+/** Fixed geometry of a settings row, in terminal columns. */
+const BAR_COLS = 4; // TWO selection bars: Selectable's outer glyph cell and
+// MenuItem's inner bar cell, each 1 char + 1 margin. The second one is easy
+// to miss and exactly the two columns by which every wrap estimate drifted.
+const ICON_COLS = 2; // icon + its margin
+const LABEL_COLS = 16; // the name column, as in MenuItem
+const BADGE_COLS = 14; // marginLeft + the fixed badge column
+
+/** Terminal columns left for the description cell on one line. */
+function descriptionWidth(columns: number): number {
+  return Math.max(20, columns - BAR_COLS - ICON_COLS - LABEL_COLS - BADGE_COLS);
+}
+
+/**
+ * How many rows a description occupies, given the live BODY width — terminal
+ * columns minus what the frame consumes (`frameChromeColumns`), which the
+ * caller subtracts before calling. A greedy word-wrap count, not a character
+ * division: Ink wraps on WORD boundaries, so `ceil(len / width)` undershoots
+ * whenever words do not pack evenly — and an undershoot means the scroll
+ * window reserves too little and the next row paints on top of this one's
+ * tail (the original shearing bug, seen again live at 60 columns before this
+ * counter replaced the division). Long words with no break point are
+ * hard-split, same as Ink does.
+ */
+function descriptionLines(desc: string, columns: number): number {
+  const width = descriptionWidth(columns);
+  let lines = 1;
+  let col = 0;
+  for (const word of desc.split(/\s+/).filter(Boolean)) {
+    let piece = word;
+    while (piece.length > width) {
+      if (col > 0) {
+        lines += 1;
+        col = 0;
+      }
+      lines += 1;
+      piece = piece.slice(width);
+    }
+    if (col === 0) col = piece.length;
+    else if (col + 1 + piece.length <= width) col += 1 + piece.length;
+    else {
+      lines += 1;
+      col = piece.length;
+    }
+  }
+  return lines;
 }
 
 /** Screens this one leads to. */
-export type Target = "memory" | "voice" | "doctor";
+export type Target = "memory" | "voice";
 
 /**
  * Everything the cursor can land on, in screen order.
@@ -67,7 +106,7 @@ export type Row =
   | "voice"
   | "autostart"
   | "default"
-  | "doctor";
+  | "release";
 
 const ROWS: Row[] = [
   "identity",
@@ -77,61 +116,32 @@ const ROWS: Row[] = [
   "voice",
   "autostart",
   "default",
-  "doctor",
+  "release",
 ];
-
-/**
- * The dim readings belonging to the row above them, as label/value pairs.
- *
- * Pairs rather than pre-padded strings: `"binary".padEnd(13)` is column
- * arithmetic done in a component, and it slips the moment a value contains a
- * double-width glyph. The layout engine owns the alignment here too.
- */
-function Detail(props: {
-  lines: Array<[string, string] | undefined>;
-}): React.ReactElement {
-  return (
-    <Box flexDirection="column" paddingLeft={6} marginBottom={1}>
-      {props.lines
-        .filter((line): line is [string, string] => Boolean(line))
-        .map(([label, value], i) => (
-          <Box key={i}>
-            <Box width={13} flexShrink={0}>
-              <Text color={theme.dim} wrap="truncate">
-                {label}
-              </Text>
-            </Box>
-            <Box flexGrow={1}>
-              <Text color={theme.dim} wrap="truncate">
-                {value}
-              </Text>
-            </Box>
-          </Box>
-        ))}
-    </Box>
-  );
-}
-
-function channelLine(channel: ChannelDetail): [string, string] {
-  const mark =
-    channel.state === "connected"
-      ? glyph.up
-      : channel.state === "broken"
-        ? glyph.warn
-        : glyph.down;
-  return [channel.label, `${mark} ${channel.detail}`];
-}
 
 export function PersonaDetailScreen(props: {
   persona: PersonaSnapshot;
+  /**
+   * The live `/status` reading for this persona, as the Doctor screen's
+   * status block shows it. Descriptions quote it verbatim; while it is
+   * still gathering (the probes hit the network, 5s deadline) the cells
+   * read `…` and fill in when it lands.
+   */
+  status?: StatusRows;
   onOpen: (target: Target) => void;
   onEditIdentity: () => void;
   onChangeBrain: () => void;
   onChangeChannels: () => void;
   onToggleAutostart: () => void;
   onMakeDefault: () => void;
+  /** The host's current release ring — shown on the Release Channel row. */
+  releaseChannel: string;
+  onToggleRelease: () => void;
+  /** False on a single-phantom host: the default row is informational there. */
+  canSetDefault: boolean;
+  /** False when running as a persona agent: the release ring is host-only. */
+  canSetRelease: boolean;
   onBack: () => void;
-  onLogs: () => void;
 }): React.ReactElement {
   const [cursor, setCursor] = useState(0);
   const p = props.persona;
@@ -142,193 +152,208 @@ export function PersonaDetailScreen(props: {
     if (id === "brain") return props.onChangeBrain();
     if (id === "channels") return props.onChangeChannels();
     if (id === "autostart") return props.onToggleAutostart();
-    if (id === "default") return props.onMakeDefault();
+    if (id === "default") {
+      if (props.canSetDefault) return props.onMakeDefault();
+      return; // greyed out — a lone phantom IS the default, nothing to do
+    }
+    if (id === "release") {
+      if (props.canSetRelease) return props.onToggleRelease();
+      return; // greyed out — a persona agent may not move the host's ring
+    }
     return props.onOpen(id);
   };
 
-  useInput((char, key) => {
+  useInput((_char, key) => {
     if (key.escape || key.leftArrow) return props.onBack();
     if (key.upArrow) setCursor((c) => Math.max(0, c - 1));
     else if (key.downArrow) setCursor((c) => Math.min(ROWS.length - 1, c + 1));
     else if (key.return) press(row);
-    else if (char === "L") props.onLogs();
   });
 
-  const identityMarks = p.identity.files
-    .map((f) => `${f.name} ${f.present ? glyph.ok : glyph.bad}`)
-    .join("   ");
+  // The live /status reading, as a key→value lookup. `undefined` status means
+  // "still gathering" (the probes reach the network, 5s deadline) — cells read
+  // `…` until it lands. A gathered map MISSING a key means /status omitted the
+  // line, which by /status's own rule means "not configured", never "broken".
+  const status = props.status === undefined ? undefined : new Map(props.status);
+  const line = (key: string): string | undefined => status?.get(key);
 
-  const voiceProvider = (p.voiceProvider ?? "none") as VoiceProvider;
-  const hears = p.voiceHears ?? providerHearsVoice(voiceProvider);
-  const embedding = p.memory.embedding;
-  // Three states, not two. A count we could not read is NOT "out of sync":
-  // claiming a re-embed is pending because the index DB was unreadable sends
-  // the user to re-embed a corpus that may be perfectly in step.
-  const indexState =
-    p.memory.indexedInSpace === undefined || p.memory.indexedTotal === undefined
-      ? "unknown"
-      : p.memory.indexedInSpace === p.memory.indexedTotal
-        ? "in sync"
-        : "stale";
+  // Probe lines carry their own verdict words ("gemini embeddings OK",
+  // "telegram ERR (401 Unauthorized)"). The badge reads those words rather
+  // than re-probing anything — one reader, no second opinion to drift.
+  const probeBadge = (
+    value: string | undefined,
+    okLabel: string,
+  ): { badge: string; badgeColor: string } => {
+    if (status === undefined) return { badge: "…", badgeColor: theme.dim };
+    // /status prints "none" for a voice provider explicitly set to none —
+    // same "not set up" meaning as an omitted line, so same yellow badge.
+    if (value === undefined || value === "none")
+      return { badge: "optional", badgeColor: theme.warn };
+    if (value.includes("no key"))
+      return { badge: `${glyph.warn} no key`, badgeColor: theme.warn };
+    if (value.includes("ERR"))
+      return { badge: `${glyph.bad} error`, badgeColor: theme.bad };
+    if (value.includes("WARN"))
+      return { badge: `${glyph.warn} warning`, badgeColor: theme.warn };
+    return { badge: `${glyph.ok} ${okLabel}`, badgeColor: theme.ok };
+  };
+
+  // Only SOUL.md / IDENTITY.md are load-bearing (loader.ts: at least one must
+  // exist, else PersonaNotFoundError). AGENTS.md is an optional tools-hints
+  // file (first match wins vs tools.md) — its absence must not trip the badge.
+  const identityMissing = p.identity.files.some(
+    (f) => !f.present && (f.name === "SOUL.md" || f.name === "IDENTITY.md"),
+  );
+
+  // The badge reads the same /status lines the STATUS block prints — one
+  // reader, no second opinion to drift — while the DESCRIPTION column is a
+  // static one-liner on what the setting is for, not live probe output.
+  const channelParts = [line("telegram"), line("acp")].filter(
+    (s): s is string => Boolean(s),
+  );
 
   // Chrome around the scrolling region: border (2), title (1), title gap (1),
-  // the two "more" markers (2), footer (1). A constant, like the chat screen's:
-  // measuring would mean reading the layout back out of Yoga mid-render, and
-  // one row conservative costs a blank line while one row optimistic tears the
-  // frame.
+  // the two "more" markers (2), footer (1), the framed header (three rules +
+  // the header row = 4), the rule under the rows (1), and the STATUS telemetry
+  // block (margin 1 + heading 1 + one line per /status row + the blank row
+  // under it = N + 3). A constant, like the chat screen's: measuring would
+  // mean reading the layout back out of Yoga mid-render, and one row
+  // conservative costs a blank line while one row optimistic tears the frame.
+  // While /status is still gathering the block is one line ("gathering…").
+  const statusLines = props.status?.length ?? 1;
   const size = useTerminalSize();
-  const budget = viewportRows(size, 5 + frameChromeRows());
+  const budget = viewportRows(size, 12 + statusLines + frameChromeRows());
 
-  const blocks: Array<{ id: Row; height: number; node: React.ReactNode }> = [
+  // Row height follows the live window width: a wrapped description is a
+  // two-row cell, and the scroll window must reserve what the paint will
+  // actually use or rows collide (the original shearing regression).
+  const bodyColumns = size.columns - frameChromeColumns();
+  const h = (desc: string) => descriptionLines(desc, bodyColumns);
+
+  // One squared table geometry for every row: wrapping description cell,
+  // fixed right-aligned badge column, no per-row hint (the footer owns ↵ —
+  // a reversed hint after the badge would shove the selected row's badge
+  // out of column and break the table).
+  const tableProps = { wrap: true, badgeWidth: 13 } as const;
+
+  const mainBlocks: Array<{ id: Row; height: number; node: React.ReactNode }> = [
     {
       id: "identity",
-      height: 3,
+      height: h("the persona files that define who this phantom is"),
       node: (
-        <>
-          <MenuItem
-            icon="◐"
-            label="Identity"
-            description={p.identity.description ?? p.name}
-            activateHint="↵ edit"
-            selected={row === "identity"}
-            onPress={() => press("identity")}
-          />
-          <Detail lines={[["files", identityMarks]]} />
-        </>
+        <MenuItem
+          icon="◐"
+          label="Identity"
+          description="the persona files that define who this phantom is"
+          badge={identityMissing ? "required" : `${glyph.ok} configured`}
+          badgeColor={identityMissing ? theme.bad : theme.ok}
+          selected={row === "identity"}
+          onPress={() => press("identity")}
+          {...tableProps}
+        />
       ),
     },
     {
       id: "brain",
-      height: 4,
+      height: h("which model and harness power this phantom"),
       node: (
-        <>
-          <MenuItem
-            icon="◉"
-            label="Brain"
-            description={`harness: ${p.chain.join(" → ") || "none configured"} · ${sourceLabel(p.configSources?.brain)}`}
-            badge={
-              p.resolvedHarness
-                ? `${glyph.ok} resolved`
-                : `${glyph.bad} missing`
-            }
-            badgeColor={p.resolvedHarness ? theme.ok : theme.bad}
-            activateHint="↵ change"
-            selected={row === "brain"}
-            onPress={() => press("brain")}
-          />
-          <Detail
-            lines={[
-              ["binary", p.resolvedHarness?.path ?? "not found on PATH"],
-              [
-                "from",
-                "env > config.toml [harnesses.<h>] bin > state.json harness_bins > default",
-              ],
-            ]}
-          />
-        </>
+        <MenuItem
+          icon="◉"
+          label="Brain"
+          description="which model and harness power this phantom"
+          badge={
+            status === undefined
+              ? "…"
+              : p.resolvedHarness
+                ? `${glyph.ok} configured`
+                : "required"
+          }
+          badgeColor={
+            status === undefined ? theme.dim : p.resolvedHarness ? theme.ok : theme.bad
+          }
+          selected={row === "brain"}
+          onPress={() => press("brain")}
+          {...tableProps}
+        />
       ),
     },
     {
       id: "channels",
-      height: 3 + p.channelDetails.length,
+      height: h("the chat surfaces this phantom answers on"),
       node: (
-        <>
-          <MenuItem
-            icon="◎"
-            label="Channels"
-            description={p.channels.join(", ")}
-            activateHint="↵ manage"
-            selected={row === "channels"}
-            onPress={() => press("channels")}
-          />
-          <Detail
-            lines={[
-              ["from", sourceLabel(p.configSources?.channels)],
-              ...p.channelDetails.map(channelLine),
-            ]}
-          />
-        </>
+        <MenuItem
+          icon="◎"
+          label="Chat Channels"
+          description="the chat surfaces this phantom answers on"
+          // Same source as the description (the /status lines), so the badge
+          // and the text can never disagree — p.channels is a different
+          // reader and testbot proved they drift (green badge over "none
+          // configured").
+          badge={
+            status === undefined
+              ? "…"
+              : channelParts.some((s) => s.includes("ERR"))
+                ? `${glyph.bad} error`
+                : channelParts.length > 0
+                  ? `${glyph.ok} configured`
+                  : "optional"
+          }
+          badgeColor={
+            status === undefined
+              ? theme.dim
+              : channelParts.some((s) => s.includes("ERR"))
+                ? theme.bad
+                : channelParts.length > 0
+                  ? theme.ok
+                  : theme.warn
+          }
+          selected={row === "channels"}
+          onPress={() => press("channels")}
+          {...tableProps}
+        />
       ),
     },
     {
       id: "memory",
-      height: 6,
+      height: h("the long-term memory database"),
       node: (
-        <>
-          <MenuItem
-            icon="◆"
-            label="Memory"
-            description={`journal ${humanCount(p.memory.journalRows)} rows · kb ${humanCount(p.memory.kbNotes)} notes · ${humanBytes(p.memory.dbBytes)}`}
-            activateHint="↵ manage"
-            selected={row === "memory"}
-            onPress={() => press("memory")}
-          />
-          <Detail
-            lines={[
-              [
-                "last nightly",
-                p.nightly
-                  ? // A healthy sweep says so in three words; only a sweep in
-                    // trouble is worth spending the line on its detail.
-                    `${humanWhen(p.nightly.lastRun)}  ${
-                      p.nightly.status === "ok"
-                        ? `${glyph.ok} clean`
-                        : `${glyph.warn} ${p.nightly.detail}`
-                    }`
-                  : "—",
-              ],
-              [
-                "embeddings",
-                embedding
-                  ? `${embedding.provider} · ${embedding.model} · ${embedding.dimensions}`
-                  : "off",
-              ],
-              ["from", sourceLabel(p.configSources?.embeddings)],
-              [
-                "indexed",
-                `${humanCount(p.memory.indexedInSpace)} / ${humanCount(p.memory.indexedTotal)}  ${
-                  indexState === "in sync"
-                    ? `${glyph.ok} in sync`
-                    : indexState === "stale"
-                      ? `${glyph.warn} re-embed pending`
-                      : "· count unavailable"
-                }`,
-              ],
-            ]}
-          />
-        </>
+        <MenuItem
+          icon="◆"
+          label="Memory"
+          description="the long-term memory database"
+          {...probeBadge(line("memory"), "healthy")}
+          selected={row === "memory"}
+          onPress={() => press("memory")}
+          {...tableProps}
+        />
       ),
     },
     {
       id: "voice",
-      height: 4,
+      height: h("spoken replies, text-to-speech"),
       node: (
-        <>
-          <MenuItem
-            icon="◈"
-            label="Voice"
-            description={`${voiceProvider}${p.voiceName ? ` · ${p.voiceName}` : ""}`}
-            activateHint="↵ manage"
-            selected={row === "voice"}
-            onPress={() => press("voice")}
-          />
-          <Detail
-            lines={[
-              ["from", sourceLabel(p.configSources?.voice)],
-              // The azure_edge trap, stated as a live reading: one config key
-              // drives both speaking and hearing, and the provider that needs
-              // no credential cannot transcribe. See screens/Voice.tsx.
-              [
-                "STT",
-                hears
-                  ? `${glyph.up} ${voiceProvider}`
-                  : `${glyph.bad} not available on ${voiceProvider} — it speaks, it cannot hear`,
-              ],
-            ]}
-          />
-        </>
+        <MenuItem
+          icon="◈"
+          label="Voice"
+          description="spoken replies, text-to-speech"
+          {...probeBadge(line("voice"), "configured")}
+          selected={row === "voice"}
+          onPress={() => press("voice")}
+          {...tableProps}
+        />
       ),
     },
+  ];
+
+  // The informational group — toggles, not health checks. They carry the
+  // VALUE where the badges sit (on|off, yes|no, stable|preview, dim, no
+  // glyph, no colour) and sit under their own rule, separated from the
+  // required/optional rows above.
+  const infoBlocks: Array<{
+    id: Row;
+    height: number;
+    node: React.ReactNode;
+  }> = [
     {
       id: "autostart",
       height: 1,
@@ -336,66 +361,72 @@ export function PersonaDetailScreen(props: {
         <MenuItem
           icon="⏻"
           label="Autostart"
-          description="starts with the daemon"
-          badge={
-            p.autostart || p.isDefault ? `${glyph.ok} on` : `${glyph.bad} off`
-          }
-          badgeColor={p.autostart || p.isDefault ? theme.ok : theme.dim}
-          activateHint="↵ toggle"
+          description="start this phantom with the daemon"
+          badge={p.autostart ? "on" : "off"}
           selected={row === "autostart"}
           onPress={() => press("autostart")}
+          {...tableProps}
         />
       ),
     },
     {
       id: "default",
-      height: 2,
-      node: (
-        <>
-          <MenuItem
-            icon="★"
-            label="Default"
-            description={
-              p.isDefault
-                ? "owns /update and /restart"
-                : "↵ hands over /update and /restart"
-            }
-            badge={p.isDefault ? `${glyph.ok} yes` : `${glyph.bad} no`}
-            badgeColor={p.isDefault ? theme.ok : theme.dim}
-            activateHint="↵ change"
-            selected={row === "default"}
-            onPress={() => press("default")}
-          />
-          <Box marginBottom={1} />
-        </>
-      ),
-    },
-    {
-      id: "doctor",
       height: 1,
       node: (
         <MenuItem
-          icon="✚"
-          label="Doctor"
+          icon="★"
+          label="Default"
           description={
-            p.completeness.complete
-              ? "run the checks"
-              : `setup unfinished — resume at ${p.completeness.resumeAt}`
+            props.canSetDefault
+              ? "the host default; owns /update and /restart"
+              : "the only phantom on this host, so it is the default"
           }
-          badgeColor={p.completeness.complete ? theme.ok : theme.warn}
-          activateHint="↵ run"
-          selected={row === "doctor"}
-          onPress={() => press("doctor")}
+          badge={p.isDefault ? "yes" : "no"}
+          badgeColor={props.canSetDefault ? undefined : theme.dim}
+          selected={row === "default"}
+          onPress={() => press("default")}
+          {...tableProps}
+        />
+      ),
+    },
+    {
+      id: "release",
+      height: 1,
+      node: (
+        <MenuItem
+          icon="⇅"
+          label="Release Channel"
+          description={
+            props.canSetRelease
+              ? "update ring this HOST follows; stable lags, preview tracks main"
+              : "host-only setting; run the TUI as the host operator to change it"
+          }
+          badge={props.releaseChannel}
+          badgeColor={props.canSetRelease ? undefined : theme.dim}
+          selected={row === "release"}
+          onPress={() => press("release")}
+          {...tableProps}
         />
       ),
     },
   ];
 
-  // `blocks` is in ROWS order, so the cursor indexes both.
+  // Both groups render through one scroll window; the rule between them is a
+  // fixed one-row separator. The cursor indexes ROWS, which skips the
+  // separator — shift anything at or past autostart down by one so the
+  // window always reveals the row the cursor is actually on.
+  const blocks = [
+    ...mainBlocks,
+    { id: "sep" as const, height: 1, node: <Rule /> },
+    ...infoBlocks,
+  ];
+  const cursorBlock =
+    cursor >= ROWS.indexOf("autostart") ? cursor + 1 : cursor;
+
   const view = scrollWindow(
     blocks.map((b) => b.height),
     budget,
-    cursor,
+    cursorBlock,
   );
 
   return (
@@ -409,10 +440,29 @@ export function PersonaDetailScreen(props: {
       footer={[
         { icon: badge.move, key: "↑↓", label: "Move" },
         { icon: badge.edit, key: "↵", label: "Edit" },
-        { icon: badge.logs, key: "L", label: "Logs" },
         { icon: badge.back, key: "esc", label: "Back" },
       ]}
     >
+      {/* The framed header — the phantoms table's exact skeleton: a rule, a
+          dim lowercase header row sitting over the columns, a rule. The
+          lead-in matches a row's gutters (Selectable's pointer + MenuItem's
+          bar + the icon cell) so the labels sit over their columns. */}
+      <Rule />
+      <Box>
+        <Box width={6}>
+          <Text> </Text>
+        </Box>
+        <Box width={16} flexShrink={0}>
+          <Text color={theme.dim}>setting</Text>
+        </Box>
+        <Box flexGrow={1} flexBasis={0}>
+          <Text color={theme.dim}>description</Text>
+        </Box>
+        <Box marginLeft={1} flexShrink={0} width={13} justifyContent="flex-end">
+          <Text color={theme.dim}>state</Text>
+        </Box>
+      </Box>
+      <Rule />
       <Text color={theme.dim}>
         {view.above > 0 ? `▲ ${view.above} more above` : " "}
       </Text>
@@ -425,6 +475,59 @@ export function PersonaDetailScreen(props: {
       <Text color={theme.dim}>
         {view.below > 0 ? `▼ ${view.below} more below` : " "}
       </Text>
+      <Rule />
+      <StatusBlock status={props.status} />
+      {/* One blank row between the STATUS telemetry and the footer — the same
+          breathing room the footer gets on every other screen. */}
+      <Box height={1} />
     </Frame>
   );
 }
+
+/** One telemetry line, in the Dashboard's HOST-block style: mark, label, dim
+ * detail — fixed columns, truncated detail, never a wrapped telemetry line. */
+function StatusLine(props: {
+  label: string;
+  detail?: string;
+}): React.ReactElement {
+  return (
+    <Box>
+      <Box width={2} flexShrink={0}>
+        <Text color={theme.ok}>{glyph.ok}</Text>
+      </Box>
+      <Box width={14} flexShrink={0}>
+        <Text>{props.label}</Text>
+      </Box>
+      <Box flexGrow={1} flexBasis={0}>
+        <Text color={theme.dim} wrap="truncate">
+          {props.detail ?? ""}
+        </Text>
+      </Box>
+    </Box>
+  );
+}
+
+/** The full telemetry, where the Dashboard puts HOST: the persona's complete
+ * /status reading — heading, label/value dim pairs under the bottom rule.
+ * Status is already gathered for the table's badges. */
+function StatusBlock(props: {
+  status?: StatusRows;
+}): React.ReactElement {
+  return (
+    <Box marginTop={1} flexDirection="column">
+      <Box>
+        <Text color={theme.accent} bold>
+          STATUS
+        </Text>
+      </Box>
+      {!props.status ? (
+        <Text color={theme.dim}>gathering…</Text>
+      ) : (
+        props.status.map(([label, detail]) => (
+          <StatusLine key={label} label={label} detail={detail} />
+        ))
+      )}
+    </Box>
+  );
+}
+
