@@ -36,7 +36,12 @@
  *     possibly-flaky reply than to refuse outright.
  */
 
-import type { Harness, HarnessChunk, HarnessRequest } from "../harnesses/types.ts";
+import type {
+  Harness,
+  HarnessChunk,
+  HarnessExecutionInfo,
+  HarnessRequest,
+} from "../harnesses/types.ts";
 import { type CooldownStore, cooldownStore as defaultStore } from "../lib/cooldown.ts";
 import {
   type HarnessAlerter,
@@ -50,6 +55,12 @@ import {
   PartialAttempt,
   shouldResume,
 } from "./resume.ts";
+import {
+  buildHardContinuationRequest,
+  HARD_CONTINUATION_EXHAUSTED_MESSAGE,
+  MAX_HARD_CONTINUATIONS,
+  shouldContinueAfterHardTimeout,
+} from "./hardContinuation.ts";
 
 export interface RunWithFallbackOptions {
   /**
@@ -91,6 +102,7 @@ export async function* runWithFallback(
   const cooldown = options.cooldown ?? defaultStore;
   const alerter = options.alerter ?? defaultAlerter;
   const chainIds = chain.map((h) => h.id);
+  const turnStartedAt = Date.now();
   // Remembers the first harness that failed this turn, so that if a LATER
   // harness answers we can tell the owner which one is broken and who is
   // covering for it. Only the first matters: that's the primary.
@@ -117,6 +129,12 @@ export async function* runWithFallback(
     );
     cooledIds.clear();
   }
+
+  // The hard-boundary continuation budget belongs to the whole turn, not to
+  // an individual fallback slot. Otherwise a productive timeout followed by
+  // a later harness could receive another one-hour continuation.
+  let hardContinuationAttemptsUsed = 0;
+  let hardContinuationStarted = false;
 
   for (let i = 0; i < chain.length; i++) {
     // Short-circuit if the channel layer has already aborted — otherwise
@@ -204,10 +222,13 @@ export async function* runWithFallback(
     // handle.
     let thrown: unknown;
 
-    // ── resume-with-context (#459) ────────────────────────────────────
-    // One harness slot, up to two attempts. The second only happens when the
-    // first was killed by the IDLE watchdog after it had already streamed
-    // something — a wedge mid-flight, the case with no other recovery path:
+    // ── bounded continuation/recovery (#459 + hard-boundary continuation) ──
+    // A harness slot may receive an idle resume, while the whole turn gets at
+    // most one productive hard-boundary continuation. The idle case is a
+    // wedge mid-flight; the hard case is an absolute wall-clock boundary
+    // reached after recent meaningful work. Both carry state, but the hard
+    // path has a distinct whole-turn budget and cannot turn into an unbounded
+    // respawn loop:
     // pi's coder ladder declines it (it refuses to replay side effects) and a
     // single-entry chain has no next harness to fall to, so the turn used to
     // be dropped outright. The retry carries a synthesised preamble naming
@@ -224,20 +245,75 @@ export async function* runWithFallback(
     // slot emits its reply across two processes, and the terminal `done` has
     // to account for both — see the stitch below.
     let carriedText = "";
+    let carriedToolCalls: string[] = [];
+    let carriedDroppedToolCalls = 0;
     while (resumeRequested) {
       resumeRequested = false;
       // Chunk log for THIS attempt only — a resume must describe the attempt
       // that actually wedged, not an earlier one it already recovered from.
       const partial = new PartialAttempt();
+      let attemptExecution: HarnessExecutionInfo | undefined;
       try {
       for await (const chunk of harness.invoke(attemptReq)) {
         if (chunk.type === "error") {
+          attemptExecution = chunk.execution;
+          const now = Date.now();
+          if (
+            shouldContinueAfterHardTimeout(
+              chunk,
+              partial,
+              hardContinuationAttemptsUsed,
+              now,
+              req.idleTimeoutMs,
+            )
+          ) {
+            hardContinuationAttemptsUsed++;
+            hardContinuationStarted = true;
+            const continuationState = {
+              elapsedMs: now - turnStartedAt,
+              continuationNumber: hardContinuationAttemptsUsed,
+              execution: attemptExecution,
+              priorNarration: carriedText,
+              priorToolCalls: carriedToolCalls,
+              priorDroppedToolCalls: carriedDroppedToolCalls,
+            };
+            log.warn(
+              "orchestrator: productive hard timeout — continuing with context",
+              {
+                harnessId: harness.id,
+                error: chunk.error,
+                continuation: hardContinuationAttemptsUsed,
+                of: MAX_HARD_CONTINUATIONS,
+                elapsedMs: continuationState.elapsedMs,
+                narrationChars: partial.text.length,
+                toolCalls: partial.toolCalls.length,
+                model: attemptExecution?.model,
+                provider: attemptExecution?.provider,
+              },
+            );
+            carriedText += partial.rawText;
+            const allToolCalls = [...carriedToolCalls, ...partial.toolCalls];
+            const overflow = Math.max(0, allToolCalls.length - 20);
+            carriedToolCalls = allToolCalls.slice(-20);
+            carriedDroppedToolCalls +=
+              partial.droppedToolCalls + overflow;
+            attemptReq = buildHardContinuationRequest(
+              req,
+              partial,
+              continuationState,
+            );
+            resumeRequested = true;
+            break;
+          }
           // Killed mid-flight with work already done: respawn this same
           // harness once, carrying what it had said and started. Checked BEFORE
           // the fall-through branch so a chain that HAS a next harness still
           // prefers the one that was making progress over a cold hand-off to a
           // different model with none of the context.
-          if (shouldResume(chunk, partial, resumeAttemptsUsed)) {
+          if (
+            !hardContinuationStarted &&
+            shouldResume(chunk, partial, resumeAttemptsUsed)
+          ) {
             resumeAttemptsUsed++;
             log.warn(
               "orchestrator: harness wedged after producing output — resuming with context",
@@ -251,8 +327,22 @@ export async function* runWithFallback(
               },
             );
             carriedText += partial.rawText;
-            attemptReq = buildResumeRequest(req, partial);
+            const allToolCalls = [...carriedToolCalls, ...partial.toolCalls];
+            const overflow = Math.max(0, allToolCalls.length - 20);
+            carriedToolCalls = allToolCalls.slice(-20);
+            carriedDroppedToolCalls += partial.droppedToolCalls + overflow;
+            attemptReq = buildResumeRequest(req, partial, attemptExecution);
             resumeRequested = true;
+            break;
+          }
+          if (hardContinuationStarted && chunk.killCause === "timeout") {
+            carriedText += partial.rawText;
+            yield {
+              type: "done",
+              finalText: `${carriedText}${HARD_CONTINUATION_EXHAUSTED_MESSAGE}`,
+              meta: { hardContinuationExhausted: true },
+            };
+            succeeded = true;
             break;
           }
           if (chunk.recoverable && !isLast) {

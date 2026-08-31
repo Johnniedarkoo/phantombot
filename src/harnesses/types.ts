@@ -17,6 +17,17 @@ export interface HistoryTurn {
   text: string;
 }
 
+/**
+ * The concrete provider/model used for one harness invocation.  This is
+ * internal execution metadata, not user-visible model output.  A continuation
+ * carries it forward so synthetic recovery text cannot re-run capability
+ * routing and silently select a different brain.
+ */
+export interface HarnessExecutionInfo {
+  provider?: string;
+  model?: string;
+}
+
 export interface HarnessRequest {
   /**
    * System material: persona identity, policy, instructions, security rules,
@@ -38,6 +49,8 @@ export interface HarnessRequest {
   userMessage: string;
   /** Prior turns of this conversation, oldest first. May be empty. */
   history: HistoryTurn[];
+  /** Pin a continuation to the exact execution identity of the interrupted attempt. */
+  execution?: HarnessExecutionInfo;
   /**
    * Persona key for THIS turn (e.g. "burt"). Exposed to the subprocess as
    * the `PHANTOMBOT_PERSONA` env var so tools can self-identify without a
@@ -206,13 +219,17 @@ export type HarnessChunk =
        * Why the kill coordinator killed the subprocess, when it was a kill
        * rather than a natural exit. Structured because the orchestrator makes
        * a real decision on it (issue #459): an `idle` kill that had already
-       * produced output is resumable with context, while a hard-cap `timeout`
-       * or a `startup` kill is not. Matching on the human-readable `error`
-       * string to recover that distinction would be a rename away from
-       * silently disabling the recovery. Omitted when the failure was not a
-       * coordinator kill (spawn failure, non-zero exit, provider 4XX).
+       * produced output is resumable with context, while the Pi-internal
+       * retry ladder treats a hard-cap `timeout` as final. The outer
+       * orchestrator has a separate, bounded productive-hard-boundary path
+       * for that cause. Matching on the human-readable `error` string to
+       * recover the distinction would be a rename away from silently
+       * disabling recovery. Omitted when the failure was not a coordinator
+       * kill (spawn failure, non-zero exit, provider 4XX).
        */
       killCause?: "timeout" | "idle" | "startup" | "aborted" | "policy";
+      /** Exact provider/model selected for this invocation, when the harness knows it. */
+      execution?: HarnessExecutionInfo;
       /**
        * Last ~20 lines of harness stderr, captured by a ring buffer in
        * `runHarnessProcess` (src/lib/harnessRunner.ts). Present on non-zero-exit

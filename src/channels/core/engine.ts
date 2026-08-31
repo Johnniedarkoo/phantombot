@@ -25,7 +25,7 @@ import {
   DEFAULT_TELEGRAM_STREAMING,
   type Config,
 } from "../../config.ts";
-import type { Harness } from "../../harnesses/types.ts";
+import type { Harness, HistoryTurn } from "../../harnesses/types.ts";
 import {
   sttSupport,
   synthesize,
@@ -48,7 +48,10 @@ import { log } from "../../lib/logger.ts";
 import { resolveNarrationEnabled } from "../../lib/chattiness.ts";
 import type { ServiceControl } from "../../lib/systemd.ts";
 import type { MemoryStore } from "../../memory/store.ts";
-import { runTurn } from "../../orchestrator/turn.ts";
+import {
+  DEFAULT_HISTORY_LIMIT,
+  runTurn,
+} from "../../orchestrator/turn.ts";
 import { generateRecoveryReply } from "../../orchestrator/recovery.ts";
 import { makeRetriever } from "../../orchestrator/retrieval.ts";
 import { makeTurnIndexer } from "../../orchestrator/turnIndexer.ts";
@@ -1528,9 +1531,26 @@ async function processChatMessage(
       chatId: msg.conversationId,
       error: errored,
     });
+    let recoveryHistory: HistoryTurn[] = [];
+    try {
+      // The failed current turn is intentionally not persisted by runTurn.
+      // Re-read the canonical prior history so a context-dependent message
+      // still has its referent during the bounded, tool-free recovery reply.
+      recoveryHistory = await input.memory.recentTurns(
+        input.persona,
+        conversationKey,
+        DEFAULT_HISTORY_LIMIT,
+      );
+    } catch (e) {
+      log.warn("telegram: failed to load recovery history", {
+        chatId: msg.conversationId,
+        error: (e as Error).message,
+      });
+    }
     recoveryText = await generateRecoveryReply({
       harnesses,
       userMessage: msg.text,
+      history: recoveryHistory,
       personaName: input.persona,
       signal: controller.signal,
     });

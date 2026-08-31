@@ -29,7 +29,7 @@
 import { homedir } from "node:os";
 
 import { runWithFallback } from "./fallback.ts";
-import type { Harness } from "../harnesses/types.ts";
+import type { Harness, HistoryTurn } from "../harnesses/types.ts";
 import { CooldownStore } from "../lib/cooldown.ts";
 import { log } from "../lib/logger.ts";
 
@@ -46,6 +46,8 @@ export interface RecoveryReplyInput {
   harnesses: Harness[];
   /** The user's original message — carries the language to mirror. */
   userMessage: string;
+  /** Canonical prior conversation, retained for context-dependent messages. */
+  history?: HistoryTurn[];
   /** Persona display name, for light tone framing. Optional. */
   personaName?: string;
   /** Subprocess working dir. Defaults to the running user's home. */
@@ -73,6 +75,7 @@ function recoverySystemPrompt(personaName?: string): string {
     "- Do NOT use any tools. Just write the message.",
     "- Do NOT mention timeouts, subprocesses, errors, or any technical detail.",
     "- Do NOT try to answer their actual question — you don't have an answer.",
+    "- Do NOT ask them to repeat details already present in the conversation context.",
     "- Keep it short and human; no long apologies.",
   ].join("\n");
 }
@@ -94,7 +97,7 @@ export async function generateRecoveryReply(
       {
         systemPrompt: recoverySystemPrompt(input.personaName),
         userMessage: input.userMessage,
-        history: [],
+        history: input.history ?? [],
         workingDir: input.workingDir ?? homedir(),
         idleTimeoutMs: RECOVERY_IDLE_TIMEOUT_MS,
         hardTimeoutMs: RECOVERY_HARD_TIMEOUT_MS,

@@ -20,6 +20,12 @@ import {
   PartialAttempt,
   shouldResume,
 } from "../src/orchestrator/resume.ts";
+import {
+  buildHardContinuationRequest,
+  buildHardContinuationPreamble,
+  MAX_HARD_CONTINUATIONS,
+  shouldContinueAfterHardTimeout,
+} from "../src/orchestrator/hardContinuation.ts";
 import { CooldownStore } from "../src/lib/cooldown.ts";
 import { HarnessAlerter } from "../src/lib/harnessAlert.ts";
 import type {
@@ -264,6 +270,204 @@ describe("shouldResume — when recovery is allowed to fire", () => {
     expect(shouldResume({ type: "text", text: "hi" }, withOutput(), 0)).toBe(
       false,
     );
+  });
+});
+
+describe("productive hard-boundary continuation", () => {
+  const productiveHardKill = (): HarnessChunk => ({
+    type: "error",
+    error: "pi timed out after 100ms (hard wall-clock cap)",
+    recoverable: true,
+    killCause: "timeout",
+    execution: { provider: "llamacpp", model: "qwen3.8-27b" },
+  });
+
+  test("recent meaningful output qualifies, while a stale attempt does not", () => {
+    const recent = new PartialAttempt();
+    recent.record({ type: "text", text: "checking the repository" }, 1_000);
+    expect(
+      shouldContinueAfterHardTimeout(
+        productiveHardKill(),
+        recent,
+        0,
+        1_000 + 300_000,
+        300_000,
+      ),
+    ).toBe(true);
+
+    const stale = new PartialAttempt();
+    stale.record({ type: "text", text: "old output" }, 1_000);
+    expect(
+      shouldContinueAfterHardTimeout(
+        productiveHardKill(),
+        stale,
+        0,
+        1_000 + 300_001,
+        300_000,
+      ),
+    ).toBe(false);
+  });
+
+  test("heartbeats and bare progress do not qualify as recent productive work", () => {
+    const p = new PartialAttempt();
+    p.record({ type: "heartbeat" }, 1_000);
+    p.record({ type: "progress", note: "still working" }, 1_001);
+    expect(
+      shouldContinueAfterHardTimeout(productiveHardKill(), p, 0, 1_001, 300_000),
+    ).toBe(false);
+  });
+
+  test("abort and policy failures never qualify, even with recent output", () => {
+    const p = new PartialAttempt();
+    p.record({ type: "text", text: "working" }, 1_000);
+    expect(
+      shouldContinueAfterHardTimeout(
+        { type: "error", error: "stopped", recoverable: false, killCause: "aborted" },
+        p,
+        0,
+        1_001,
+        300_000,
+      ),
+    ).toBe(false);
+    expect(
+      shouldContinueAfterHardTimeout(
+        {
+          type: "error",
+          error: "policy",
+          recoverable: true,
+          terminal: true,
+          killCause: "policy",
+        },
+        p,
+        0,
+        1_001,
+        300_000,
+      ),
+    ).toBe(false);
+  });
+
+  test("hard timeout after productive work gets one verify-first continuation", async () => {
+    const pi = new ScriptedHarness("pi", [
+      [
+        { type: "text", text: "I am inspecting the task. " },
+        {
+          type: "progress",
+          note: "tool: Bash",
+          tool: { title: "Bash: git status", kind: "execute", locations: [] },
+        },
+        productiveHardKill(),
+      ],
+      [{ type: "done", finalText: "continuing from the verified state" }],
+    ]);
+    const req = newRequest({
+      userMessage: "continue with that",
+      history: [
+        { role: "user", text: "Fix the failing test in the repository." },
+        { role: "assistant", text: "I will inspect it." },
+      ],
+      turnContext: "working repository: D:/code/example",
+      workingDir: "D:/code/example",
+    });
+    const chunks = await collect(runWithFallback([pi], req, opts()));
+
+    expect(pi.invocations).toBe(2);
+    expect(chunks.at(-1)).toMatchObject({ type: "done" });
+    expect(pi.requests[1]!.userMessage).toContain("continue with that");
+    expect(pi.requests[1]!.userMessage).toContain("SAME user request");
+    expect(pi.requests[1]!.userMessage).toContain("VERIFY");
+    expect(pi.requests[1]!.history).toBe(req.history);
+    expect(pi.requests[1]!.turnContext).toBe(req.turnContext);
+    expect(pi.requests[1]!.workingDir).toBe(req.workingDir);
+    expect(pi.requests[1]!.execution).toEqual({
+      provider: "llamacpp",
+      model: "qwen3.8-27b",
+    });
+  });
+
+  test("a second hard boundary produces a controlled result and no third attempt", async () => {
+    const pi = new ScriptedHarness("pi", [
+      [{ type: "text", text: "first attempt" }, productiveHardKill()],
+      [{ type: "text", text: "continuation attempt" }, productiveHardKill()],
+      [{ type: "done", finalText: "must not run" }],
+    ]);
+    const chunks = await collect(runWithFallback([pi], newRequest(), opts()));
+    expect(MAX_HARD_CONTINUATIONS).toBe(1);
+    expect(pi.invocations).toBe(2);
+    expect(chunks.at(-1)).toMatchObject({
+      type: "done",
+      meta: { hardContinuationExhausted: true },
+    });
+    expect(chunks.some((c) => c.type === "error")).toBe(false);
+  });
+
+  test("the hard-continuation budget is whole-turn, across fallback harnesses", async () => {
+    const pi = new ScriptedHarness("pi", [
+      [{ type: "text", text: "primary work" }, hardCapKill("pi")],
+      [{ type: "error", error: "transport failed", recoverable: true }],
+    ]);
+    const fallback = new ScriptedHarness("fallback", [
+      [{ type: "text", text: "fallback work" }, hardCapKill("fallback")],
+      [{ type: "done", finalText: "must not run" }],
+    ]);
+    const chunks = await collect(
+      runWithFallback([pi, fallback], newRequest(), opts()),
+    );
+
+    expect(pi.invocations).toBe(2);
+    expect(fallback.invocations).toBe(1);
+    expect(chunks.at(-1)).toMatchObject({
+      type: "done",
+      meta: { hardContinuationExhausted: true },
+    });
+  });
+
+  test("the hard preamble carries bounded prior tool state", () => {
+    const p = new PartialAttempt();
+    p.record({ type: "text", text: "working" });
+    p.record({
+      type: "progress",
+      note: "tool: Bash",
+      tool: { title: "Bash: npm test", kind: "execute", locations: [] },
+    });
+    const text = buildHardContinuationPreamble(p, {
+      elapsedMs: 3_600_000,
+      continuationNumber: 1,
+      priorNarration: "earlier progress",
+      priorToolCalls: ["Bash: git status"],
+    });
+    expect(text).toContain("earlier progress");
+    expect(text).toContain("Bash: git status");
+    expect(text).toContain("Bash: npm test");
+    expect(text).toContain("tool side effects may already have");
+  });
+
+  test("the request builder preserves execution identity and original context", () => {
+    const p = new PartialAttempt();
+    p.record({ type: "text", text: "progress" });
+    const req = newRequest({
+      userMessage: "continue with that",
+      history: [{ role: "user", text: "original task" }],
+      turnContext: "context",
+      epochTurns: [
+        {
+          turnContext: "prior context",
+          userMessage: "earlier request",
+          assistantMessage: "earlier result",
+        },
+      ],
+    });
+    const continued = buildHardContinuationRequest(req, p, {
+      elapsedMs: 100,
+      continuationNumber: 1,
+      execution: { provider: "llamacpp", model: "qwen3.8-27b" },
+    });
+    expect(continued.history).toBe(req.history);
+    expect(continued.turnContext).toBe("context");
+    expect(continued.epochTurns).toBe(req.epochTurns);
+    expect(continued.execution).toEqual({
+      provider: "llamacpp",
+      model: "qwen3.8-27b",
+    });
   });
 });
 
@@ -516,16 +720,21 @@ describe("runWithFallback — resume-with-context end to end", () => {
     expect(chunks.at(-1)).toMatchObject({ type: "error", recoverable: true });
   });
 
-  test("a hard-cap kill after output is not resumed — it falls through", async () => {
+  test("a productive hard-cap kill gets one bounded continuation before completion", async () => {
     const pi = new ScriptedHarness("pi", [
       [{ type: "text", text: "runaway" }, hardCapKill()],
+      [{ type: "done", finalText: " finished" }],
     ]);
     const claude = new ScriptedHarness("claude", [
       [{ type: "done", finalText: "covered" }],
     ]);
-    await collect(runWithFallback([pi, claude], newRequest(), opts()));
-    expect(pi.invocations).toBe(1);
-    expect(claude.invocations).toBe(1);
+    const chunks = await collect(runWithFallback([pi, claude], newRequest(), opts()));
+    expect(pi.invocations).toBe(2);
+    expect(claude.invocations).toBe(0);
+    expect(chunks.at(-1)).toMatchObject({
+      type: "done",
+      finalText: "runaway finished",
+    });
   });
 
   test("/stop after output is never resumed", async () => {

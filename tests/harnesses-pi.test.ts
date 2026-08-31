@@ -586,6 +586,29 @@ describe("PiHarness routing (subprocess)", () => {
     expect(argv).toContain("--model z-ai/glm-5.2");
   });
 
+  test("a continuation execution identity pins the original model and skips a fresh swap", async () => {
+    process.env.FAKE_PI_MODE = "argv";
+    const chunks = await collect(
+      routed({
+        provider: "openrouter",
+        primaryModel: "mimo-v2.5",
+        codingModel: "z-ai/glm-5.2",
+      }).invoke(
+        newRequest({
+          userMessage: "review this pull request https://github.com/x/y/pull/1",
+          execution: { provider: "openrouter", model: "mimo-v2.5" },
+        }),
+      ),
+    );
+    const argv = chunks
+      .filter((c) => c.type === "text")
+      .map((c) => (c as { text: string }).text)
+      .join("");
+    expect(argv).toContain("--provider openrouter");
+    expect(argv).toContain("--model mimo-v2.5");
+    expect(argv).not.toContain("--model z-ai/glm-5.2");
+  });
+
   test("no routing → no --model flag", async () => {
     process.env.FAKE_PI_MODE = "argv";
     const chunks = await collect(mkHarness().invoke(newRequest()));
@@ -951,6 +974,9 @@ describe("PiHarness coder-swap retry ladder", () => {
       | undefined;
     expect(error?.error).toContain("hard wall-clock cap");
     expect(error?.recoverable).toBe(true);
+    expect((error as { execution?: { model?: string } })?.execution?.model).toBe(
+      "z-ai/glm-5.2",
+    );
     // Exactly ONE invocation — no retries, no primary fallback.
     expect(await loggedArgv()).toHaveLength(1);
   });

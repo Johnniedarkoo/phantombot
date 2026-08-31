@@ -41,6 +41,7 @@ import { access, constants } from "node:fs/promises";
 import type {
   Harness,
   HarnessChunk,
+  HarnessExecutionInfo,
   HarnessModelInfo,
   HarnessRequest,
 } from "./types.ts";
@@ -172,12 +173,17 @@ export class PiHarness implements Harness {
     // an equal model would activate the retry ladder for nothing).
     const primaryModel = this.config.routing?.primaryModel;
     const codingModel = this.config.routing?.codingModel;
+    // A continuation must use the identity selected for the interrupted
+    // attempt. Re-running the coding scorer against a synthetic recovery
+    // preamble can otherwise switch the brain mid-turn.
+    const pinnedExecution = req.execution;
     const coderSwapEligible =
+      !pinnedExecution &&
       req.toolsMode !== "none" &&
       !!codingModel &&
       codingModel !== primaryModel;
     let swapped = false;
-    let swapModel = primaryModel;
+    let swapModel = pinnedExecution?.model ?? primaryModel;
     if (coderSwapEligible) {
       const override =
         req.persona && req.conversation
@@ -216,7 +222,11 @@ export class PiHarness implements Harness {
     // omit the flag and let Pi use its own default. Read from the static routing
     // config (like the model), not per-turn env, since the provider is a config
     // choice that pairs with the saved models.
-    const provider = this.config.routing?.provider;
+    const provider = pinnedExecution?.provider ?? this.config.routing?.provider;
+    const execution: HarnessExecutionInfo = {
+      model: swapModel,
+      provider,
+    };
 
     // Reconcile this persona's encrypted vault into the env BEFORE the Pi API
     // key is read below — the key is a vault secret post-migration. See claude.ts.
@@ -335,7 +345,7 @@ export class PiHarness implements Harness {
 
       // Shared engine. Pi delivers its payload via argv (stdin ignored, so no
       // stdinPayload), and the terminal `done` meta records the argv byte count.
-      yield* runHarnessProcess({
+      for await (const chunk of runHarnessProcess({
         proc,
         req,
         harnessId: this.id,
@@ -363,7 +373,12 @@ export class PiHarness implements Harness {
           req.hardTimeoutMs ?? Number.POSITIVE_INFINITY,
           Math.max(req.idleTimeoutMs * 4, 1_200_000),
         ),
-      });
+      })) {
+        // The shared runner creates timeout errors after the process is killed;
+        // attach the identity that was chosen before spawning so an
+        // orchestrator continuation can pin the same provider/model.
+        yield chunk.type === "error" ? { ...chunk, execution } : chunk;
+      }
     }.bind(this);
 
     if (!swapped) {
