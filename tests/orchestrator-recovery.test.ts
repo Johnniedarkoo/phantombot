@@ -73,6 +73,26 @@ describe("generateRecoveryReply", () => {
     expect(harness.lastRequest?.systemPrompt).toContain("Do NOT use any tools");
   });
 
+  test("passes canonical history so context-dependent failures are reportable", async () => {
+    const harness = new FakeHarness("fake", [
+      { type: "done", finalText: "I hit a snag; I can continue from the current state." },
+    ]);
+    const history = [
+      { role: "user" as const, text: "Fix the failing test in the repository." },
+      { role: "assistant" as const, text: "I am inspecting it." },
+    ];
+    await generateRecoveryReply({
+      harnesses: [harness],
+      userMessage: "continue with that",
+      history,
+    });
+    expect(harness.lastRequest?.history).toEqual(history);
+    expect(harness.lastRequest?.userMessage).toBe("continue with that");
+    expect(harness.lastRequest?.systemPrompt).toContain(
+      "Do NOT ask them to repeat details already present",
+    );
+  });
+
   test("returns undefined when the recovery turn itself errors", async () => {
     const harness = new FakeHarness("fake", [
       { type: "error", error: "still broken", recoverable: true },

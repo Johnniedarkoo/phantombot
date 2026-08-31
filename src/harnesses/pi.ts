@@ -48,6 +48,7 @@ import { join } from "node:path";
 import type {
   Harness,
   HarnessChunk,
+  HarnessExecutionInfo,
   HarnessModelInfo,
   HarnessRequest,
 } from "./types.ts";
@@ -320,12 +321,17 @@ export class PiHarness implements Harness {
     const routing = this.routing();
     const primaryModel = routing?.primaryModel;
     const codingModel = routing?.codingModel;
+    // A continuation must use the identity selected for the interrupted
+    // attempt. Re-running the coding scorer against a synthetic recovery
+    // preamble can otherwise switch the brain mid-turn.
+    const pinnedExecution = req.execution;
     const coderSwapEligible =
+      !pinnedExecution &&
       req.toolsMode !== "none" &&
       !!codingModel &&
       codingModel !== primaryModel;
     let swapped = false;
-    let swapModel = primaryModel;
+    let swapModel = pinnedExecution?.model ?? primaryModel;
     if (coderSwapEligible) {
       const override =
         req.persona && req.conversation
@@ -435,7 +441,11 @@ export class PiHarness implements Harness {
     // omit the flag and let Pi use its own default. Read from the static routing
     // config (like the model), not per-turn env, since the provider is a config
     // choice that pairs with the saved models.
-    const provider = routing?.provider;
+    const provider = pinnedExecution?.provider ?? routing?.provider;
+    const execution: HarnessExecutionInfo = {
+      model: swapModel,
+      provider,
+    };
 
     // The provider's NATIVE env var — the one Pi itself resolves the key from
     // when no runtime/stored credential exists (issue #602). Undefined for a
@@ -749,7 +759,7 @@ export class PiHarness implements Harness {
 
       // Shared engine. Pi delivers its payload via argv (stdin ignored, so no
       // stdinPayload), and the terminal `done` meta records the argv byte count.
-      yield* runHarnessProcess({
+      for await (const chunk of runHarnessProcess({
         proc,
         req,
         harnessId: this.id,
@@ -765,7 +775,27 @@ export class PiHarness implements Harness {
         // finished answer, so a narration-only mid-task exit falls through to the
         // next harness rather than being stored as the reply (issue #352).
         requireCompletion: true,
-      });
+        // Bound how long a single contiguous tool-run may keep the idle watchdog
+        // alive via tool_execution_* activity alone, with no user-facing text. pi
+        // only emits tool_execution_update on genuine new output (bash streams
+        // stdout, the coder delegate forwards its child's progress) so a healthy
+        // turn is rarely affected — but a tool that trickles output forever (a
+        // stalled auto-router, a hung network retry that keeps logging) could
+        // otherwise reset the idle timer up to the 60-min hard cap with no
+        // fallback (issue #351). This is a GENEROUS last-resort net: comfortably
+        // above any realistic tool-run yet well under the hard cap, so a
+        // wedged-but-chattery turn fails over in minutes, not an hour. Derived
+        // from the idle window, floored at 20 min, and never above the hard cap.
+        toolTimeoutMs: Math.min(
+          req.hardTimeoutMs ?? Number.POSITIVE_INFINITY,
+          Math.max(req.idleTimeoutMs * 4, 1_200_000),
+        ),
+      })) {
+        // The shared runner creates timeout errors after the process is killed;
+        // attach the identity that was chosen before spawning so an
+        // orchestrator continuation can pin the same provider/model.
+        yield chunk.type === "error" ? { ...chunk, execution } : chunk;
+      }
     }.bind(this);
 
     if (!swapped) {

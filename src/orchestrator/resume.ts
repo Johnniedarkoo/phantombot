@@ -50,7 +50,11 @@
  * support code.
  */
 
-import type { HarnessChunk, HarnessRequest } from "../harnesses/types.ts";
+import type {
+  HarnessChunk,
+  HarnessExecutionInfo,
+  HarnessRequest,
+} from "../harnesses/types.ts";
 
 /**
  * Recovery respawns allowed per harness per turn. One.
@@ -81,11 +85,13 @@ export class PartialAttempt {
   private readonly tools: string[] = [];
   private toolsDropped = 0;
   private otherProgress = 0;
+  private lastProductiveAtMs: number | undefined;
 
   /** Fold one chunk from the live stream into the log. */
-  record(chunk: HarnessChunk): void {
+  record(chunk: HarnessChunk, now = Date.now()): void {
     if (chunk.type === "text") {
       this.narration += chunk.text;
+      if (chunk.text.trim().length > 0) this.lastProductiveAtMs = now;
       return;
     }
     if (chunk.type === "progress") {
@@ -106,6 +112,7 @@ export class PartialAttempt {
       if (!note) return;
       if (this.tools.length < MAX_TOOL_CALLS) this.tools.push(note);
       else this.toolsDropped++;
+      this.lastProductiveAtMs = now;
     }
   }
 
@@ -150,6 +157,11 @@ export class PartialAttempt {
   /** The raw, untruncated streamed text, for terminal-`done` reconciliation. */
   get rawText(): string {
     return this.narration;
+  }
+
+  /** Timestamp of the newest meaningful text or structured tool event. */
+  get lastProductiveAt(): number | undefined {
+    return this.lastProductiveAtMs;
   }
 }
 
@@ -244,9 +256,12 @@ export function buildResumePreamble(partial: PartialAttempt): string {
 export function buildResumeRequest(
   req: HarnessRequest,
   partial: PartialAttempt,
+  execution?: HarnessExecutionInfo,
 ): HarnessRequest {
-  return {
+  const resumed: HarnessRequest = {
     ...req,
     userMessage: `${req.userMessage}\n\n${buildResumePreamble(partial)}`,
   };
+  if (execution) resumed.execution = execution;
+  return resumed;
 }
