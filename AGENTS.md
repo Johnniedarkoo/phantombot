@@ -357,6 +357,14 @@ gets ignored. The line goes to the stderr of whichever process has the
 variable set — your terminal in a dev checkout, the TUI's `^l` pane, and the
 service journal only if the daemon itself was started with it.
 
+**Pi turn tracing (`src/lib/piDiagnostics.ts`).** The opt-in
+`PHANTOMBOT_PI_TRACE_DIR` environment variable gives each Pi harness attempt a
+private evidence directory with redacted launch metadata, raw stdout/stderr
+JSONL, completion/usage summaries, child exit state and the owning daemon PID.
+It is diagnostic only: no routing, timeout, retry or compaction behavior may
+depend on it. Raw event files may contain prompts and tool results, so tests
+must use temporary directories and operators must keep the directory private.
+
 ## Credentials
 
 Credentials live in the per-persona encrypted vault. The agent NEVER appends

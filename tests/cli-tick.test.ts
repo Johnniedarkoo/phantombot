@@ -3,7 +3,11 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { previewForLog, runTick } from "../src/cli/tick.ts";
+import {
+  BACKGROUND_WAKE_HARD_TIMEOUT_MS,
+  previewForLog,
+  runTick,
+} from "../src/cli/tick.ts";
 import type { Config } from "../src/config.ts";
 import type {
   Harness,
@@ -716,7 +720,8 @@ describe("runTick — normal task fire", () => {
     expect(code).toBe(0);
     expect(harness.invocations).toBe(1);
     expect(harness.lastRequest?.idleTimeoutMs).toBe(config.harnessIdleTimeoutMs);
-    expect(harness.lastRequest?.hardTimeoutMs).toBe(30 * 60 * 1000);
+    expect(harness.lastRequest?.hardTimeoutMs).toBe(BACKGROUND_WAKE_HARD_TIMEOUT_MS);
+    expect(BACKGROUND_WAKE_HARD_TIMEOUT_MS).toBe(90 * 60 * 1000);
     // The original prompt is still there...
     expect(harness.lastUserMessage).toContain("do the thing");
     // ...followed by the hygiene footer because there's no expiry.

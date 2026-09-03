@@ -423,11 +423,13 @@ export interface HarnessProcessSpec {
   ) => Record<string, unknown>;
   /** Cap for a non-JSON progress note. Omit for the full line (claude/pi). */
   progressNoteLimit?: number;
-   /** Side-effect for each non-JSON stdout line (e.g. provider debug log). */
+  /** Side-effect for every non-empty stdout line, before adapter translation. */
+  onStdoutLine?: (line: string, parsed?: unknown) => void;
+  /** Side-effect for each non-JSON stdout line (e.g. provider debug log). */
   onNonJsonLine?: (line: string) => void;
   /** Per-line stderr handler. Defaults to a debug log tagged with harnessId. */
   onStderrLine?: (line: string) => void;
-   /** Parse the decoder tail after stdout closes, when an adapter needs it. */
+  /** Parse the decoder tail after stdout closes, when an adapter needs it. */
   flushTail?: boolean;
   /**
    * Require an explicit completion signal before treating an exit-0 run as a
@@ -597,6 +599,13 @@ export async function* runHarnessProcess(
         try {
           parsed = JSON.parse(trimmed);
         } catch {
+          try {
+            spec.onStdoutLine?.(line);
+          } catch (error) {
+            log.warn(`${harnessId}.invoke stdout trace failed`, {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
           spec.onNonJsonLine?.(trimmed);
           killer.touch("productive"); // non-JSON line is real output
           yield {
@@ -606,6 +615,13 @@ export async function* runHarnessProcess(
               : trimmed,
           };
           continue;
+        }
+        try {
+          spec.onStdoutLine?.(line, parsed);
+        } catch (error) {
+          log.warn(`${harnessId}.invoke stdout trace failed`, {
+            error: error instanceof Error ? error.message : String(error),
+          });
         }
         yield* consume(parsed);
         if (terminalError) break; // policy violation: drop the rest of the batch
@@ -617,7 +633,15 @@ export async function* runHarnessProcess(
       const tail = buffer.trim();
       if (tail) {
         try {
-          yield* consume(JSON.parse(tail));
+          const parsed = JSON.parse(tail);
+          try {
+            spec.onStdoutLine?.(buffer, parsed);
+          } catch (error) {
+            log.warn(`${harnessId}.invoke stdout trace failed`, {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+          yield* consume(parsed);
         } catch {
           /* drop trailing partial line */
         }

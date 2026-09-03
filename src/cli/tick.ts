@@ -67,7 +67,8 @@ import {
 } from "../orchestrator/durableFacts.ts";
 
 const WAKE_STREAM_PREVIEW_CHARS = 2000;
-const BACKGROUND_WAKE_HARD_TIMEOUT_MS = 30 * 60 * 1000;
+/** Fixed wall-clock cap for productive scheduled-agent wakes. */
+export const BACKGROUND_WAKE_HARD_TIMEOUT_MS = 90 * 60 * 1000;
 
 export function defaultTickLockPath(): string {
   return join(xdgStateHome(), "phantombot", "tick.lock");

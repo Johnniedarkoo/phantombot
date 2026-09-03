@@ -534,6 +534,16 @@ backstop. In-place self-update needs the task installed (`phantombot install`).
 rotates files over 16 MiB and keeps three generations by default; see
 [Service lifecycle](#service-lifecycle-start--stop--restart--logs).
 
+**Pi turn diagnostics (opt-in).** To capture one or more Pi `--print` attempts
+for investigating a stalled tool-heavy turn, set
+`PHANTOMBOT_PI_TRACE_DIR` to a local directory before starting the daemon. Each
+attempt writes `metadata.json`, raw `events.jsonl` stdout/stderr and a
+`summary.json` with Pi completion markers, usage/stop reason, child exit code,
+signal and the owning PhantomBot PID. Raw events can contain conversation and
+tool-result content; keep the directory private and remove it after collecting
+evidence. The setting is unset by default and does not change routing,
+timeouts, compaction or retry behavior.
+
 Status: every pull request runs the full suite and typecheck on Linux. A
 dedicated `windows-latest` job runs typecheck plus a curated set of
 Windows-relevant suites. There is no macOS pull-request runner; macOS and all
@@ -822,6 +832,13 @@ Harness notes:
   fall-through, and `/stop` means stop. One recovery per harness per turn; a
   second wedge falls through to the next harness as before. This is what a
   single-entry chain (`chain = ["pi"]`) gets instead of nothing at all.
+- Scheduled agent wakes fired by `phantombot tick` have a fixed **90-minute
+  productive hard cap**. The separate idle watchdog remains five minutes, so
+  a genuinely silent/wedged harness still fails over promptly; the 90-minute
+  cap only prevents a continuously active turn from running forever.
+- The Pi adapter does not currently perform content-level repetition or
+  tool-call loop detection; its liveness handling distinguishes productive
+  activity from silence, but does not stop a repetitive-but-active turn.
 - Falling back is silent in chat, but not silent to you: if the primary
   harness fails authentication several turns running, phantombot sends you
   one Telegram alert naming the host and which harness is covering for it
