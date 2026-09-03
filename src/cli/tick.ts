@@ -96,13 +96,10 @@ import {
 
 const WAKE_STREAM_PREVIEW_CHARS = 2000;
 /**
- * Total wall-clock budget for ONE background wake, across its whole harness
- * chain (issue #631). The wake child clamps every attempt's hard cap to the
- * time remaining, so a timed-out primary hands the fallback only what is
- * left — the value is unchanged from before the claim-then-dispatch change;
- * it just stopped being PER-HARNESS.
+ * Total wall-clock budget for one background wake across its whole harness
+ * chain. The child clamps each attempt to the remaining time.
  */
-const BACKGROUND_WAKE_HARD_TIMEOUT_MS = 30 * 60 * 1000;
+export const BACKGROUND_WAKE_HARD_TIMEOUT_MS = 90 * 60 * 1000;
 
 export function defaultTickLockPath(): string {
   return join(xdgStateHome(), "phantombot", "tick.lock");

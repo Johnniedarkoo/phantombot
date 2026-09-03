@@ -100,6 +100,11 @@ import type { WriteSink } from "../lib/io.ts";
 
 export const EXPECTED_PI_HEAP_MB = 2_048;
 
+import {
+  createPiTrace,
+  traceError,
+} from "../lib/piDiagnostics.ts";
+
 export interface PiHarnessConfig {
   /**
    * Path to the host `pi` CLI binary (`pi-host` mode). Ignored in native mode,
@@ -749,17 +754,55 @@ export class PiHarness implements Harness {
       this: PiHarness,
       model: string | undefined,
     ): AsyncGenerator<HarnessChunk> {
-      const proc = spawnInNewSession([...this.command(), ...buildArgs(model)], {
-        cwd: req.workingDir,
+      const args = buildArgs(model);
+      const command = [...this.command(), ...args];
+      const trace = await createPiTrace({
+        rootDir: process.env.PHANTOMBOT_PI_TRACE_DIR ?? "",
+        outerPid: process.pid,
+        harnessId: this.id,
+        turnId: req.turnId,
+        persona: req.persona,
+        conversation: req.conversation,
+        workingDir: req.workingDir,
+        model,
+        provider,
+        argv: command,
         env: childEnv,
-        stdin: "ignore",
-        stdout: "pipe",
-        stderr: "pipe",
+        payloadBytes: totalBytes,
+        idleTimeoutMs: req.idleTimeoutMs,
+        hardTimeoutMs: req.hardTimeoutMs,
+        startupTimeoutMs: req.startupTimeoutMs,
+      });
+      let proc: ReturnType<typeof spawnInNewSession>;
+      try {
+        proc = spawnInNewSession(command, {
+          cwd: req.workingDir,
+          env: childEnv,
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+      } catch (error) {
+        trace?.record("spawn_error", { error: traceError(error) });
+        await trace?.close({
+          childPid: undefined,
+          childExitCode: undefined,
+          childSignal: undefined,
+          outerPid: process.pid,
+          completedAt: new Date().toISOString(),
+        });
+        throw error;
+      }
+      trace?.record("spawned", {
+        pid: proc.pid,
+        processGroupLeader: proc.pid,
+        startedAt: new Date().toISOString(),
       });
 
-      // Shared engine. Pi delivers its payload via argv (stdin ignored, so no
-      // stdinPayload), and the terminal `done` meta records the argv byte count.
-      for await (const chunk of runHarnessProcess({
+      try {
+        // Shared engine. Pi delivers its payload via argv (stdin ignored, so no
+        // stdinPayload), and the terminal `done` meta records the argv byte count.
+        for await (const chunk of runHarnessProcess({
         proc,
         req,
         harnessId: this.id,
@@ -768,6 +811,8 @@ export class PiHarness implements Harness {
         activity: piActivity,
         reasoningReplay:
           this.config.reasoningReplay ?? DEFAULT_REASONING_REPLAY,
+        onStdoutLine: (line, parsed) => trace?.recordStdout(line, parsed),
+        onStderrLine: (line) => trace?.recordStderr(line),
         buildDoneMeta: () => ({ harnessId: this.id, payloadBytes: totalBytes }),
         // pi is the only harness with no native terminal `done` in its stream —
         // it derives completion from turn_end (mapped to a `done` marker in
@@ -790,11 +835,29 @@ export class PiHarness implements Harness {
           req.hardTimeoutMs ?? Number.POSITIVE_INFINITY,
           Math.max(req.idleTimeoutMs * 4, 1_200_000),
         ),
-      })) {
-        // The shared runner creates timeout errors after the process is killed;
-        // attach the identity that was chosen before spawning so an
-        // orchestrator continuation can pin the same provider/model.
-        yield chunk.type === "error" ? { ...chunk, execution } : chunk;
+        })) {
+          trace?.recordChunk(chunk as unknown as Record<string, unknown>);
+          // The shared runner creates timeout errors after the process is killed;
+          // attach the identity that was chosen before spawning so an
+          // orchestrator continuation can pin the same provider/model.
+          yield chunk.type === "error" ? { ...chunk, execution } : chunk;
+        }
+      } finally {
+        let exitCode: number | undefined;
+        try {
+          exitCode = await proc.exited;
+        } catch (error) {
+          trace?.record("exit_observation_error", { error: traceError(error) });
+        }
+        const signalCode =
+          (proc as unknown as { signalCode?: string | null }).signalCode ?? undefined;
+        await trace?.close({
+          childPid: proc.pid,
+          childExitCode: exitCode,
+          childSignal: signalCode,
+          outerPid: process.pid,
+          completedAt: new Date().toISOString(),
+        });
       }
     }.bind(this);
 

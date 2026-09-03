@@ -9,6 +9,7 @@ import {
   runTick,
   type RunTaskWakeInput,
   type RunTickInput,
+  BACKGROUND_WAKE_HARD_TIMEOUT_MS,
 } from "../src/cli/tick.ts";
 import type { Config } from "../src/config.ts";
 import type {
@@ -908,13 +909,14 @@ describe("runTick — normal task fire", () => {
     expect(code).toBe(0);
     expect(harness.invocations).toBe(1);
     expect(harness.lastRequest?.idleTimeoutMs).toBe(config.harnessIdleTimeoutMs);
-    // #631: the 30-min wake budget is now a chain-wide deadline, so the
-    // first attempt's hard cap is min(30 min, time-remaining) — a hair under
+    // #631: the 90-minute wake budget is a chain-wide deadline, so each
+    // attempt's hard cap is bounded by the remaining time — a hair under
     // the budget once the clock has ticked, still the full budget in spirit.
     expect(harness.lastRequest?.hardTimeoutMs).toBeGreaterThan(
-      30 * 60 * 1000 - 1_000,
+      BACKGROUND_WAKE_HARD_TIMEOUT_MS - 1_000,
     );
-    expect(harness.lastRequest?.hardTimeoutMs!).toBeLessThanOrEqual(30 * 60 * 1000);
+    expect(harness.lastRequest?.hardTimeoutMs!).toBeLessThanOrEqual(BACKGROUND_WAKE_HARD_TIMEOUT_MS);
+    expect(BACKGROUND_WAKE_HARD_TIMEOUT_MS).toBe(90 * 60 * 1000);
     // The original prompt is still there...
     expect(harness.lastUserMessage).toContain("do the thing");
     // ...followed by the hygiene footer because there's no expiry.
