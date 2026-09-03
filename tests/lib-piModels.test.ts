@@ -29,6 +29,8 @@ describe("parsePiModels", () => {
     expect(models[0]).toEqual({
       provider: "deepseek",
       model: "deepseek-v4-flash",
+      contextWindow: 1_000_000,
+      maxTokens: 384_000,
       supportsImages: false,
     });
     const gpt = findModel(models, "gpt-5.2");
@@ -46,6 +48,14 @@ describe("parsePiModels", () => {
     const models = parsePiModels(SAMPLE);
     expect(findModel(models, "gpt-4")?.supportsImages).toBe(false);
     expect(findModel(models, "amazon/nova-micro-v1")?.supportsImages).toBe(false);
+  });
+
+  test("retains numeric context and max-output values", () => {
+    const models = parsePiModels(SAMPLE);
+    expect(findModel(models, "gpt-5.2")).toMatchObject({
+      contextWindow: 400_000,
+      maxTokens: 128_000,
+    });
   });
 
   test("returns [] when the header is absent (output changed / pi missing)", () => {

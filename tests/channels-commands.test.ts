@@ -756,6 +756,27 @@ describe("/status phantom + models surface", () => {
     );
   });
 
+  test("uses a resolved model context window instead of the generic fallback", async () => {
+    const r = await handleSlashCommand(
+      "/status",
+      ctx({
+        harnesses: [
+          new StubHarness("pi", true, {
+            model: "qwen3.8-27b",
+            provider: "vllm",
+            contextWindow: 128_000,
+            maxTokens: 16_384,
+          }),
+        ],
+      }),
+    );
+    expect(r!.reply).toContain(`/ ${(128_000).toLocaleString()} tokens`);
+    expect(r!.reply).toContain(
+      `context=${(128_000).toLocaleString()}, max-out=${(16_384).toLocaleString()}`,
+    );
+    expect(r!.reply).not.toContain(`/ ${(64_000).toLocaleString()} tokens`);
+  });
+
   test("marks unavailable harnesses in the chain line", async () => {
     const r = await handleSlashCommand(
       "/status",

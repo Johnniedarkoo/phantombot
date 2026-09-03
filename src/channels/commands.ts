@@ -755,6 +755,21 @@ async function formatHarnessChain(harnesses: Harness[]): Promise<string> {
 async function handleStatus(
   ctx: SlashCommandContext,
 ): Promise<SlashCommandResult> {
+  // Pi's model list is dynamic for local vLLM providers. Refresh it before
+  // calculating the denominator so a Qwen restart is visible without a
+  // PhantomBot restart. Other harnesses have no refresh hook and are unchanged.
+  await Promise.all(
+    ctx.harnesses.map(async (h) => {
+      try {
+        await h.refreshModelInfo?.();
+      } catch (error) {
+        log.warn("status: dynamic harness model capability refresh failed", {
+          harness: h.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }),
+  );
   const uptimeS = Math.floor((Date.now() - ctx.startedAt) / 1000);
   const primary = ctx.harnesses[0]?.id ?? "(none)";
   const chain = await formatHarnessChain(ctx.harnesses);
@@ -770,7 +785,8 @@ async function handleStatus(
   );
   const historyChars = recent.reduce((a, t) => a + t.text.length, 0);
   const approxTokens = Math.round(historyChars / 4);
-  const windowTokens = nominalContextWindow(primary);
+  const primaryInfo = ctx.harnesses[0]?.modelInfo?.();
+  const windowTokens = primaryInfo?.contextWindow ?? nominalContextWindow(primary);
   const pct = Math.min(
     100,
     Math.max(0, Math.round((approxTokens / windowTokens) * 100)),
@@ -787,7 +803,11 @@ async function handleStatus(
     .map((h) => {
       const mi = h.modelInfo?.();
       if (!mi) return undefined;
-      return `${h.id}: ${mi.model}${mi.provider ? ` (${mi.provider})` : ""}`;
+      const capability = mi.contextWindow
+        ? `, context=${mi.contextWindow.toLocaleString()}` +
+          (mi.maxTokens ? `, max-out=${mi.maxTokens.toLocaleString()}` : "")
+        : "";
+      return `${h.id}: ${mi.model}${mi.provider ? ` (${mi.provider}` + capability + ")" : capability}`;
     })
     .filter((p): p is string => p !== undefined);
   const modelsLine =

@@ -9,7 +9,8 @@
  * Example row:
  *   openai      gpt-5.2                400K     128K     yes       yes
  *
- * We only need two columns downstream: the fully-qualified model id
+ * Downstream consumers retain the provider/model identity plus the numeric
+ * context and output limits:
  * (`provider/model`, which is what `pi --model` expects) and whether the
  * model accepts image input (the `images` column → multimodal capability).
  *
@@ -30,6 +31,10 @@ export interface PiModel {
    * because that is the string `pi --model` accepts.
    */
   model: string;
+  /** Context capacity printed by Pi, normalized from K/M suffixes. */
+  contextWindow?: number;
+  /** Maximum output printed by Pi, normalized from K/M suffixes. */
+  maxTokens?: number;
   /** Whether the model accepts image input (the `images` column = yes). */
   supportsImages: boolean;
 }
@@ -40,6 +45,23 @@ export interface PiModel {
  * see this header, we return [] rather than mis-parsing arbitrary lines.
  */
 const HEADER_TOKENS = ["provider", "model", "context", "max-out", "thinking", "images"];
+
+/** Parse Pi's human-readable token count (for example `128K` or `1M`). */
+export function parsePiTokenCount(value: string): number | undefined {
+  const match = /^(\d+(?:\.\d+)?)([KMG])?$/i.exec(value.trim());
+  if (!match) return undefined;
+  const amount = Number(match[1]);
+  const multiplier =
+    match[2]?.toUpperCase() === "G"
+      ? 1_000_000_000
+      : match[2]?.toUpperCase() === "M"
+        ? 1_000_000
+        : match[2]?.toUpperCase() === "K"
+          ? 1_000
+          : 1;
+  const result = amount * multiplier;
+  return Number.isSafeInteger(result) && result > 0 ? result : undefined;
+}
 
 function isHeaderLine(line: string): boolean {
   const cols = line.trim().split(/\s+/);
@@ -79,9 +101,13 @@ export function parsePiModels(stdout: string): PiModel[] {
     // `images` is the last column. Read it positionally from the right so a
     // future column insertion in the middle doesn't silently flip the flag.
     const imagesCol = cols[cols.length - 1]!;
+    const contextWindow = parsePiTokenCount(cols[2]!);
+    const maxTokens = parsePiTokenCount(cols[3]!);
     models.push({
       provider,
       model,
+      ...(contextWindow !== undefined ? { contextWindow } : {}),
+      ...(maxTokens !== undefined ? { maxTokens } : {}),
       supportsImages: imagesCol.toLowerCase() === "yes",
     });
   }

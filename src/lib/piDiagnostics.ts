@@ -24,6 +24,9 @@ export interface PiTraceOptions {
   workingDir?: string;
   model?: string;
   provider?: string;
+  /** Last resolved Pi model capabilities, when available to the parent. */
+  contextWindow?: number;
+  maxTokens?: number;
   argv: string[];
   env: Record<string, string | undefined>;
   payloadBytes: number;
@@ -402,6 +405,10 @@ class PiTraceImpl implements PiTrace {
       },
       model: o.model,
       provider: o.provider,
+      modelCapability: {
+        contextWindow: o.contextWindow,
+        maxTokens: o.maxTokens,
+      },
       invocationNumber: o.invocationNumber,
       rawCapture: o.captureRaw === true,
       payloadBytes: o.payloadBytes,

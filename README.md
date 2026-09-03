@@ -1523,6 +1523,18 @@ mirrored into `config.toml` under `[harnesses.pi.routing]` and visible to
 `phantombot doctor`. They can also be changed live from chat with
 [`/model`](#model-management-model).
 
+### Local vLLM context discovery
+
+For the local `vllm` provider, phantombot installs a separate managed Pi
+extension at startup. Pi probes the configured provider's `/v1/models` endpoint
+with a short timeout and uses its numeric `max_model_len` value as the selected
+model's `contextWindow`. The static `models.json` entry remains authoritative
+for model identity, API, reasoning/image support, cost, compatibility, and the
+16,384-token output ceiling. If the endpoint is unavailable or invalid, Pi
+keeps the static metadata and emits a warning. `/status` refreshes Pi's model
+catalog so a Qwen context-profile restart is visible without restarting
+phantombot.
+
 ## Model Management (`/model`)
 
 `/model` shows and switches the model every configured harness runs — from

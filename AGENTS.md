@@ -365,6 +365,18 @@ It is diagnostic only: no routing, timeout, retry or compaction behavior may
 depend on it. Raw event files may contain prompts and tool results, so tests
 must use temporary directories and operators must keep the directory private.
 
+**Local vLLM context is runtime metadata.** The managed
+`pi-extension/dynamic-context/` extension probes the configured local `vllm`
+provider's `/v1/models` during Pi startup, before model resolution, and applies
+only the numeric `max_model_len` value to matching configured model entries.
+Profile names are never a capability map. Static model metadata, including the
+16,384-token output ceiling, must be preserved; probe failure falls back to
+the static entry with a warning. `PiHarness.refreshModelInfo()` uses Pi's
+`--list-models` table for `/status`, and the parser must retain provider, model,
+context, and max-output fields. `--offline` remains enabled: Pi's installed
+0.84.2 semantics permit this localhost extension fetch while disabling Pi's
+own startup network refreshes.
+
 ## Credentials
 
 Credentials live in the per-persona encrypted vault. The agent NEVER appends

@@ -71,6 +71,7 @@ import {
   traceError,
 } from "../lib/piDiagnostics.ts";
 import { xdgDataHome } from "../config.ts";
+import { listPiModels, type PiModel } from "../lib/piModels.ts";
 
 export interface PiHarnessConfig {
   /** Path to the `pi` CLI binary. Default: "pi" (looked up in PATH). */
@@ -93,17 +94,56 @@ export interface PiHarnessConfig {
 
 export class PiHarness implements Harness {
   readonly id = "pi";
+  private resolvedModel?: PiModel;
 
   constructor(private readonly config: PiHarnessConfig) {}
 
   modelInfo(): HarnessModelInfo {
     const r = this.config.routing;
+    const model = r?.primaryModel;
+    const provider = r?.provider;
+    const resolved =
+      this.resolvedModel &&
+      this.resolvedModel.model === model &&
+      this.resolvedModel.provider === provider
+        ? this.resolvedModel
+        : undefined;
     return {
       model: r?.primaryModel ?? "(pi default)",
       provider: r?.provider,
       codingModel: r?.codingModel,
       imageModel: r?.imageModel,
+      ...(resolved?.contextWindow !== undefined
+        ? { contextWindow: resolved.contextWindow }
+        : {}),
+      ...(resolved?.maxTokens !== undefined ? { maxTokens: resolved.maxTokens } : {}),
     };
+  }
+
+  async refreshModelInfo(): Promise<void> {
+    const routing = this.config.routing;
+    if (!routing?.primaryModel || !routing.provider) {
+      this.resolvedModel = undefined;
+      return;
+    }
+    // A refresh is authoritative for the current endpoint. Clear the prior
+    // result first so a dead or malformed endpoint falls back to the static
+    // model metadata instead of leaving a stale context window in /status.
+    this.resolvedModel = undefined;
+    // Status is diagnostic, so keep Pi itself offline too. The managed
+    // extension's localhost fetch still works under this flag; only Pi's
+    // unrelated catalog/network refresh is suppressed.
+    const models = await listPiModels(this.config.bin, undefined, { PI_OFFLINE: "1" });
+    this.resolvedModel = models.find(
+      (model) =>
+        model.provider === routing.provider && model.model === routing.primaryModel,
+    );
+    if (!this.resolvedModel) {
+      log.warn("pi model capability discovery did not resolve the configured model", {
+        provider: routing.provider,
+        model: routing.primaryModel,
+      });
+    }
   }
 
   async available(): Promise<boolean> {
@@ -360,6 +400,8 @@ export class PiHarness implements Harness {
         argv: [this.config.bin, ...args],
         env: childEnv,
         payloadBytes: totalBytes,
+        contextWindow: this.resolvedModel?.contextWindow,
+        maxTokens: this.resolvedModel?.maxTokens,
         idleTimeoutMs: req.idleTimeoutMs,
         hardTimeoutMs: req.hardTimeoutMs,
         startupTimeoutMs: req.startupTimeoutMs,

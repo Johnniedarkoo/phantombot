@@ -87,6 +87,7 @@ import { VERSION } from "../version.ts";
 import { runDoctor } from "./doctor.ts";
 import { spawnNightlySweep } from "../lib/nightlyTrigger.ts";
 import { ensureRoutingExtension } from "../lib/piExtensionProvision.ts";
+import { ensureDynamicContextExtension } from "../lib/piDynamicContextProvision.ts";
 import { reconcileEditorConnectors } from "../connectors/acp/autoInstall.ts";
 
 /**
@@ -807,12 +808,10 @@ export async function runRun(input: RunInput = {}): Promise<number> {
     spawnStartupNightly(p);
   }
 
-  // Self-provision the managed Pi capability-routing extension: when a routable
-  // capability (image and/or coding model) is configured, stamp the embedded
-  // source + a routing.json baked from config into the owned
-  // ~/.pi/agent/extensions/capability-routing/ dir; when none is configured,
-  // remove any previously-stamped dir. Fire-and-forget so a slow or failing
-  // filesystem never blocks startup. `doctor` re-stamps/removes on drift.
+  // Self-provision the managed Pi extensions. Capability routing is conditional
+  // on an image model; dynamic local-provider context discovery is always
+  // present so Pi can probe vLLM before resolving a model. Fire-and-forget so a
+  // slow or failing filesystem never blocks startup.
   // Gated to the real `phantombot` binary (same gate doctor uses for its
   // filesystem-touching checks) so `bun test`/dev never stamp the dev box's
   // real ~/.pi.
@@ -828,6 +827,20 @@ export async function runRun(input: RunInput = {}): Promise<number> {
       },
       (e: unknown) =>
         log.warn("run: pi extension provision failed", {
+          error: (e as Error).message,
+        }),
+    );
+    ensureDynamicContextExtension().then(
+      (r) => {
+        if (r.action !== "unchanged") {
+          log.info("run: provisioned pi dynamic-context extension", {
+            action: r.action,
+            dir: r.dir,
+          });
+        }
+      },
+      (e: unknown) =>
+        log.warn("run: pi dynamic-context extension provision failed", {
           error: (e as Error).message,
         }),
     );
