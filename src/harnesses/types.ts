@@ -331,6 +331,10 @@ export interface HarnessModelInfo {
   imageModel?: string;
   /** Claude's --fallback-model, when configured. */
   fallbackModel?: string;
+  /** Resolved model context capacity, when the harness can discover it. */
+  contextWindow?: number;
+  /** Resolved model output ceiling, when the harness reports it. */
+  maxTokens?: number;
 }
 
 export interface Harness {
@@ -343,6 +347,9 @@ export interface Harness {
    * degrades to omitting the harness from the models line when absent.
    */
   modelInfo?(): HarnessModelInfo;
+
+  /** Refresh dynamic model capability metadata before a diagnostic/status read. */
+  refreshModelInfo?(): Promise<void>;
 
   /**
    * Largest allowable rendered payload (system prompt + history + new

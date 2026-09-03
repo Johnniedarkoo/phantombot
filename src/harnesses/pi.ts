@@ -95,6 +95,7 @@ import {
   nativeExtensionsDir,
   seedEphemeralAgentConfig,
 } from "../lib/nativeAgentDir.ts";
+import { dynamicContextExtensionDir } from "../lib/piDynamicContextProvision.ts";
 import { removePiApiKey } from "../lib/piAuthStore.ts";
 import type { WriteSink } from "../lib/io.ts";
 
@@ -105,6 +106,7 @@ import {
   traceError,
 } from "../lib/piDiagnostics.ts";
 import { xdgDataHome } from "../config.ts";
+import { listPiModels, type PiModel } from "../lib/piModels.ts";
 
 export interface PiHarnessConfig {
   /**
@@ -173,6 +175,7 @@ export interface PiHarnessConfig {
 
 export class PiHarness implements Harness {
   readonly id: string;
+  private resolvedModel?: PiModel;
 
   constructor(private readonly config: PiHarnessConfig) {
     this.id = config.id ?? (config.mode === "native" ? "native" : "pi-host");
@@ -195,12 +198,50 @@ export class PiHarness implements Harness {
       return { model: "(host pi configuration)" };
     }
     const r = this.routing();
+    const model = r?.primaryModel;
+    const provider = r?.provider;
+    const resolved =
+      this.resolvedModel &&
+      this.resolvedModel.model === model &&
+      this.resolvedModel.provider === provider
+        ? this.resolvedModel
+        : undefined;
     return {
       model: r?.primaryModel ?? "(pi default)",
       provider: r?.provider,
       codingModel: r?.codingModel,
       imageModel: r?.imageModel,
+      ...(resolved?.contextWindow !== undefined
+        ? { contextWindow: resolved.contextWindow }
+        : {}),
+      ...(resolved?.maxTokens !== undefined ? { maxTokens: resolved.maxTokens } : {}),
     };
+  }
+
+  async refreshModelInfo(): Promise<void> {
+    const routing = this.routing();
+    if (!routing?.primaryModel || !routing.provider) {
+      this.resolvedModel = undefined;
+      return;
+    }
+    // A refresh is authoritative for the current endpoint. Clear the prior
+    // result first so a dead or malformed endpoint falls back to the static
+    // model metadata instead of leaving a stale context window in /status.
+    this.resolvedModel = undefined;
+    // Status is diagnostic, so keep Pi itself offline too. The managed
+    // extension's localhost fetch still works under this flag; only Pi's
+    // unrelated catalog/network refresh is suppressed.
+    const models = await listPiModels(this.command(), undefined, { PI_OFFLINE: "1" });
+    this.resolvedModel = models.find(
+      (model) =>
+        model.provider === routing.provider && model.model === routing.primaryModel,
+    );
+    if (!this.resolvedModel) {
+      log.warn("pi model capability discovery did not resolve the configured model", {
+        provider: routing.provider,
+        model: routing.primaryModel,
+      });
+    }
   }
 
   async available(): Promise<boolean> {
@@ -292,6 +333,10 @@ export class PiHarness implements Harness {
       );
       if (existsSync(managedExtDir)) {
         baseArgs.push("--extension", managedExtDir);
+      }
+      const dynamicContextExtDir = dynamicContextExtensionDir();
+      if (existsSync(dynamicContextExtDir)) {
+        baseArgs.push("--extension", dynamicContextExtDir);
       }
     }
     // Capability routing: pin the orchestrator model. Without this `--model`
@@ -775,6 +820,8 @@ export class PiHarness implements Harness {
         argv: command,
         env: childEnv,
         payloadBytes: totalBytes,
+        contextWindow: this.resolvedModel?.contextWindow,
+        maxTokens: this.resolvedModel?.maxTokens,
         idleTimeoutMs: req.idleTimeoutMs,
         hardTimeoutMs: req.hardTimeoutMs,
         startupTimeoutMs: req.startupTimeoutMs,
