@@ -337,6 +337,9 @@ describe("runWithFallback — bounded empty-completion finalization", () => {
 
     expect(harness.invocations).toBe(2);
     expect(harness.requests[1]?.userMessage).toContain("The tool work for this turn has completed");
+    expect(harness.requests[1]?.userMessage).toContain("Read: src/example.ts");
+    expect(harness.requests[1]?.userMessage).toContain("I am checking the files first.");
+    expect(harness.requests[1]?.systemPrompt).toBe("system prompt");
     expect(chunks.map((c) => c.type)).toEqual(["text", "progress", "text", "progress", "text", "done"]);
     expect(chunks.filter((c) => c.type === "text").map((c) => c.text)).toEqual([
       "I am checking the files first.",

@@ -470,7 +470,7 @@ export async function* runWithFallback(
             narrationChars: partial.rawText.length,
             finalizationAttempt: emptyCompletionFinalizationAttempts,
           });
-          attemptReq = buildEmptyCompletionRequest(req);
+          attemptReq = buildEmptyCompletionRequest(req, partial);
           resumeRequested = true;
           break;
         }
