@@ -267,8 +267,9 @@ describe("runAsk — pre-tool narration", () => {
       err: new CapturingSink(),
     });
     const prompt = harness.lastRequest?.systemPrompt ?? "";
-    expect(prompt).toContain("Narration before tool calls");
-    expect(prompt).toMatch(/language of the user'?s LATEST message/i);
+    expect(prompt).toContain("# Progress narration and turn completion");
+    expect(prompt).toContain("Every completed turn MUST end with a user-facing final response.");
+    expect(prompt).toMatch(/user'?s language/i);
   });
 
   test("plain ask (no --stream) does NOT enable narration", async () => {
@@ -285,7 +286,7 @@ describe("runAsk — pre-tool narration", () => {
       err: new CapturingSink(),
     });
     const prompt = harness.lastRequest?.systemPrompt ?? "";
-    expect(prompt).not.toContain("Narration before tool calls");
+    expect(prompt).not.toContain("# Progress narration and turn completion");
   });
 });
 
