@@ -294,11 +294,18 @@ describe("runTurn — successful path", () => {
     );
 
     const prompt = captured?.systemPrompt ?? "";
-    expect(prompt).toContain("Narration before tool calls");
-    // Multilingual nudge: the rule must explicitly say "use the user's
-    // language" so non-English speakers don't get English filler leaking
-    // into their conversations.
+    expect(prompt).toContain("# Progress narration and turn completion");
+    expect(prompt).toMatch(/starting a new\s+phase/);
+    expect(prompt).toMatch(/before a potentially long\s+operation/);
+    expect(prompt).toMatch(/after an important\s+milestone/);
+    expect(prompt).toContain("Do not narrate every tool call.");
+    expect(prompt).toContain("If you say you are about to do something next");
+    expect(prompt).toMatch(/perform that action immediately\s+in the same\s+turn\./);
+    expect(prompt).toContain("Every completed turn MUST end with a user-facing final response.");
+    expect(prompt).toContain("mandatory and separate from progress narration");
+    expect(prompt).toMatch(/Chattiness may hide interim\s+progress, but the final response must always be\s+produced\./);
     expect(prompt).toMatch(/user'?s language/i);
+    expect(prompt).not.toContain("before each tool call, say ONE short sentence");
   });
 
   test("toolNarration coexists with systemPromptSuffix — both land in the prompt", async () => {
@@ -323,7 +330,7 @@ describe("runTurn — successful path", () => {
 
     const prompt = captured?.systemPrompt ?? "";
     expect(prompt).toContain("# CUSTOM SUFFIX MARKER");
-    expect(prompt).toContain("Narration before tool calls");
+    expect(prompt).toContain("# Progress narration and turn completion");
   });
 
   test("uses the done chunk's finalText (not the running text accumulation) for persistence", async () => {

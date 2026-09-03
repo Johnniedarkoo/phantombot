@@ -255,7 +255,8 @@ describe("runAsk — pre-tool narration", () => {
       err: new CapturingSink(),
     });
     const prompt = harness.lastRequest?.systemPrompt ?? "";
-    expect(prompt).toContain("Narration before tool calls");
+    expect(prompt).toContain("# Progress narration and turn completion");
+    expect(prompt).toContain("Every completed turn MUST end with a user-facing final response.");
     expect(prompt).toMatch(/user'?s language/i);
   });
 
@@ -273,7 +274,7 @@ describe("runAsk — pre-tool narration", () => {
       err: new CapturingSink(),
     });
     const prompt = harness.lastRequest?.systemPrompt ?? "";
-    expect(prompt).not.toContain("Narration before tool calls");
+    expect(prompt).not.toContain("# Progress narration and turn completion");
   });
 });
 

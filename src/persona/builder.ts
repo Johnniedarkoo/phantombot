@@ -633,8 +633,8 @@ sentences, a channel that asks for one line — that rule wins.`;
  *
  * Framing note: the canonical store is now the phantombot VAULT — a
  * per-persona, encrypted-at-rest secrets database (write via
- * `phantombot vault set`). Secrets are ALWAYS stored in and read from
- * the vault; the plaintext `~/.env` era is over (migrated on startup).
+ * \`phantombot vault set\`). Secrets are ALWAYS stored in and read from
+ * the vault; the plaintext \`~/.env\` era is over (migrated on startup).
  * The vault is a *convenience layer*, not a cage: the agent should still
  * scan creatively for credentials wherever they actually live (git
  * history, config files, keychains, password managers, log lines, …) and
