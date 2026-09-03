@@ -82,6 +82,10 @@ const MAX_TOOL_CALLS = 20;
  */
 export class PartialAttempt {
   private narration = "";
+  /** Text seen since the most recent progress boundary. */
+  private pendingNarration = "";
+  /** Text that a progress boundary proves was consumed as narration. */
+  private consumedNarration = "";
   private readonly tools: string[] = [];
   private toolsDropped = 0;
   private otherProgress = 0;
@@ -91,10 +95,20 @@ export class PartialAttempt {
   record(chunk: HarnessChunk, now = Date.now()): void {
     if (chunk.type === "text") {
       this.narration += chunk.text;
+      this.pendingNarration += chunk.text;
       if (chunk.text.trim().length > 0) this.lastProductiveAtMs = now;
       return;
     }
     if (chunk.type === "progress") {
+      // The channel treats text before a progress event as narration and
+      // consumes it from the candidate final reply. Keep that semantic fact
+      // separate from raw streamed text: Pi's turn_end currently maps to an
+      // empty done chunk even for ordinary no-tool answers, so rawText alone
+      // must not trigger a finalization retry.
+      if (this.pendingNarration.trim().length > 0) {
+        this.consumedNarration += this.pendingNarration;
+        this.pendingNarration = "";
+      }
       // ONLY a structured `chunk.tool` is a started tool call. The chunk
       // contract allows `progress` without `tool` for plain liveness and
       // diagnostic lines (a version warning, a "still working" note), and
@@ -157,6 +171,16 @@ export class PartialAttempt {
   /** The raw, untruncated streamed text, for terminal-`done` reconciliation. */
   get rawText(): string {
     return this.narration;
+  }
+
+  /** Text proven to have been consumed as progress/narration. */
+  get narrationChars(): number {
+    return this.consumedNarration.length;
+  }
+
+  /** Whether any non-blank text was consumed as narration before progress. */
+  get hadNarration(): boolean {
+    return this.consumedNarration.trim().length > 0;
   }
 
   /** Timestamp of the newest meaningful text or structured tool event. */

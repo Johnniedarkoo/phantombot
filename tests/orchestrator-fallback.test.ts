@@ -369,6 +369,50 @@ describe("runWithFallback — bounded empty-completion finalization", () => {
     });
   });
 
+  test("finalizes narrated work even when progress has no structured tool metadata", async () => {
+    const harness = new SequencedHarness("pi", [
+      [
+        { type: "text", text: "I am checking the files first." },
+        { type: "progress", note: "working through the requested files" },
+        { type: "text", text: "The remaining details are now clear." },
+        { type: "progress", note: "finished inspecting the files" },
+        { type: "done", finalText: "" },
+      ],
+      [
+        { type: "text", text: "The requested change is complete." },
+        { type: "done", finalText: "The requested change is complete." },
+      ],
+    ]);
+
+    const chunks = await collect(
+      runWithFallback([harness], newRequest(), { cooldown: new CooldownStore() }),
+    );
+
+    expect(harness.invocations).toBe(2);
+    expect(harness.requests[1]?.userMessage).toContain("I am checking the files first.");
+    expect(chunks.at(-1)).toMatchObject({
+      type: "done",
+      finalText: "The requested change is complete.",
+    });
+  });
+
+  test("does not treat text-only Pi completion as narrated work", async () => {
+    const harness = new FakeHarness("pi", [
+      { type: "text", text: "An ordinary answer." },
+      { type: "done", finalText: "" },
+    ]);
+
+    const chunks = await collect(
+      runWithFallback([harness], newRequest(), { cooldown: new CooldownStore() }),
+    );
+
+    expect(harness.invocations).toBe(1);
+    expect(chunks).toEqual([
+      { type: "text", text: "An ordinary answer." },
+      { type: "done", finalText: "" },
+    ]);
+  });
+
   test("preserves an intentional empty completion with no work", async () => {
     const harness = new FakeHarness("pi", [
       { type: "done", finalText: "" },

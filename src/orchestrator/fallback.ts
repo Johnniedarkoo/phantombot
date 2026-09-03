@@ -414,13 +414,13 @@ export async function* runWithFallback(
           yield chunk;
           return;
         }
-        // Empty `done` = the harness exited cleanly but produced no
-        // assistant text. A clean first attempt that actually narrated and
-        // performed structured tool work gets one bounded same-context
-        // finalization request. This is deliberately before the old
-        // fall-through behavior: the work was completed by this harness, so
-        // asking it to state the result is safer than handing the turn to a
-        // different model or silently surfacing "(no reply)".
+        // Empty `done` = the harness exited cleanly but produced no terminal
+        // assistant text. A clean attempt that demonstrably consumed text as
+        // narration, or performed structured tool work, gets one bounded
+        // same-context finalization request. Raw streamed text alone is not
+        // enough: Pi maps every turn_end to an empty done chunk, including
+        // ordinary no-tool answers. The progress boundary is the shared
+        // stream-level evidence that the text was narration.
         // Stitch a resumed slot's two attempts back together. `done.finalText`
         // is contracted to be the sum of every text chunk the slot emitted, and
         // consumers lean on that: runTurn persists it as the assistant message,
@@ -444,11 +444,24 @@ export async function* runWithFallback(
             : chunk;
         const emptyFinalText =
           emitted.type === "done" && emitted.finalText.trim().length === 0;
+        if (currentTerminalEmpty) {
+          log.info("orchestrator: empty completion observed", {
+            harnessId: harness.id,
+            persona: req.persona,
+            conversation: req.conversation,
+            turnId: req.turnId,
+            rawTextChars: partial.rawText.length,
+            narrationChars: partial.narrationChars,
+            structuredToolCalls: partial.toolCalls.length,
+            nonToolProgress: partial.nonToolProgress,
+            finalizationAttempts: emptyCompletionFinalizationAttempts,
+          });
+        }
         if (
           currentTerminalEmpty &&
           emptyCompletionFinalizationAttempts < MAX_EMPTY_COMPLETION_FINALIZATIONS &&
           partial.rawText.trim().length > 0 &&
-          partial.toolCalls.length > 0
+          (partial.toolCalls.length > 0 || partial.hadNarration)
         ) {
           emptyCompletionFinalizationAttempts++;
           log.warn("orchestrator: empty completion after tool work detected", {
@@ -456,8 +469,10 @@ export async function* runWithFallback(
             persona: req.persona,
             conversation: req.conversation,
             turnId: req.turnId,
-            toolCalls: partial.toolCalls.length,
-            narrationChars: partial.rawText.length,
+            structuredToolCalls: partial.toolCalls.length,
+            rawTextChars: partial.rawText.length,
+            narrationChars: partial.narrationChars,
+            nonToolProgress: partial.nonToolProgress,
             finalizationAttempt: emptyCompletionFinalizationAttempts,
           });
           log.info("orchestrator: empty-completion finalization started", {
@@ -465,8 +480,10 @@ export async function* runWithFallback(
             persona: req.persona,
             conversation: req.conversation,
             turnId: req.turnId,
-            toolCalls: partial.toolCalls.length,
-            narrationChars: partial.rawText.length,
+            structuredToolCalls: partial.toolCalls.length,
+            rawTextChars: partial.rawText.length,
+            narrationChars: partial.narrationChars,
+            nonToolProgress: partial.nonToolProgress,
             finalizationAttempt: emptyCompletionFinalizationAttempts,
           });
           // The current request may itself be a hard/idle continuation. Keep
@@ -486,8 +503,10 @@ export async function* runWithFallback(
             persona: req.persona,
             conversation: req.conversation,
             turnId: req.turnId,
-            toolCalls: partial.toolCalls.length,
-            narrationChars: partial.rawText.length,
+            structuredToolCalls: partial.toolCalls.length,
+            rawTextChars: partial.rawText.length,
+            narrationChars: partial.narrationChars,
+            nonToolProgress: partial.nonToolProgress,
             finalizationAttempt: emptyCompletionFinalizationAttempts,
           });
           yield {

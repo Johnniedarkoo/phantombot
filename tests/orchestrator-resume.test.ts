@@ -112,6 +112,16 @@ describe("PartialAttempt — the chunk log a resume is built from", () => {
     expect(p.text).toBe("Checking the release notes...");
   });
 
+  test("tracks text consumed before a progress boundary as narration", () => {
+    const p = new PartialAttempt();
+    p.record({ type: "text", text: "I am checking the files." });
+    p.record({ type: "progress", note: "working" });
+    p.record({ type: "text", text: "The result is clear." });
+
+    expect(p.hadNarration).toBe(true);
+    expect(p.narrationChars).toBe("I am checking the files.".length);
+  });
+
   test("a structured tool call counts as output even with no text at all", () => {
     const p = new PartialAttempt();
     p.record({
