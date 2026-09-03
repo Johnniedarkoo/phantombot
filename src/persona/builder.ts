@@ -507,58 +507,58 @@ scheduling a self-message, posting on Google Chat, etc.) — the user
 reads notifications on Telegram.`;
 
 /**
- * Optional channel-level overlay: ask the model to narrate one short
- * sentence before each tool call so streaming channels (Telegram text,
- * Twilio voice via `phantombot ask --stream`) have something to render
- * during the silence while a tool runs.
+ * Optional channel-level overlay: keep streaming channels informative without
+ * forcing intent narration before every tool call. The model should surface
+ * occasional progress at meaningful transitions, while the channel decides
+ * whether those interim bubbles are shown (`/chattiness`). The final response
+ * is a separate mandatory part of a completed turn and is never narration.
  *
  * Why a model-driven nudge and not a harness-emitted filler:
- *   - Harness-emitted filler ("checking your email…") would be in
- *     English. Many users converse with the agent in other languages —
- *     the leak is jarring. Letting the model write the line means it
- *     comes out in whatever language the conversation is already in.
- *   - The harnesses already flush text the moment it arrives (Claude
- *     streams partial deltas; Pi/Gemini emit text_delta / message
- *     events one at a time). So as long as the model produces a
- *     sentence BEFORE the tool_use block, that sentence reaches the
- *     channel before the silence — no harness change needed.
+ *   - Harness-emitted filler would be in one fixed language. Letting the model
+ *     write the line means it follows the conversation's language naturally.
+ *   - The harnesses already stream model text as it arrives, so useful progress
+ *     can reach the channel before a long silent operation without fabricating
+ *     synthetic status text in the transport layer.
  *
- * Channels enable this via `TurnInput.toolNarration: true`. Off by
- * default so CLI/nightly turns aren't padded with intent narration.
+ * Channels enable this via `TurnInput.toolNarration: true`. Off by default so
+ * CLI/nightly turns aren't padded with progress narration. The chattiness gate
+ * remains presentation-only: it may hide interim narration, but it must never
+ * suppress the terminal user-facing response.
  *
- * Voice notes (Telegram voice in → voice out) deliberately do NOT
- * enable this — VOICE_REPLY_INSTRUCTION already says "no narration of
- * your work," and voice-note replies are one-shot anyway, so there's
- * no streaming silence to fill.
+ * Voice notes (Telegram voice in → voice out) deliberately do NOT enable this
+ * overlay — VOICE_REPLY_INSTRUCTION already requires one final spoken answer.
  *
  * Exported for testing.
  */
 export const PRE_TOOL_NARRATION_INSTRUCTION =
-  `# Narration before tool calls
+  `# Progress narration and turn completion
 
-You're in a streaming channel — the user sees / hears your reply as
-you produce it, not all at once at the end. While a tool runs the
-channel goes silent, which is unsettling for the user.
+You're in a streaming channel. During substantial work, occasionally give the
+user ONE short progress update at a meaningful transition: when starting a new
+phase, before a potentially long operation, or after an important milestone.
+Routine reads, searches, small edits, and back-to-back tool calls need no
+announcement. Do not narrate every tool call.
 
-Rule: before each tool call, say ONE short sentence describing what
-you're about to do. Then run the tool. Examples:
+Use the user's language. Keep progress updates short (roughly 12 words or less),
+concrete, and non-repetitive. They are status, not a substitute for doing the
+work.
 
-  "Checking your calendar..."
-  "Looking at your email now..."
-  "One sec, asking Home Assistant..."
+If you say you are about to do something next, perform that action immediately
+in the same turn. Never end the turn on future-intent narration such as "Next
+I'll...", "I'll do that now", or "On my way."
 
-Use the user's language — match whatever language the conversation
-is in. (Don't always say it in English. If the user wrote to you in
-Spanish, narrate in Spanish.)
+Every completed turn MUST end with a user-facing final response. That final
+response is mandatory and separate from progress narration. Continue working
+while the user's requested task still has actionable work you can perform with
+the available tools.
 
-One sentence per tool call, no more. Don't pile multiple
-narrations together ahead of time, and don't repeat yourself across
-back-to-back tools — vary the wording. Keep each sentence short
-(under ~12 words) so it's quick to read or speak.
+End the turn only when the requested work is complete, you need information or
+approval from the user, you hit a real blocker, or you deliberately stop after
+substantial work. When work remains, the final response must briefly say what
+you completed, why you are stopping, and the next useful step.
 
-Never narrate after the tool finishes ("got it!", "done!"). The
-narration is purely to fill the pre-tool silence; once the result
-is in, just answer.`;
+Do not use a progress update as the final response. Chattiness may hide interim
+progress, but the final response must always be produced.`;
 
 /**
  * Channel-agnostic conduct overlay: plan-then-confirm before a long or
@@ -633,8 +633,8 @@ sentences, a channel that asks for one line — that rule wins.`;
  *
  * Framing note: the canonical store is now the phantombot VAULT — a
  * per-persona, encrypted-at-rest secrets database (write via
- * \`phantombot vault set\`). Secrets are ALWAYS stored in and read from
- * the vault; the plaintext \`~/.env\` era is over (migrated on startup).
+ * `phantombot vault set`). Secrets are ALWAYS stored in and read from
+ * the vault; the plaintext `~/.env` era is over (migrated on startup).
  * The vault is a *convenience layer*, not a cage: the agent should still
  * scan creatively for credentials wherever they actually live (git
  * history, config files, keychains, password managers, log lines, …) and
