@@ -139,10 +139,6 @@ export async function* runWithFallback(
   // a later harness could receive another one-hour continuation.
   let hardContinuationAttemptsUsed = 0;
   let hardContinuationStarted = false;
-  // A finalization continuation is only for a clean first attempt. Once any
-  // timeout/error/fallback recovery has happened, its own completion state is
-  // no longer the simple empty-after-tool-work case this guard repairs.
-  let recoveryOccurred = false;
   let emptyCompletionFinalizationAttempts = 0;
 
   for (let i = 0; i < chain.length; i++) {
@@ -276,7 +272,6 @@ export async function* runWithFallback(
               req.idleTimeoutMs,
             )
           ) {
-            recoveryOccurred = true;
             hardContinuationAttemptsUsed++;
             hardContinuationStarted = true;
             const continuationState = {
@@ -324,7 +319,6 @@ export async function* runWithFallback(
             !hardContinuationStarted &&
             shouldResume(chunk, partial, resumeAttemptsUsed)
           ) {
-            recoveryOccurred = true;
             resumeAttemptsUsed++;
             log.warn(
               "orchestrator: harness wedged after producing output — resuming with context",
@@ -391,7 +385,6 @@ export async function* runWithFallback(
                 httpStatus: chunk.httpStatus,
               },
             );
-            recoveryOccurred = true;
             // Cool the harness off — esp. fast for 4XX (the harness
             // detected an upstream auth/quota/capacity issue and we
             // don't want to keep slamming it). markFailure() handles
@@ -438,6 +431,13 @@ export async function* runWithFallback(
         // history and from voice, and — because the stream no longer matches
         // its own prefix — make the transports resend the recovery text. So the
         // terminal chunk describes the whole stream, not just its tail.
+        // Inspect the terminal answer from THIS attempt before stitching any
+        // narration carried from an earlier recovery attempt into the public
+        // done chunk. The stitch is correct for ordinary recovered replies,
+        // but must not hide an empty current terminal answer from the bounded
+        // finalizer.
+        const currentTerminalEmpty =
+          chunk.type === "done" && chunk.finalText.trim().length === 0;
         const emitted: HarnessChunk =
           chunk.type === "done" && carriedText.length > 0
             ? { ...chunk, finalText: carriedText + chunk.finalText }
@@ -445,8 +445,7 @@ export async function* runWithFallback(
         const emptyFinalText =
           emitted.type === "done" && emitted.finalText.trim().length === 0;
         if (
-          emptyFinalText &&
-          !recoveryOccurred &&
+          currentTerminalEmpty &&
           emptyCompletionFinalizationAttempts < MAX_EMPTY_COMPLETION_FINALIZATIONS &&
           partial.rawText.trim().length > 0 &&
           partial.toolCalls.length > 0
@@ -470,12 +469,16 @@ export async function* runWithFallback(
             narrationChars: partial.rawText.length,
             finalizationAttempt: emptyCompletionFinalizationAttempts,
           });
-          attemptReq = buildEmptyCompletionRequest(req, partial);
+          // The current request may itself be a hard/idle continuation. Keep
+          // that established context, but do not carry its narration into the
+          // finalizer's terminal answer: it was already streamed as progress.
+          carriedText = "";
+          attemptReq = buildEmptyCompletionRequest(attemptReq, partial);
           resumeRequested = true;
           break;
         }
         if (
-          emptyFinalText &&
+          currentTerminalEmpty &&
           emptyCompletionFinalizationAttempts >= MAX_EMPTY_COMPLETION_FINALIZATIONS
         ) {
           log.error("orchestrator: empty-completion finalization also empty", {
@@ -515,7 +518,6 @@ export async function* runWithFallback(
           // push. The cost of a flake is one wasted round-trip.
           alerter.noteFailure(harness.id, "empty reply");
           firstFailure ??= { harnessId: harness.id, error: "empty reply" };
-          recoveryOccurred = true;
           recoverableError = true;
           break;
         }
@@ -564,7 +566,6 @@ export async function* runWithFallback(
     // ── end resume-with-context ───────────────────────────────────────
 
     if (thrown !== undefined) {
-      recoveryOccurred = true;
       const error = describeInvokeThrow(harness.id, thrown);
       if (!isLast) {
         log.warn("orchestrator: harness threw, falling through", {

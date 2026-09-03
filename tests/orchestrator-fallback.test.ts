@@ -413,6 +413,39 @@ describe("runWithFallback — bounded empty-completion finalization", () => {
     expect(harness.invocations).toBe(1);
     expect(chunks).toEqual([{ type: "error", error: "pi timed out", recoverable: false }]);
   });
+
+  test("finalizes after a productive hard-timeout continuation", async () => {
+    const harness = new SequencedHarness("pi", [
+      [
+        { type: "text", text: "I started the requested change." },
+        toolProgress,
+        { type: "error", error: "hard boundary", recoverable: true, killCause: "timeout" },
+      ],
+      [
+        { type: "text", text: "The resumed process checked the remaining files." },
+        { type: "progress", note: "tool: Read", tool: { title: "Read: package.json", kind: "read", locations: [] } },
+        { type: "done", finalText: "" },
+      ],
+      [
+        { type: "text", text: "The work is complete." },
+        { type: "done", finalText: "The work is complete." },
+      ],
+    ]);
+
+    const chunks = await collect(
+      runWithFallback([harness], newRequest({ hardTimeoutMs: 5_000 }), {
+        cooldown: new CooldownStore(),
+      }),
+    );
+
+    expect(harness.invocations).toBe(3);
+    expect(harness.requests[2]?.userMessage).toContain("The tool work for this turn has completed");
+    expect(harness.requests[2]?.userMessage).toContain("package.json");
+    expect(chunks.at(-1)).toMatchObject({
+      type: "done",
+      finalText: "The work is complete.",
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
