@@ -253,7 +253,11 @@ describe("parsePiEvent", () => {
     expect(parsePiEvent({ type: "turn_end", message: {}, toolResults: [] })).toEqual({
       type: "done",
       finalText: "",
-      meta: undefined,
+      meta: {
+        completionMarker: "turn_end",
+        nativeTerminalTextEmpty: true,
+        nativeTerminalTextChars: 0,
+      },
     });
     expect(parsePiEvent({ type: "agent_end", messages: [] })).toBeUndefined();
   });

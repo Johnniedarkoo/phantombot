@@ -12,6 +12,71 @@ afterEach(async () => {
 });
 
 describe("Pi diagnostic traces", () => {
+  test("writes compact lifecycle and model-call diagnostics without raw prompt streams", async () => {
+    const root = await mkdtemp(join(tmpdir(), "phantombot-pi-compact-trace-test-"));
+    tempDirs.push(root);
+    const trace = await createPiTrace({
+      rootDir: root,
+      outerPid: 123,
+      harnessId: "pi",
+      turnId: "turn-compact",
+      persona: "phantom",
+      conversation: "test",
+      workingDir: root,
+      model: "qwen3.8-27b",
+      provider: "vllm",
+      argv: ["pi", "--mode", "json"],
+      env: {},
+      payloadBytes: 42,
+      idleTimeoutMs: 300000,
+      captureRaw: false,
+    });
+    expect(trace).toBeDefined();
+
+    trace!.recordStdout('{"type":"message_start","message":{"role":"assistant","model":"qwen3.8-27b","provider":"vllm"}}', {
+      type: "message_start",
+      message: { role: "assistant", model: "qwen3.8-27b", provider: "vllm" },
+    });
+    trace!.recordStdout('{"type":"message_update","usage":{"input":100,"output":8},"assistantMessageEvent":{"type":"text_delta","delta":"narration"}}', {
+      type: "message_update",
+      usage: { input: 100, output: 8 },
+      assistantMessageEvent: { type: "text_delta", delta: "narration" },
+    });
+    trace!.recordStdout('{"type":"message_end","message":{"role":"assistant","stopReason":"length","usage":{"input":100,"output":8,"reasoning":7,"cacheRead":20,"totalTokens":128},"content":[{"type":"text","text":"narration"}]}}', {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        stopReason: "length",
+        usage: { input: 100, output: 8, reasoning: 7, cacheRead: 20, totalTokens: 128 },
+        content: [{ type: "text", text: "narration" }],
+      },
+    });
+    trace!.recordStdout('{"type":"compaction_start","reason":"overflow","tokensBefore":64000}', {
+      type: "compaction_start",
+      reason: "overflow",
+      tokensBefore: 64000,
+    });
+    trace!.recordStderr("private stderr detail");
+    await trace!.close({ childPid: 456, childExitCode: 0, childSignal: undefined });
+
+    const events = await readFile(join(trace!.dir, "events.jsonl"), "utf8");
+    const summary = JSON.parse(await readFile(join(trace!.dir, "summary.json"), "utf8")) as Record<string, any>;
+    expect(events).toContain('"kind":"model_call_end"');
+    expect(events).toContain('"kind":"process_exit"');
+    expect(events).not.toContain("private stderr detail");
+    expect(summary.modelCalls).toHaveLength(1);
+    expect(summary.lastModelCall.stopReason).toBe("length");
+    expect(summary.modelCalls[0]).toMatchObject({
+      stopReason: "length",
+      inputTokens: 100,
+      outputTokens: 8,
+      reasoningTokens: 7,
+      cachedInputTokens: 20,
+      visibleTextChars: 9,
+    });
+    expect(summary.diagnostics.requestBudget).toContain("does not expose");
+  });
+
   test("persists raw streams and structured completion state without writing argv secrets", async () => {
     const root = await mkdtemp(join(tmpdir(), "phantombot-pi-trace-test-"));
     tempDirs.push(root);

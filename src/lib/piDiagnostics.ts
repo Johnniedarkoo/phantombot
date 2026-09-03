@@ -1,11 +1,11 @@
 /**
- * Opt-in Pi turn tracing for diagnosing interrupted --print runs.
+ * Compact Pi invocation tracing for diagnosing interrupted --print runs.
  *
- * Set PHANTOMBOT_PI_TRACE_DIR to enable it. Each Pi attempt gets its own
- * directory containing metadata.json, events.jsonl, and summary.json. The
- * events file intentionally keeps the raw Pi stdout/stderr lines: it is local
- * diagnostic evidence and may contain prompt or tool-result content, so this
- * feature is off unless the operator explicitly enables it.
+ * Every Pi harness attempt gets a small trace directory containing
+ * metadata.json, events.jsonl, and summary.json. Raw stdout/stderr is retained
+ * only when the operator explicitly sets PHANTOMBOT_PI_TRACE_DIR; the default
+ * trace is deliberately summary-only so prompts and tool results do not enter
+ * the normal diagnostic log.
  */
 
 import { appendFileSync } from "node:fs";
@@ -30,6 +30,10 @@ export interface PiTraceOptions {
   idleTimeoutMs: number;
   hardTimeoutMs?: number;
   startupTimeoutMs?: number;
+  /** Keep raw Pi stdout/stderr lines (explicit diagnostic opt-in only). */
+  captureRaw?: boolean;
+  /** Invocation number within this logical harness call (1-based). */
+  invocationNumber?: number;
 }
 
 export interface PiTrace {
@@ -68,6 +72,28 @@ function safeValue(value: unknown): unknown {
   return String(value);
 }
 
+function numeric(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function messageTextStats(message: Record<string, unknown>): Record<string, number> {
+  const content = Array.isArray(message.content) ? message.content : [];
+  let visibleTextChars = 0;
+  let thinkingChars = 0;
+  let toolCalls = 0;
+  for (const part of content) {
+    if (!isRecord(part)) continue;
+    if (part.type === "text" && typeof part.text === "string") visibleTextChars += part.text.length;
+    if (part.type === "thinking" && typeof part.thinking === "string") thinkingChars += part.thinking.length;
+    if (part.type === "toolCall") toolCalls++;
+  }
+  return { visibleTextChars, thinkingChars, toolCalls };
+}
+
 function eventSummary(parsed: unknown): Record<string, unknown> | undefined {
   if (!isRecord(parsed)) return undefined;
   const message = isRecord(parsed.message) ? parsed.message : undefined;
@@ -79,8 +105,15 @@ function eventSummary(parsed: unknown): Record<string, unknown> | undefined {
     "retry",
     "usage",
     "model",
+    "provider",
+    "contextWindow",
+    "maxTokens",
+    "effectiveMaxTokens",
     "errorMessage",
     "reason",
+    "tokensBefore",
+    "tokensAfter",
+    "estimatedTokensAfter",
   ]) {
     if (key in parsed) summary[key] = safeValue(parsed[key]);
     else if (message && key in message) summary[`message_${key}`] = safeValue(message[key]);
@@ -88,6 +121,10 @@ function eventSummary(parsed: unknown): Record<string, unknown> | undefined {
   if (message) {
     if (typeof message.role === "string") summary.messageRole = message.role;
     if (typeof message.model === "string") summary.messageModel = message.model;
+    if (typeof message.provider === "string") summary.messageProvider = message.provider;
+    for (const key of ["contextWindow", "maxTokens", "effectiveMaxTokens"]) {
+      if (key in message) summary[`message_${key}`] = safeValue(message[key]);
+    }
   }
   return Object.keys(summary).length > 0 ? summary : undefined;
 }
@@ -143,6 +180,11 @@ class PiTraceImpl implements PiTrace {
   private lastUsage: unknown;
   private lastStopReason: unknown;
   private lifecycle: string[] = [];
+  private readonly modelCalls: Array<Record<string, unknown>> = [];
+  private textDeltaChars = 0;
+  private thinkingDeltaChars = 0;
+  private toolExecutionStarts = 0;
+  private stderrChars = 0;
 
   constructor(private readonly options: PiTraceOptions, dir: string) {
     this.dir = dir;
@@ -177,15 +219,86 @@ class PiTraceImpl implements PiTrace {
       if ("message_usage" in summary) this.lastUsage = summary.message_usage;
       if ("stopReason" in summary) this.lastStopReason = summary.stopReason;
       if ("message_stopReason" in summary) this.lastStopReason = summary.message_stopReason;
+
+      const type = summary.type;
+      const record = isRecord(parsed) ? parsed : undefined;
+      const message = record && isRecord(record.message) ? record.message : undefined;
+      if (type === "message_update" && record) {
+        const assistantEvent = isRecord(record.assistantMessageEvent)
+          ? record.assistantMessageEvent
+          : undefined;
+        const delta = assistantEvent?.delta;
+        if (assistantEvent?.type === "text_delta" && typeof delta === "string") {
+          this.textDeltaChars += delta.length;
+        } else if (
+          typeof assistantEvent?.type === "string" &&
+          assistantEvent.type.includes("thinking") &&
+          typeof delta === "string"
+        ) {
+          this.thinkingDeltaChars += delta.length;
+        }
+      }
+      if (type === "tool_execution_start") this.toolExecutionStarts++;
+
+      if (type === "message_start" && message?.role === "assistant") {
+        const call: Record<string, unknown> = {
+          call: this.modelCalls.length + 1,
+          startedAt: now(),
+          model: stringValue(message.model) ?? stringValue(record?.model),
+          provider: stringValue(message.provider) ?? stringValue(record?.provider),
+          contextWindow: numeric(message.contextWindow) ?? numeric(record?.contextWindow),
+          configuredMaxTokens: numeric(message.maxTokens) ?? numeric(record?.maxTokens),
+          effectiveMaxTokens:
+            numeric(message.effectiveMaxTokens) ?? numeric(record?.effectiveMaxTokens),
+        };
+        const cleaned = Object.fromEntries(Object.entries(call).filter(([, v]) => v !== undefined));
+        this.modelCalls.push(cleaned);
+        this.record("model_call_start", cleaned);
+      }
+      if (type === "message_end" && message?.role === "assistant") {
+        const usage = isRecord(message.usage) ? message.usage : undefined;
+        const stats = messageTextStats(message);
+        const existing = this.modelCalls.at(-1) ?? { call: this.modelCalls.length + 1 };
+        const ended: Record<string, unknown> = {
+          ...existing,
+          endedAt: now(),
+          model: existing.model ?? stringValue(message.model) ?? stringValue(record?.model),
+          provider: existing.provider ?? stringValue(message.provider) ?? stringValue(record?.provider),
+          stopReason: stringValue(message.stopReason) ?? stringValue(record?.stopReason),
+          inputTokens: numeric(usage?.input),
+          outputTokens: numeric(usage?.output),
+          reasoningTokens: numeric(usage?.reasoning),
+          cachedInputTokens: numeric(usage?.cacheRead),
+          cacheWriteTokens: numeric(usage?.cacheWrite),
+          totalTokens: numeric(usage?.totalTokens),
+          ...stats,
+        };
+        const cleaned = Object.fromEntries(Object.entries(ended).filter(([, v]) => v !== undefined));
+        if (this.modelCalls.length === 0) this.modelCalls.push(cleaned);
+        else this.modelCalls[this.modelCalls.length - 1] = cleaned;
+        this.record("model_call_end", cleaned);
+      }
+
+      // Keep compact traces bounded: lifecycle markers and model summaries are
+      // useful; per-token message_update events are not.
+      if (type !== "message_update" && type !== "session") {
+        this.record("pi_event", { event: summary });
+      }
     }
-    this.record("stdout", {
-      raw: line,
-      ...(summary ? { event: summary } : {}),
-    });
+    if (this.options.captureRaw) {
+      this.record("stdout", {
+        raw: line,
+        ...(summary ? { event: summary } : {}),
+      });
+    }
   }
 
   recordStderr(line: string): void {
-    this.record("stderr", { raw: line });
+    this.stderrChars += line.length;
+    this.record("stderr", {
+      chars: line.length,
+      ...(this.options.captureRaw ? { raw: line } : {}),
+    });
   }
 
   recordChunk(chunk: Record<string, unknown>): void {
@@ -197,12 +310,25 @@ class PiTraceImpl implements PiTrace {
 
   async close(summary: Record<string, unknown>): Promise<void> {
     if (this.closed) return;
+    this.record("process_exit", {
+      pid: summary.childPid,
+      exitCode: summary.childExitCode,
+      signal: summary.childSignal,
+    });
     this.record("trace_end", {
       ...summary,
       lastEvent: this.lastEvent,
       lastUsage: this.lastUsage,
       lastStopReason: this.lastStopReason,
+      lastModelCall: this.modelCalls.at(-1),
       lifecycle: this.lifecycle,
+      modelCalls: this.modelCalls,
+      counters: {
+        textDeltaChars: this.textDeltaChars,
+        thinkingDeltaChars: this.thinkingDeltaChars,
+        toolExecutionStarts: this.toolExecutionStarts,
+        stderrChars: this.stderrChars,
+      },
     });
     await this.pending;
     this.closed = true;
@@ -217,7 +343,19 @@ class PiTraceImpl implements PiTrace {
             lastEvent: this.lastEvent,
             lastUsage: this.lastUsage,
             lastStopReason: this.lastStopReason,
+            lastModelCall: this.modelCalls.at(-1),
             lifecycle: this.lifecycle,
+            modelCalls: this.modelCalls,
+            counters: {
+              textDeltaChars: this.textDeltaChars,
+              thinkingDeltaChars: this.thinkingDeltaChars,
+              toolExecutionStarts: this.toolExecutionStarts,
+              stderrChars: this.stderrChars,
+            },
+            diagnostics: {
+              requestBudget: "Pi JSON mode does not expose the outbound effective max_tokens value",
+              contextWindow: "not present in Pi JSON lifecycle events unless supplied by the provider",
+            },
           },
           null,
           2,
@@ -264,6 +402,8 @@ class PiTraceImpl implements PiTrace {
       },
       model: o.model,
       provider: o.provider,
+      invocationNumber: o.invocationNumber,
+      rawCapture: o.captureRaw === true,
       payloadBytes: o.payloadBytes,
       timeouts: {
         idleMs: o.idleTimeoutMs,
@@ -284,7 +424,10 @@ export async function createPiTrace(options: PiTraceOptions): Promise<PiTrace | 
   const dir = join(root, `${stamp}-${options.turnId ?? "no-turn"}-${randomUUID()}`);
   try {
     await mkdir(dir, { recursive: true });
-    const trace = new PiTraceImpl(options, dir);
+    const trace = new PiTraceImpl(
+      { ...options, captureRaw: options.captureRaw ?? true },
+      dir,
+    );
     await writeFile(join(dir, "metadata.json"), JSON.stringify(trace.metadata(), null, 2) + "\n", "utf8");
     activeTraces.add(trace);
     installPiTraceProcessObservers();

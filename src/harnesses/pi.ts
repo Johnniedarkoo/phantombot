@@ -38,6 +38,7 @@
  */
 
 import { access, constants } from "node:fs/promises";
+import { join } from "node:path";
 import type {
   Harness,
   HarnessChunk,
@@ -69,6 +70,7 @@ import {
   createPiTrace,
   traceError,
 } from "../lib/piDiagnostics.ts";
+import { xdgDataHome } from "../config.ts";
 
 export interface PiHarnessConfig {
   /** Path to the `pi` CLI binary. Default: "pi" (looked up in PATH). */
@@ -335,13 +337,18 @@ export class PiHarness implements Harness {
      * subprocess per attempt (the shared engine arms its own kill coordinator
      * per spawn), same temp payload files (model-independent) and child env.
      */
+    let invocationNumber = 0;
     const runAttempt = async function* (
       this: PiHarness,
       model: string | undefined,
     ): AsyncGenerator<HarnessChunk> {
       const args = buildArgs(model);
+      invocationNumber++;
+      const explicitTraceRoot = process.env.PHANTOMBOT_PI_TRACE_DIR?.trim();
+      const traceRoot =
+        explicitTraceRoot || join(xdgDataHome(), "phantombot", "pi-traces");
       const trace = await createPiTrace({
-        rootDir: process.env.PHANTOMBOT_PI_TRACE_DIR ?? "",
+        rootDir: traceRoot,
         outerPid: process.pid,
         harnessId: this.id,
         turnId: req.turnId,
@@ -356,6 +363,8 @@ export class PiHarness implements Harness {
         idleTimeoutMs: req.idleTimeoutMs,
         hardTimeoutMs: req.hardTimeoutMs,
         startupTimeoutMs: req.startupTimeoutMs,
+        captureRaw: Boolean(explicitTraceRoot),
+        invocationNumber,
       });
       let proc: ReturnType<typeof spawnInNewSession>;
       try {
@@ -394,7 +403,12 @@ export class PiHarness implements Harness {
         activity: piActivity,
         onStdoutLine: (line, parsed) => trace?.recordStdout(line, parsed),
         onStderrLine: (line) => trace?.recordStderr(line),
-        buildDoneMeta: () => ({ harnessId: this.id, payloadBytes: totalBytes }),
+        buildDoneMeta: (_finalText, captured) => ({
+          harnessId: this.id,
+          payloadBytes: totalBytes,
+          harnessDoneSynthesized: true,
+          ...(captured ?? {}),
+        }),
         // pi is the only harness with no native terminal `done` in its stream —
         // it derives completion from turn_end (mapped to a `done` marker in
         // parsePiEvent). Require that marker before accepting an exit-0 run as a
@@ -659,7 +673,23 @@ export function parsePiEvent(parsed: unknown): HarnessChunk | undefined {
   // (double work, not a wrong answer) — whereas the pre-fix behaviour returned
   // the trimmed narration as if it were the answer.
   if (obj.type === "turn_end") {
-    return { type: "done", finalText: "", meta: undefined };
+    const terminalMessage = isObject(obj.message) ? obj.message : undefined;
+    const terminalContent = terminalMessage && Array.isArray(terminalMessage.content)
+      ? terminalMessage.content
+      : [];
+    const nativeTerminalTextChars = terminalContent.reduce((total, part) => {
+      if (!isObject(part) || part.type !== "text" || typeof part.text !== "string") return total;
+      return total + part.text.length;
+    }, 0);
+    return {
+      type: "done",
+      finalText: "",
+      meta: {
+        completionMarker: "turn_end",
+        nativeTerminalTextEmpty: nativeTerminalTextChars === 0,
+        nativeTerminalTextChars,
+      },
+    };
   }
 
   if (obj.type !== "message_update") return undefined;
