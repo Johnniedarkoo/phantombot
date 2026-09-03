@@ -38,6 +38,27 @@ class FakeHarness implements Harness {
   }
 }
 
+class SequencedHarness implements Harness {
+  invocations = 0;
+  readonly requests: HarnessRequest[] = [];
+
+  constructor(
+    public readonly id: string,
+    private readonly scripts: HarnessChunk[][],
+  ) {}
+
+  async available(): Promise<boolean> {
+    return true;
+  }
+
+  async *invoke(req: HarnessRequest): AsyncGenerator<HarnessChunk> {
+    this.requests.push(req);
+    const script = this.scripts[Math.min(this.invocations, this.scripts.length - 1)] ?? [];
+    this.invocations++;
+    for (const c of script) yield c;
+  }
+}
+
 /**
  * A harness whose `invoke()` THROWS instead of yielding an error chunk —
  * the shape of a spawn failure (`Bun.spawn` throws E2BIG/ENOENT/EACCES
@@ -283,6 +304,111 @@ describe("runWithFallback — empty done falls through", () => {
     expect(last && last.type === "done" ? last.finalText : "").toBe(
       "real reply",
     );
+  });
+});
+
+describe("runWithFallback — bounded empty-completion finalization", () => {
+  const toolProgress = {
+    type: "progress" as const,
+    note: "tool: Read",
+    tool: { title: "Read: src/example.ts", kind: "read" as const, locations: [] },
+  };
+
+  test("finalizes a tool-work turn exactly once without turning narration into the answer", async () => {
+    const harness = new SequencedHarness("pi", [
+      [
+        { type: "text", text: "I am checking the files first." },
+        toolProgress,
+        { type: "text", text: "The relevant change is now identified." },
+        { type: "progress", note: "tool: Read", tool: { title: "Read: README.md", kind: "read", locations: [] } },
+        { type: "done", finalText: "" },
+      ],
+      [
+        { type: "text", text: "The requested change is complete." },
+        { type: "done", finalText: "The requested change is complete." },
+      ],
+    ]);
+
+    const chunks = await collect(
+      runWithFallback([harness], newRequest({ persona: "claire", conversation: "test:1", turnId: "turn-1" }), {
+        cooldown: new CooldownStore(),
+      }),
+    );
+
+    expect(harness.invocations).toBe(2);
+    expect(harness.requests[1]?.userMessage).toContain("The tool work for this turn has completed");
+    expect(chunks.map((c) => c.type)).toEqual(["text", "progress", "text", "progress", "text", "done"]);
+    expect(chunks.filter((c) => c.type === "text").map((c) => c.text)).toEqual([
+      "I am checking the files first.",
+      "The relevant change is now identified.",
+      "The requested change is complete.",
+    ]);
+    expect(chunks.at(-1)).toMatchObject({
+      type: "done",
+      finalText: "The requested change is complete.",
+    });
+  });
+
+  test("does not finalize an ordinary non-empty answer", async () => {
+    const harness = new FakeHarness("pi", [
+      toolProgress,
+      { type: "done", finalText: "Completed successfully." },
+    ]);
+
+    const chunks = await collect(
+      runWithFallback([harness], newRequest(), { cooldown: new CooldownStore() }),
+    );
+
+    expect(harness.invocations).toBe(1);
+    expect(chunks.at(-1)).toMatchObject({
+      type: "done",
+      finalText: "Completed successfully.",
+    });
+  });
+
+  test("preserves an intentional empty completion with no work", async () => {
+    const harness = new FakeHarness("pi", [
+      { type: "done", finalText: "" },
+    ]);
+
+    const chunks = await collect(
+      runWithFallback([harness], newRequest(), { cooldown: new CooldownStore() }),
+    );
+
+    expect(harness.invocations).toBe(1);
+    expect(chunks).toEqual([{ type: "done", finalText: "" }]);
+  });
+
+  test("reports a bounded anomaly when finalization is also empty", async () => {
+    const harness = new SequencedHarness("pi", [
+      [toolProgress, { type: "text", text: "Working through the files." }, { type: "done", finalText: "" }],
+      [{ type: "done", finalText: "" }],
+    ]);
+
+    const chunks = await collect(
+      runWithFallback([harness], newRequest(), { cooldown: new CooldownStore() }),
+    );
+
+    expect(harness.invocations).toBe(2);
+    expect(chunks.filter((c) => c.type === "done")).toHaveLength(0);
+    expect(chunks.at(-1)).toMatchObject({
+      type: "error",
+      recoverable: false,
+      error: expect.stringContaining("bounded finalization attempt"),
+    });
+  });
+
+  test("does not finalize a timeout/error path", async () => {
+    const harness = new FakeHarness("pi", [
+      { type: "error", error: "pi timed out", recoverable: false },
+    ]);
+
+    const chunks = await collect(
+      runWithFallback([harness], newRequest(), { cooldown: new CooldownStore() }),
+    );
+
+    expect(harness.invocations).toBe(1);
+    expect(chunks).toEqual([{ type: "error", error: "pi timed out", recoverable: false }]);
   });
 });
 

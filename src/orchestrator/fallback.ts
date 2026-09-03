@@ -61,6 +61,10 @@ import {
   MAX_HARD_CONTINUATIONS,
   shouldContinueAfterHardTimeout,
 } from "./hardContinuation.ts";
+import {
+  buildEmptyCompletionRequest,
+  MAX_EMPTY_COMPLETION_FINALIZATIONS,
+} from "./emptyCompletion.ts";
 
 export interface RunWithFallbackOptions {
   /**
@@ -135,6 +139,11 @@ export async function* runWithFallback(
   // a later harness could receive another one-hour continuation.
   let hardContinuationAttemptsUsed = 0;
   let hardContinuationStarted = false;
+  // A finalization continuation is only for a clean first attempt. Once any
+  // timeout/error/fallback recovery has happened, its own completion state is
+  // no longer the simple empty-after-tool-work case this guard repairs.
+  let recoveryOccurred = false;
+  let emptyCompletionFinalizationAttempts = 0;
 
   for (let i = 0; i < chain.length; i++) {
     // Short-circuit if the channel layer has already aborted — otherwise
@@ -267,6 +276,7 @@ export async function* runWithFallback(
               req.idleTimeoutMs,
             )
           ) {
+            recoveryOccurred = true;
             hardContinuationAttemptsUsed++;
             hardContinuationStarted = true;
             const continuationState = {
@@ -314,6 +324,7 @@ export async function* runWithFallback(
             !hardContinuationStarted &&
             shouldResume(chunk, partial, resumeAttemptsUsed)
           ) {
+            recoveryOccurred = true;
             resumeAttemptsUsed++;
             log.warn(
               "orchestrator: harness wedged after producing output — resuming with context",
@@ -380,6 +391,7 @@ export async function* runWithFallback(
                 httpStatus: chunk.httpStatus,
               },
             );
+            recoveryOccurred = true;
             // Cool the harness off — esp. fast for 4XX (the harness
             // detected an upstream auth/quota/capacity issue and we
             // don't want to keep slamming it). markFailure() handles
@@ -410,12 +422,12 @@ export async function* runWithFallback(
           return;
         }
         // Empty `done` = the harness exited cleanly but produced no
-        // assistant text (gemini SIGTERMed mid-stream by an updater
-        // restart, or a tool-only run with no final message). On a
-        // non-last harness, fall through — pi getting a chance is far
-        // better than the user seeing "(no reply)". On the last harness,
-        // yield it and let the channel surface "(no reply)" so the user
-        // knows something happened.
+        // assistant text. A clean first attempt that actually narrated and
+        // performed structured tool work gets one bounded same-context
+        // finalization request. This is deliberately before the old
+        // fall-through behavior: the work was completed by this harness, so
+        // asking it to state the result is safer than handing the turn to a
+        // different model or silently surfacing "(no reply)".
         // Stitch a resumed slot's two attempts back together. `done.finalText`
         // is contracted to be the sum of every text chunk the slot emitted, and
         // consumers lean on that: runTurn persists it as the assistant message,
@@ -430,9 +442,60 @@ export async function* runWithFallback(
           chunk.type === "done" && carriedText.length > 0
             ? { ...chunk, finalText: carriedText + chunk.finalText }
             : chunk;
+        const emptyFinalText =
+          emitted.type === "done" && emitted.finalText.trim().length === 0;
         if (
-          emitted.type === "done" &&
-          emitted.finalText.length === 0 &&
+          emptyFinalText &&
+          !recoveryOccurred &&
+          emptyCompletionFinalizationAttempts < MAX_EMPTY_COMPLETION_FINALIZATIONS &&
+          partial.rawText.trim().length > 0 &&
+          partial.toolCalls.length > 0
+        ) {
+          emptyCompletionFinalizationAttempts++;
+          log.warn("orchestrator: empty completion after tool work detected", {
+            harnessId: harness.id,
+            persona: req.persona,
+            conversation: req.conversation,
+            turnId: req.turnId,
+            toolCalls: partial.toolCalls.length,
+            narrationChars: partial.rawText.length,
+            finalizationAttempt: emptyCompletionFinalizationAttempts,
+          });
+          log.info("orchestrator: empty-completion finalization started", {
+            harnessId: harness.id,
+            persona: req.persona,
+            conversation: req.conversation,
+            turnId: req.turnId,
+            toolCalls: partial.toolCalls.length,
+            narrationChars: partial.rawText.length,
+            finalizationAttempt: emptyCompletionFinalizationAttempts,
+          });
+          attemptReq = buildEmptyCompletionRequest(req);
+          resumeRequested = true;
+          break;
+        }
+        if (
+          emptyFinalText &&
+          emptyCompletionFinalizationAttempts >= MAX_EMPTY_COMPLETION_FINALIZATIONS
+        ) {
+          log.error("orchestrator: empty-completion finalization also empty", {
+            harnessId: harness.id,
+            persona: req.persona,
+            conversation: req.conversation,
+            turnId: req.turnId,
+            toolCalls: partial.toolCalls.length,
+            narrationChars: partial.rawText.length,
+            finalizationAttempt: emptyCompletionFinalizationAttempts,
+          });
+          yield {
+            type: "error",
+            error: `harness ${harness.id} completed tool work but produced no final response after the bounded finalization attempt`,
+            recoverable: false,
+          };
+          return;
+        }
+        if (
+          emptyFinalText &&
           !isLast
         ) {
           log.warn(
@@ -452,6 +515,7 @@ export async function* runWithFallback(
           // push. The cost of a flake is one wasted round-trip.
           alerter.noteFailure(harness.id, "empty reply");
           firstFailure ??= { harnessId: harness.id, error: "empty reply" };
+          recoveryOccurred = true;
           recoverableError = true;
           break;
         }
@@ -474,7 +538,23 @@ export async function* runWithFallback(
         yield emitted;
         if (emitted.type === "done") {
           succeeded = true;
-          if (emitted.finalText.length === 0) servedEmpty = true;
+          if (emptyFinalText) servedEmpty = true;
+          if (
+            emitted.finalText.trim().length > 0 &&
+            emptyCompletionFinalizationAttempts > 0
+          ) {
+            log.info(
+              "orchestrator: empty-completion finalization completed",
+              {
+                harnessId: harness.id,
+                persona: req.persona,
+                conversation: req.conversation,
+                turnId: req.turnId,
+                finalizationAttempt: emptyCompletionFinalizationAttempts,
+                finalChars: emitted.finalText.length,
+              },
+            );
+          }
         }
       }
       } catch (e) {
@@ -484,6 +564,7 @@ export async function* runWithFallback(
     // ── end resume-with-context ───────────────────────────────────────
 
     if (thrown !== undefined) {
+      recoveryOccurred = true;
       const error = describeInvokeThrow(harness.id, thrown);
       if (!isLast) {
         log.warn("orchestrator: harness threw, falling through", {
