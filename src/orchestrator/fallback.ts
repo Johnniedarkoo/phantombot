@@ -753,7 +753,6 @@ export async function* runWithFallback(
           // own `empty` cause, so 3 consecutive empty turns fire a DEGRADED
           // push. The cost of a flake is one wasted round-trip.
           alerter.noteFailure(harness.id, "empty reply");
-<<<<<<< HEAD
           recordFailure(harness.id, "empty reply", { cause: "empty" });
           firstFailure ??= {
             harnessId: harness.id,
