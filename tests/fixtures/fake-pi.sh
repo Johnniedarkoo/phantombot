@@ -17,6 +17,7 @@
 #              exit 1 like a provider death: an attempt that DID real,
 #              side-effecting work before dying. Drives the producedOutput
 #              ladder test (tools aren't idempotent → no retry).
+<<<<<<< HEAD
 #   stallaftertools — the 2026-09-20 TUI incident (#598, pi case): narration
 #              text BEFORE tools, two real tool rounds, then turn_end fires
 #              anyway and pi exits 0 — the stream died after the tool results
@@ -25,6 +26,10 @@
 #   toolsdone — healthy control for the same guard: tools run, then the model
 #              replies with text AFTER the last tool result, then turn_end.
 #              Must yield done with the full text.
+=======
+#   provider-error — emit narration and an exit-0 Pi turn_end carrying a
+#              structured provider 400, followed by normal lifecycle events.
+>>>>>>> dac6082 (Treat Pi semantic errors as failed turns)
 #   argv     — echo argv (joined) as a text_delta, exit 0 (arg-shape test)
 #   env      — echo the PHANTOMBOT_*_MODEL env vars + the PI provider/api-key
 #              as a text_delta, exit 0 (routing env-projection test)
@@ -200,6 +205,18 @@ case "$mode" in
     # the classifier with real provider wording (review on #561).
     echo "${FAKE_PI_RATELIMIT_TEXT:-provider error: 429 rate_limit exceeded}" >&2
     exit 1
+    ;;
+  provider-error)
+    printf '%s\n' '{"type":"session","version":3,"id":"abc"}'
+    printf '%s\n' '{"type":"agent_start"}'
+    printf '%s\n' '{"type":"turn_start"}'
+    printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"I am inspecting the image now.","partial":{}},"message":{}}'
+    printf '%s\n' '{"type":"tool_execution_start","toolName":"read","args":{"path":"zoom-top.png"}}'
+    printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"400: {\"message\":\"At most 1 image(s) may be provided in one prompt.\",\"code\":400}"}}'
+    printf '%s\n' '{"type":"turn_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"400: {\"message\":\"At most 1 image(s) may be provided in one prompt.\",\"code\":400}"},"toolResults":[]}'
+    printf '%s\n' '{"type":"agent_end","willRetry":false}'
+    printf '%s\n' '{"type":"agent_settled"}'
+    exit 0
     ;;
   error)
     echo "simulated pi error" >&2
