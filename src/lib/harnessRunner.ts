@@ -554,6 +554,11 @@ export async function* runHarnessProcess(
   // and every line after it — same batch or later — is dropped: nothing a
   // process says after violating policy may reach the user.
   let terminalError: HarnessChunk | undefined;
+  // Adapter-level semantic errors (for example Pi's structured provider
+  // failure on turn_end) are authoritative. Forward one immediately, then
+  // stop consuming the child so a later exit-0 cannot become a successful done
+  // or a duplicate completion-gate error.
+  let parsedError: Extract<HarnessChunk, { type: "error" }> | undefined;
   const decoder = new TextDecoder();
 
   // Translate one parsed line, feed the idle timer, fold text/done. Yields the
@@ -565,6 +570,11 @@ export async function* runHarnessProcess(
     if (c.type === "error" && c.terminal) {
       terminalError = c;
       killer.terminate(); // SIGTERM → grace → SIGKILL the whole group
+      yield c;
+      return;
+    }
+    if (c.type === "error") {
+      parsedError = c;
       yield c;
       return;
     }
@@ -624,9 +634,11 @@ export async function* runHarnessProcess(
           });
         }
         yield* consume(parsed);
+        if (parsedError) break;
         if (terminalError) break; // policy violation: drop the rest of the batch
       }
       if (terminalError) break; // ...and stop reading stdout entirely
+      if (parsedError) break;
     }
     if (spec.flushTail && !terminalError) {
       buffer += decoder.decode();
@@ -656,6 +668,11 @@ export async function* runHarnessProcess(
   // orchestrator has it, so just stop), then a harness-specific early
   // provider error wins over kill-cause, which wins over exit code.
   if (terminalError) {
+    await proc.exited;
+    return;
+  }
+
+  if (parsedError) {
     await proc.exited;
     return;
   }

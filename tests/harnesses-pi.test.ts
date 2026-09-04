@@ -262,6 +262,35 @@ describe("parsePiEvent", () => {
     expect(parsePiEvent({ type: "agent_end", messages: [] })).toBeUndefined();
   });
 
+  test("turn_end with toolUse is an intermediate cycle, not completion", () => {
+    expect(
+      parsePiEvent({
+        type: "turn_end",
+        message: { role: "assistant", content: [], stopReason: "toolUse" },
+        toolResults: [],
+      }),
+    ).toBeUndefined();
+  });
+
+  test("turn_end with a provider error is an error even when Pi will exit 0", () => {
+    expect(
+      parsePiEvent({
+        type: "turn_end",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: '400: {"message":"At most 1 image(s) may be provided in one prompt.","code":400}',
+        },
+      }),
+    ).toEqual({
+      type: "error",
+      error: 'pi provider error: 400: {"message":"At most 1 image(s) may be provided in one prompt.","code":400}',
+      recoverable: false,
+      httpStatus: 400,
+    });
+  });
+
   test("ignores empty text_delta", () => {
     expect(
       parsePiEvent({
@@ -422,6 +451,20 @@ describe("PiHarness.invoke (subprocess)", () => {
     const errors = chunks.filter((c) => c.type === "error");
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatchObject({ type: "error", recoverable: true });
+  });
+
+  test("structured provider error is not synthesized into done on exit 0", async () => {
+    process.env.FAKE_PI_MODE = "provider-error";
+    const chunks = await collect(mkHarness().invoke(newRequest()));
+    expect(chunks.filter((c) => c.type === "done")).toHaveLength(0);
+    expect(chunks.filter((c) => c.type === "error")).toEqual([
+      expect.objectContaining({
+        type: "error",
+        recoverable: false,
+        httpStatus: 400,
+        error: expect.stringContaining("At most 1 image(s)"),
+      }),
+    ]);
   });
 
   test("exit 127 emits TERMINAL error", async () => {

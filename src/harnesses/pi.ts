@@ -697,17 +697,14 @@ export function parsePiEvent(parsed: unknown): HarnessChunk | undefined {
     return { type: "heartbeat" };
   }
 
-  // turn_end is pi's end-of-turn COMPLETION signal — the model has finished
-  // this turn. Verified against pi 0.80.x: a successful run always ends
-  // turn_end → agent_end → agent_settled, in --no-tools mode too. Surface it
-  // as a `done` marker (payload-less: the reply text already streamed as
-  // text_delta chunks and is accumulated by the shared engine) so that engine
-  // can distinguish a genuinely COMPLETED turn from an exit-0 that stopped
-  // mid-task having emitted only tool narration — see runHarnessProcess's
-  // `requireCompletion` gate and issue #352. We deliberately gate on turn_end
-  // ALONE, not the later agent_end/agent_settled: a run that errors out can
-  // still emit agent_end, and treating that as "done" would accept a broken
-  // turn as complete. turn_end fires only when the turn itself finished.
+  // turn_end is pi's end-of-turn lifecycle signal, but it is emitted for every
+  // model/tool cycle. Only a successful terminal cycle is a completion marker:
+  // `toolUse` is an intermediate turn and must not satisfy the exit-0 gate.
+  // Provider failures are especially important here: Pi can emit
+  // turn_end(message.stopReason="error") → agent_end → agent_settled and exit
+  // 0 after a 400 from vLLM. That is a failed turn, not a successful empty
+  // answer, so surface the structured error before the shared runner can
+  // synthesize `done` from the normal process exit.
   //
   // Version caveat: on a hypothetical pi build that does not emit turn_end,
   // every turn would fail the gate and fall through to the next harness. That
@@ -716,6 +713,33 @@ export function parsePiEvent(parsed: unknown): HarnessChunk | undefined {
   // the trimmed narration as if it were the answer.
   if (obj.type === "turn_end") {
     const terminalMessage = isObject(obj.message) ? obj.message : undefined;
+    const stopReason = firstString(
+      terminalMessage?.stopReason,
+      obj.message_stopReason,
+      obj.stopReason,
+    );
+    if (stopReason === "error") {
+      const errorMessage = firstString(
+        terminalMessage?.errorMessage,
+        obj.message_errorMessage,
+        obj.errorMessage,
+      ) ?? "Pi provider returned an error";
+      const httpStatus = extractHttpStatus(errorMessage);
+      return {
+        type: "error",
+        error: `pi provider error: ${errorMessage}`,
+        recoverable: false,
+        ...(httpStatus === undefined ? {} : { httpStatus }),
+      };
+    }
+    if (stopReason === "aborted" || stopReason === "cancelled" || stopReason === "canceled") {
+      return {
+        type: "error",
+        error: `pi turn ${stopReason}`,
+        recoverable: false,
+      };
+    }
+    if (stopReason === "toolUse") return undefined;
     const terminalContent = terminalMessage && Array.isArray(terminalMessage.content)
       ? terminalMessage.content
       : [];
@@ -728,6 +752,7 @@ export function parsePiEvent(parsed: unknown): HarnessChunk | undefined {
       finalText: "",
       meta: {
         completionMarker: "turn_end",
+        ...(stopReason ? { terminalStopReason: stopReason } : {}),
         nativeTerminalTextEmpty: nativeTerminalTextChars === 0,
         nativeTerminalTextChars,
       },
@@ -798,6 +823,13 @@ export function piActivity(parsed: unknown, chunk: HarnessChunk): HarnessActivit
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function extractHttpStatus(errorMessage: string): number | undefined {
+  const prefix = errorMessage.match(/^(\d{3})\s*:/)?.[1];
+  if (prefix) return Number(prefix);
+  const code = errorMessage.match(/\"code\"\s*:\s*(\d{3})/)?.[1];
+  return code ? Number(code) : undefined;
 }
 
 function buildAssistantToolCall(

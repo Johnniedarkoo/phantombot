@@ -16,6 +16,8 @@
 #              exit 1 like a provider death: an attempt that DID real,
 #              side-effecting work before dying. Drives the producedOutput
 #              ladder test (tools aren't idempotent → no retry).
+#   provider-error — emit narration and an exit-0 Pi turn_end carrying a
+#              structured provider 400, followed by normal lifecycle events.
 #   argv     — echo argv (joined) as a text_delta, exit 0 (arg-shape test)
 #   env      — echo the PHANTOMBOT_*_MODEL env vars + the PI provider/api-key
 #              as a text_delta, exit 0 (routing env-projection test)
@@ -106,6 +108,18 @@ case "$mode" in
     printf '%s\n' '{"type":"tool_execution_start","toolName":"bash","args":{"command":"echo side-effect"}}'
     printf '%s\n' '{"type":"tool_execution_end","toolName":"bash","result":{}}'
     exit 1
+    ;;
+  provider-error)
+    printf '%s\n' '{"type":"session","version":3,"id":"abc"}'
+    printf '%s\n' '{"type":"agent_start"}'
+    printf '%s\n' '{"type":"turn_start"}'
+    printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"I am inspecting the image now.","partial":{}},"message":{}}'
+    printf '%s\n' '{"type":"tool_execution_start","toolName":"read","args":{"path":"zoom-top.png"}}'
+    printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"400: {\"message\":\"At most 1 image(s) may be provided in one prompt.\",\"code\":400}"}}'
+    printf '%s\n' '{"type":"turn_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"400: {\"message\":\"At most 1 image(s) may be provided in one prompt.\",\"code\":400}"},"toolResults":[]}'
+    printf '%s\n' '{"type":"agent_end","willRetry":false}'
+    printf '%s\n' '{"type":"agent_settled"}'
+    exit 0
     ;;
   error)
     echo "simulated pi error" >&2
