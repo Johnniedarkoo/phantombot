@@ -124,6 +124,10 @@ values. The command expects the registered `gmail` server to use the pinned
 stdio fork and its `GMAIL_MCP_OAUTH_CLIENT_JSON` / `GMAIL_MCP_OAUTH_TOKEN_JSON`
 vault mappings.
 
+If the Google OAuth client has a pre-registered loopback callback, pass that
+exact URI, including host, port, and path, with `--redirect-url` (for example
+`http://127.0.0.1:18080/callback`).
+
 `mcp add --from-url` fetches the page/doc, infers the transport + which of the
 three auth methods applies + any scopes, writes the registration on the agent's
 behalf, and surfaces the one human step. `mcp.json` is an implementation detail
