@@ -141,6 +141,7 @@ export function validateGmailAuthEnvelope(raw: string): GmailAuthEnvelope {
 /** Run the fork's browser OAuth flow and store its result in the persona vault. */
 export async function runMcpGmailAuth(input: {
   persona?: string;
+  redirectUrl?: string;
   out?: WriteSink;
   err?: WriteSink;
 }): Promise<number> {
@@ -178,7 +179,12 @@ export async function runMcpGmailAuth(input: {
     // explicit `.cmd` spelling is rejected with EINVAL in compiled builds, so
     // preserve the command exactly as registered.
     const command = entry.command!;
-    const args = [...(entry.args ?? []), "auth", `--scopes=${GMAIL_OAUTH_SCOPES.map((s) => s.slice(GMAIL_SCOPE_PREFIX.length)).join(",")}`];
+    const args = [
+      ...(entry.args ?? []),
+      "auth",
+      `--scopes=${GMAIL_OAUTH_SCOPES.map((s) => s.slice(GMAIL_SCOPE_PREFIX.length)).join(",")}`,
+      ...(input.redirectUrl ? [input.redirectUrl] : []),
+    ];
     const child = spawn(command, args, {
       cwd: dir,
       env: {
@@ -829,10 +835,17 @@ export default defineCommand({
     }),
     "gmail-auth": defineCommand({
       meta: { name: "gmail-auth", description: "Authorize the registered no-send Gmail stdio server into the encrypted vault." },
-      args: { ...personaArg },
+      args: {
+        "redirect-url": {
+          type: "string",
+          description: "Registered loopback OAuth callback URL (for example http://127.0.0.1:18080/callback).",
+        },
+        ...personaArg,
+      },
       async run({ args }) {
         process.exitCode = await runMcpGmailAuth({
           persona: args.persona ? String(args.persona) : undefined,
+          redirectUrl: args["redirect-url"] ? String(args["redirect-url"]) : undefined,
         });
       },
     }),
