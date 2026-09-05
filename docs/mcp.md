@@ -122,7 +122,10 @@ and stores the returned refreshable credential envelope directly in the same
 vault. It does not create `~/.gmail-mcp/credentials.json` or print credential
 values. The command expects the registered `gmail` server to use the pinned
 stdio fork and its `GMAIL_MCP_OAUTH_CLIENT_JSON` / `GMAIL_MCP_OAUTH_TOKEN_JSON`
-vault mappings.
+vault mappings. The configured grant also includes `gmail.modify`, which is
+needed for safe mailbox cleanup operations such as marking messages read or
+archiving them; the fork's independent no-send policy still blocks all
+outbound-mail tools.
 
 If the Google OAuth client has a pre-registered loopback callback, pass that
 exact URI, including host, port, and path, with `--redirect-url` (for example
