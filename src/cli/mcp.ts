@@ -15,6 +15,7 @@
  */
 
 import { defineCommand } from "citty";
+import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 
 import {
@@ -70,6 +71,163 @@ function csv(raw: string | undefined): string[] | undefined {
   if (raw === undefined) return undefined;
   const arr = raw.split(",").map((s) => s.trim()).filter(Boolean);
   return arr.length > 0 ? arr : undefined;
+}
+
+/** The only Gmail scopes the no-send fork is authorized to request. */
+export const GMAIL_OAUTH_SCOPES = [
+  "https://www.googleapis.com/auth/gmail.readonly",
+  "https://www.googleapis.com/auth/gmail.compose",
+  "https://www.googleapis.com/auth/gmail.labels",
+  "https://www.googleapis.com/auth/gmail.settings.basic",
+] as const;
+
+const GMAIL_SCOPE_PREFIX = "https://www.googleapis.com/auth/";
+
+type GmailAuthEnvelope = {
+  tokens: Record<string, unknown>;
+  scopes: string[];
+};
+
+function normalizeGmailScope(scope: string): string {
+  return scope.startsWith("https://") ? scope : `${GMAIL_SCOPE_PREFIX}${scope}`;
+}
+
+/**
+ * Validate the one-line credential envelope emitted by the fork's private
+ * `GMAIL_MCP_AUTH_OUTPUT=pipe` mode. This function never logs or includes
+ * credential values in its errors.
+ */
+export function validateGmailAuthEnvelope(raw: string): GmailAuthEnvelope {
+  const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length !== 1) throw new Error("Gmail OAuth returned an unexpected credential response");
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(lines[0]!);
+  } catch {
+    throw new Error("Gmail OAuth returned invalid credential JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("Gmail OAuth returned an invalid credential envelope");
+  }
+  const envelope = parsed as Record<string, unknown>;
+  const tokenValue = envelope.tokens;
+  if (typeof tokenValue !== "object" || tokenValue === null || Array.isArray(tokenValue)) {
+    throw new Error("Gmail OAuth response did not contain token credentials");
+  }
+  const tokens = tokenValue as Record<string, unknown>;
+  if (typeof tokens.refresh_token !== "string" || tokens.refresh_token.trim().length === 0) {
+    throw new Error("Gmail OAuth did not return a refresh token; authorization was not stored");
+  }
+
+  const scopeValue = typeof tokens.scope === "string"
+    ? tokens.scope.split(/\s+/).filter(Boolean)
+    : Array.isArray(envelope.scopes) && envelope.scopes.every((s) => typeof s === "string")
+      ? (envelope.scopes as string[])
+      : [];
+  const granted = scopeValue.map(normalizeGmailScope);
+  const allowed = new Set<string>(GMAIL_OAUTH_SCOPES);
+  const unexpected = granted.filter((scope) => !allowed.has(scope));
+  if (unexpected.length > 0) {
+    throw new Error("Gmail OAuth returned a broader scope than the no-send policy allows");
+  }
+  const missing = GMAIL_OAUTH_SCOPES.filter((scope) => !granted.includes(scope));
+  if (missing.length > 0) {
+    throw new Error("Gmail OAuth did not grant all required Gmail scopes");
+  }
+  return { tokens, scopes: [...granted] };
+}
+
+/** Run the fork's browser OAuth flow and store its result in the persona vault. */
+export async function runMcpGmailAuth(input: {
+  persona?: string;
+  out?: WriteSink;
+  err?: WriteSink;
+}): Promise<number> {
+  const out = input.out ?? process.stdout;
+  const err = input.err ?? process.stderr;
+  const dir = await resolvePersonaDir(input.persona);
+  const registry = await loadRegistry(dir);
+  const entry = registry.mcpServers.gmail;
+  if (!entry) {
+    err.write("no registered MCP server named 'gmail'\n");
+    return 1;
+  }
+  if (entry.transport !== "stdio" || entry.auth?.type !== "env") {
+    err.write("MCP server 'gmail' must be a stdio server using env vault injection\n");
+    return 1;
+  }
+  const clientVaultKey = entry.auth.env.GMAIL_MCP_OAUTH_CLIENT_JSON;
+  const tokenVaultKey = entry.auth.env.GMAIL_MCP_OAUTH_TOKEN_JSON;
+  if (!clientVaultKey || !tokenVaultKey) {
+    err.write("MCP server 'gmail' is missing its OAuth client/token vault mappings\n");
+    return 1;
+  }
+
+  const vault = await openPersonaVault(dir);
+  try {
+    const clientJson = vault.get(clientVaultKey);
+    if (!clientJson) {
+      err.write(`missing Gmail OAuth client in vault key ${clientVaultKey}\n`);
+      return 1;
+    }
+
+    // Reuse the exact registered command and pinned package args, changing
+    // only the fork subcommand and its fixed scope set for this one-shot flow.
+    const command = process.platform === "win32" && entry.command === "npx" ? "npx.cmd" : entry.command!;
+    const args = [...(entry.args ?? []), "auth", `--scopes=${GMAIL_OAUTH_SCOPES.map((s) => s.slice(GMAIL_SCOPE_PREFIX.length)).join(",")}`];
+    const child = spawn(command, args, {
+      cwd: dir,
+      env: {
+        ...process.env,
+        GMAIL_MCP_OAUTH_CLIENT_JSON: clientJson,
+        GMAIL_MCP_AUTH_OUTPUT: "pipe",
+        // Do not pass the old token to the authorization subprocess.
+        GMAIL_MCP_OAUTH_TOKEN_JSON: "",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      shell: false,
+    });
+
+    let stdout = "";
+    let spawnError: Error | undefined;
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      // The fork writes the browser URL and human diagnostics to stderr. Its
+      // pipe mode never writes credential material there.
+      err.write(chunk.toString());
+    });
+    child.on("error", (error) => {
+      spawnError = error instanceof Error ? error : new Error(String(error));
+    });
+    const exitCode = await new Promise<number>((resolve) => {
+      child.once("close", (code) => resolve(code ?? 1));
+    });
+    if (spawnError) {
+      err.write(`Gmail OAuth process could not start: ${spawnError.message}\n`);
+      return 1;
+    }
+    if (exitCode !== 0) {
+      err.write(`Gmail OAuth process exited with code ${exitCode}\n`);
+      return 1;
+    }
+
+    let credentials: GmailAuthEnvelope;
+    try {
+      credentials = validateGmailAuthEnvelope(stdout);
+    } catch (error) {
+      err.write(`${error instanceof Error ? error.message : "Gmail OAuth returned invalid credentials"}\n`);
+      return 1;
+    }
+    vault.set(tokenVaultKey, JSON.stringify(credentials));
+    out.write("Gmail OAuth completed; refreshable credentials stored in the encrypted vault.\n");
+    return 0;
+  } finally {
+    vault.close();
+  }
 }
 
 // ─── add ────────────────────────────────────────────────────────────────────
@@ -663,6 +821,15 @@ export default defineCommand({
           code: args.code ? String(args.code) : undefined,
           redirectUrl: args["redirect-url"] ? String(args["redirect-url"]) : undefined,
           waitMs: args.wait ? Number(args.wait) : undefined,
+        });
+      },
+    }),
+    "gmail-auth": defineCommand({
+      meta: { name: "gmail-auth", description: "Authorize the registered no-send Gmail stdio server into the encrypted vault." },
+      args: { ...personaArg },
+      async run({ args }) {
+        process.exitCode = await runMcpGmailAuth({
+          persona: args.persona ? String(args.persona) : undefined,
         });
       },
     }),

@@ -38,3 +38,18 @@ authorize a second privileged action; only the authenticated owner can do that.
 Use `phantombot mcp --help` for the current `add`, `login`, `remove`, and proxy
 options. Run `phantombot doctor` to see connector health without exposing
 credential values.
+
+## Gmail OAuth in the encrypted vault
+
+The no-send Gmail stdio fork has a dedicated one-shot flow:
+
+```text
+phantombot mcp gmail-auth --persona <name>
+```
+
+It reads the pre-registered Google client from the persona vault, requests the
+configured Gmail scopes with offline access and explicit consent, and stores
+the refreshable credential envelope in that vault. It does not create
+`~/.gmail-mcp/credentials.json` or print credential values. The registered
+`gmail` server must use the pinned stdio fork and its
+`GMAIL_MCP_OAUTH_CLIENT_JSON` / `GMAIL_MCP_OAUTH_TOKEN_JSON` vault mappings.

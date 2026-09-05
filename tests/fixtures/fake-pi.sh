@@ -17,7 +17,6 @@
 #              exit 1 like a provider death: an attempt that DID real,
 #              side-effecting work before dying. Drives the producedOutput
 #              ladder test (tools aren't idempotent → no retry).
-<<<<<<< HEAD
 #   stallaftertools — the 2026-09-20 TUI incident (#598, pi case): narration
 #              text BEFORE tools, two real tool rounds, then turn_end fires
 #              anyway and pi exits 0 — the stream died after the tool results
@@ -26,10 +25,8 @@
 #   toolsdone — healthy control for the same guard: tools run, then the model
 #              replies with text AFTER the last tool result, then turn_end.
 #              Must yield done with the full text.
-=======
 #   provider-error — emit narration and an exit-0 Pi turn_end carrying a
 #              structured provider 400, followed by normal lifecycle events.
->>>>>>> dac6082 (Treat Pi semantic errors as failed turns)
 #   argv     — echo argv (joined) as a text_delta, exit 0 (arg-shape test)
 #   env      — echo the PHANTOMBOT_*_MODEL env vars + the PI provider/api-key
 #              as a text_delta, exit 0 (routing env-projection test)

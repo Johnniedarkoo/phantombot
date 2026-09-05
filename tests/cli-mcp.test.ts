@@ -13,6 +13,7 @@ import { join } from "node:path";
 import {
   defaultEnvVaultKey,
   parseEnvSecrets,
+  validateGmailAuthEnvelope,
   runMcpAdd,
   runMcpList,
   runMcpRemove,
@@ -56,6 +57,36 @@ describe("helpers", () => {
       API_KEY: "MCP_SRV_API_KEY",
       TOKEN: "CUSTOM",
     });
+  });
+
+  test("validates a refreshable Gmail OAuth envelope without exposing values", () => {
+    const result = validateGmailAuthEnvelope(JSON.stringify({
+      tokens: {
+        access_token: "access-secret",
+        refresh_token: "refresh-secret",
+        scope: "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.labels https://www.googleapis.com/auth/gmail.settings.basic",
+      },
+      scopes: ["gmail.readonly", "gmail.compose", "gmail.labels", "gmail.settings.basic"],
+    }));
+    expect(result.scopes).toHaveLength(4);
+    expect(result.tokens.refresh_token).toBe("refresh-secret");
+  });
+
+  test("rejects Gmail OAuth envelopes with a broader send-capable scope", () => {
+    expect(() => validateGmailAuthEnvelope(JSON.stringify({
+      tokens: {
+        refresh_token: "refresh-secret",
+        scope: "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send",
+      },
+      scopes: ["gmail.readonly", "gmail.send"],
+    }))).toThrow(/broader scope/);
+  });
+
+  test("rejects Gmail OAuth envelopes without a refresh token", () => {
+    expect(() => validateGmailAuthEnvelope(JSON.stringify({
+      tokens: { access_token: "access-secret", scope: "gmail.readonly gmail.compose gmail.labels gmail.settings.basic" },
+      scopes: ["gmail.readonly", "gmail.compose", "gmail.labels", "gmail.settings.basic"],
+    }))).toThrow(/refresh token/);
   });
 });
 
