@@ -916,7 +916,7 @@ Secrets, integrations, and agent tools:
 | `printf '%s' "$VALUE" \| phantombot vault set NAME` | Save a credential without exposing it in argv |
 | `phantombot vault get|list|unset` | Read or manage one persona's encrypted vault (`--persona` supported) |
 | `phantombot env ...` | Deprecated compatibility alias for `vault` |
-| `phantombot mcp help|add|list|status|search|describe|call|login|remove|proxy` | Register and lazily use persona-scoped MCP servers |
+| `phantombot mcp help|add|list|status|search|describe|call|login|gmail-auth|remove|proxy` | Register and lazily use persona-scoped MCP servers; `gmail-auth` stores a refreshable no-send Gmail credential directly in the encrypted vault |
 | `phantombot notify --message "..." [--voice "..."] [--persona <name>]` | Broadcast to every authorized recipient on configured chat channels |
 | `phantombot reply-mode text|voice|default` | Temporarily override or clear reply modality for the current conversation |
 | `phantombot workspace lock|unlock|status` | Coordinate advisory claims on shared working copies |

@@ -108,6 +108,22 @@ phantombot mcp login <id>                  # (oauth) run the login flow
 phantombot mcp status <id>                 # verify before reporting success
 ```
 
+### Gmail stdio OAuth in the encrypted vault
+
+The no-send Gmail stdio fork has a dedicated one-shot flow:
+
+```text
+phantombot mcp gmail-auth --persona <name>
+```
+
+It reads the pre-registered static Google client from the persona vault,
+requests the configured Gmail scopes with offline access and explicit consent,
+and stores the returned refreshable credential envelope directly in the same
+vault. It does not create `~/.gmail-mcp/credentials.json` or print credential
+values. The command expects the registered `gmail` server to use the pinned
+stdio fork and its `GMAIL_MCP_OAUTH_CLIENT_JSON` / `GMAIL_MCP_OAUTH_TOKEN_JSON`
+vault mappings.
+
 `mcp add --from-url` fetches the page/doc, infers the transport + which of the
 three auth methods applies + any scopes, writes the registration on the agent's
 behalf, and surfaces the one human step. `mcp.json` is an implementation detail

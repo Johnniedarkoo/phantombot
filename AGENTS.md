@@ -35,6 +35,12 @@ If unsure, update the docs. Cheaper than the post-merge "wait, the README says X
 ~/.bun/bin/bun run build:arm64          # → dist/phantombot-arm64 (cross-compile)
 ```
 
+The MCP CLI also has the narrow `phantombot mcp gmail-auth --persona <name>`
+flow for the registered no-send Gmail stdio fork. It performs browser OAuth
+with the configured Gmail scopes and stores the refreshable credential in the
+encrypted persona vault; it must not create a plaintext credentials file or
+print token values.
+
 `bun-version` is pinned to `1.x` in CI for reproducibility (see `.github/workflows/release.yml`).
 
 The build target **must remain `bun-linux-x64-baseline`** (not plain `bun-linux-x64`). The supervisor box that runs kai is pre-AVX2 silicon; the non-baseline binary SIGILLs on launch there. If you "optimise" to plain x64, you'll break production. See PR #37 for the post-mortem.
