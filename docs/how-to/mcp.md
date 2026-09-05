@@ -53,3 +53,6 @@ the refreshable credential envelope in that vault. It does not create
 `~/.gmail-mcp/credentials.json` or print credential values. The registered
 `gmail` server must use the pinned stdio fork and its
 `GMAIL_MCP_OAUTH_CLIENT_JSON` / `GMAIL_MCP_OAUTH_TOKEN_JSON` vault mappings.
+The grant includes `gmail.modify` for mailbox cleanup such as marking messages
+read or archiving them; the fork's independent no-send policy still blocks
+outbound-mail tools.

@@ -64,11 +64,11 @@ describe("helpers", () => {
       tokens: {
         access_token: "access-secret",
         refresh_token: "refresh-secret",
-        scope: "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.labels https://www.googleapis.com/auth/gmail.settings.basic",
+        scope: "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.labels https://www.googleapis.com/auth/gmail.settings.basic",
       },
-      scopes: ["gmail.readonly", "gmail.compose", "gmail.labels", "gmail.settings.basic"],
+      scopes: ["gmail.readonly", "gmail.modify", "gmail.compose", "gmail.labels", "gmail.settings.basic"],
     }));
-    expect(result.scopes).toHaveLength(4);
+    expect(result.scopes).toHaveLength(5);
     expect(result.tokens.refresh_token).toBe("refresh-secret");
   });
 
@@ -84,8 +84,8 @@ describe("helpers", () => {
 
   test("rejects Gmail OAuth envelopes without a refresh token", () => {
     expect(() => validateGmailAuthEnvelope(JSON.stringify({
-      tokens: { access_token: "access-secret", scope: "gmail.readonly gmail.compose gmail.labels gmail.settings.basic" },
-      scopes: ["gmail.readonly", "gmail.compose", "gmail.labels", "gmail.settings.basic"],
+      tokens: { access_token: "access-secret", scope: "gmail.readonly gmail.modify gmail.compose gmail.labels gmail.settings.basic" },
+      scopes: ["gmail.readonly", "gmail.modify", "gmail.compose", "gmail.labels", "gmail.settings.basic"],
     }))).toThrow(/refresh token/);
   });
 });
