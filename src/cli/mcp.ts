@@ -174,7 +174,10 @@ export async function runMcpGmailAuth(input: {
 
     // Reuse the exact registered command and pinned package args, changing
     // only the fork subcommand and its fixed scope set for this one-shot flow.
-    const command = process.platform === "win32" && entry.command === "npx" ? "npx.cmd" : entry.command!;
+    // Bun's Windows child_process implementation resolves `npx` itself. The
+    // explicit `.cmd` spelling is rejected with EINVAL in compiled builds, so
+    // preserve the command exactly as registered.
+    const command = entry.command!;
     const args = [...(entry.args ?? []), "auth", `--scopes=${GMAIL_OAUTH_SCOPES.map((s) => s.slice(GMAIL_SCOPE_PREFIX.length)).join(",")}`];
     const child = spawn(command, args, {
       cwd: dir,
