@@ -20,8 +20,8 @@
  *   - Fresh chain: runs with its own CooldownStore so the failed turn's
  *     cooldown bookkeeping doesn't force recovery onto the weakest harness.
  *   - Non-recursive: a single runWithFallback pass. If it also fails we
- *     return undefined and the caller stays silent — the original
- *     diagnostic is already in the journal via the orchestrator's logs.
+ *     return undefined; the channel supplies a deterministic final error
+ *     bubble rather than leaving the user silent.
  *   - Tool-free by instruction: the prompt forbids tools, so recovery
  *     won't re-trigger the same wedged call.
  */
@@ -56,6 +56,24 @@ export interface RecoveryReplyInput {
   signal?: AbortSignal;
 }
 
+/**
+ * Safe local fallback when the model-generated recovery reply cannot run.
+ * Keep this independent of harness output: a failed model turn must not be
+ * represented as successful model text, and raw provider errors must not be
+ * sent to the user.
+ */
+export function deterministicFailureReply(error: string | undefined): string {
+  if (
+    error &&
+    /(?:context|token).{0,48}(?:exceed|limit|maximum|too long)|(?:exceed|limit|maximum|too long).{0,48}(?:context|token)/i.test(
+      error,
+    )
+  ) {
+    return "Qwen could not continue because the model context limit was exceeded. The task was interrupted after partial work; please continue or retry.";
+  }
+  return "The model could not complete this turn, and the automatic recovery response also failed. Please retry.";
+}
+
 function recoverySystemPrompt(personaName?: string): string {
   const who = personaName
     ? `You are ${personaName}, the user's personal assistant.`
@@ -82,7 +100,8 @@ function recoverySystemPrompt(personaName?: string): string {
 
 /**
  * Generate the recovery message. Returns the trimmed text, or undefined if
- * even the recovery turn failed (caller then stays silent).
+ * even the recovery turn failed (the caller then uses its deterministic
+ * failure bubble).
  */
 export async function generateRecoveryReply(
   input: RecoveryReplyInput,

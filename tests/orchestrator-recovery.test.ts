@@ -8,7 +8,10 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { generateRecoveryReply } from "../src/orchestrator/recovery.ts";
+import {
+  deterministicFailureReply,
+  generateRecoveryReply,
+} from "../src/orchestrator/recovery.ts";
 import type {
   Harness,
   HarnessChunk,
@@ -33,6 +36,18 @@ class FakeHarness implements Harness {
 }
 
 describe("generateRecoveryReply", () => {
+  test("provides a safe deterministic fallback when recovery also fails", () => {
+    expect(deterministicFailureReply("provider context exceeded")).toContain(
+      "context limit was exceeded",
+    );
+    expect(deterministicFailureReply("request mentioned context in a note")).toBe(
+      "The model could not complete this turn, and the automatic recovery response also failed. Please retry.",
+    );
+    expect(deterministicFailureReply("provider unavailable")).toBe(
+      "The model could not complete this turn, and the automatic recovery response also failed. Please retry.",
+    );
+  });
+
   test("returns the harness's recovery text", async () => {
     const harness = new FakeHarness("fake", [
       { type: "text", text: "Hit a snag — mind trying again?" },

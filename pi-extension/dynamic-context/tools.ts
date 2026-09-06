@@ -7,6 +7,151 @@
 
 export const MIN_CONTEXT_WINDOW = 1_024;
 export const MAX_CONTEXT_WINDOW = 10_000_000;
+/** Keep room for the next model/tool cycle after a proactive compaction. */
+export const MID_LOOP_COMPACTION_RESERVE_TOKENS = 16_384;
+
+export interface ContextUsageSnapshot {
+  tokens: number | null;
+  contextWindow: number;
+}
+
+export interface MidLoopCompactionDecision {
+  trigger: boolean;
+  currentTokens?: number;
+  contextWindow?: number;
+  threshold?: number;
+}
+
+export interface MidLoopTurnEvent {
+  message?: { stopReason?: unknown };
+}
+
+export interface MidLoopCompactionContext {
+  getContextUsage(): ContextUsageSnapshot | undefined;
+  compact(options: {
+    onComplete?: () => void;
+    onError?: (error: Error) => void;
+  }): void;
+}
+
+export interface MidLoopPiApi {
+  on(
+    event: "turn_end",
+    handler: (event: MidLoopTurnEvent, ctx: MidLoopCompactionContext) =>
+      | void
+      | Promise<void>,
+  ): void;
+}
+
+/**
+ * Decide whether a Pi tool loop should compact before its next model call.
+ * `toolUse` is deliberately required: terminal turns above the threshold are
+ * left to Pi's normal end-of-run compaction semantics.
+ */
+export function shouldProactivelyCompact(
+  stopReason: unknown,
+  usage: ContextUsageSnapshot | undefined,
+  guardArmed: boolean,
+): MidLoopCompactionDecision {
+  if (stopReason !== "toolUse" || !usage || !guardArmed) return { trigger: false };
+  const currentTokens = usage.tokens;
+  if (
+    currentTokens === null ||
+    !Number.isSafeInteger(currentTokens) ||
+    !Number.isSafeInteger(usage.contextWindow) ||
+    usage.contextWindow < MIN_CONTEXT_WINDOW
+  ) {
+    return { trigger: false };
+  }
+  const threshold = Math.max(
+    0,
+    usage.contextWindow - MID_LOOP_COMPACTION_RESERVE_TOKENS,
+  );
+  return {
+    trigger: currentTokens >= threshold,
+    currentTokens,
+    contextWindow: usage.contextWindow,
+    threshold,
+  };
+}
+
+/**
+ * Install the one-shot mid-loop guard used by the managed Pi extension.
+ * Keeping the lifecycle wiring here makes the policy independently testable
+ * without importing Pi's runtime package into the data-handling tests.
+ */
+export function installMidLoopCompactionGuard(pi: MidLoopPiApi): void {
+  let compactionInFlight = false;
+  let guardArmed = true;
+  let lastContextWindow: number | undefined;
+
+  pi.on("turn_end", async (event, ctx) => {
+    const usage = ctx.getContextUsage();
+    if (usage?.contextWindow !== lastContextWindow) {
+      lastContextWindow = usage?.contextWindow;
+      guardArmed = true;
+    }
+    if (
+      usage?.tokens !== null &&
+      usage?.tokens !== undefined &&
+      usage.tokens < (usage.contextWindow - MID_LOOP_COMPACTION_RESERVE_TOKENS)
+    ) {
+      guardArmed = true;
+    }
+
+    const decision = shouldProactivelyCompact(
+      event.message?.stopReason,
+      usage,
+      guardArmed,
+    );
+    if (!decision.trigger || compactionInFlight) return;
+
+    guardArmed = false;
+    compactionInFlight = true;
+    const fields = {
+      currentTokens: decision.currentTokens,
+      contextWindow: decision.contextWindow,
+      threshold: decision.threshold,
+      reason: "mid_loop_context_guard",
+    };
+    console.warn(
+      `phantombot: proactive Pi compaction started ` +
+        `${fields.currentTokens}/${fields.contextWindow} ` +
+        `(threshold ${fields.threshold}, reason=${fields.reason})`,
+    );
+    try {
+      await new Promise<void>((resolve) => {
+        try {
+          ctx.compact({
+            onComplete: () => {
+              console.warn(
+                `phantombot: proactive Pi compaction completed ` +
+                  `${fields.currentTokens}/${fields.contextWindow}`,
+              );
+              resolve();
+            },
+            onError: (error) => {
+              console.warn(
+                `phantombot: proactive Pi compaction failed ` +
+                  `${fields.currentTokens}/${fields.contextWindow}: ${error.message}`,
+              );
+              resolve();
+            },
+          });
+        } catch (error) {
+          console.warn(
+            `phantombot: proactive Pi compaction failed ` +
+              `${fields.currentTokens}/${fields.contextWindow}: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+          resolve();
+        }
+      });
+    } finally {
+      compactionInFlight = false;
+    }
+  });
+}
 
 export interface StaticProviderConfig {
   api?: string;
@@ -133,4 +278,3 @@ export function runtimeModelsUrl(baseUrl: string): string {
   const normalized = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
   return new URL("models", normalized).toString();
 }
-

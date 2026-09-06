@@ -383,6 +383,13 @@ context, and max-output fields. `--offline` remains enabled: Pi's installed
 0.84.2 semantics permit this localhost extension fetch while disabling Pi's
 own startup network refreshes.
 
+The extension also installs a mid-loop context guard using Pi's `turn_end`,
+`getContextUsage()` and `compact()` APIs: only an intermediate `toolUse` turn
+near `contextWindow - 16,384` is compacted, and terminal turns remain under
+Pi's normal completion policy. The interactive channel has a separate
+deterministic failure bubble when a failed primary turn's model-generated
+recovery cannot produce text; this does not change timeout or retry policy.
+
 ## Credentials
 
 Credentials live in the per-persona encrypted vault. The agent NEVER appends

@@ -1217,7 +1217,7 @@ describe("runTelegramServer dispatch", () => {
     });
   });
 
-  test("on unrecoverable harness error: never shows the raw diagnostic, does not persist", async () => {
+  test("on unrecoverable harness error: shows a safe deterministic failure, not the raw diagnostic", async () => {
     const transport = new FakeTransport();
     transport.pendingUpdates.push({
       updateId: 1,
@@ -1226,7 +1226,8 @@ describe("runTelegramServer dispatch", () => {
       text: "hi",
     });
     // This harness fails on every invoke, so the recovery re-prompt fails
-    // too. The user must NOT see the internal "boom" string; we stay silent.
+    // too. The user must NOT see the internal "boom" string, but must receive
+    // an explicit bounded failure instead of silence.
     const harness = new ScriptedHarness("fake", [
       { type: "error", error: "boom", recoverable: false },
     ]);
@@ -1239,7 +1240,10 @@ describe("runTelegramServer dispatch", () => {
       transport,
       oneShot: true,
     });
-    expect(transport.sent).toEqual([]);
+    expect(transport.sent.length).toBe(1);
+    expect(transport.sent[0]?.text).toContain(
+      "automatic recovery response also failed",
+    );
     expect(
       transport.sent.some((s) => /boom|error|timed out/i.test(s.text)),
     ).toBe(false);
@@ -2929,7 +2933,7 @@ describe("runTelegramServer narration flush (text-out)", () => {
     // Narration may or may not have reached the timer before the tool
     // blows up. Either way the raw internal diagnostic must NOT reach the
     // user — the recovery re-prompt fails too here (same scripted harness),
-    // so the turn stays silent rather than printing "(error: boom)".
+    // so the turn gets the safe deterministic failure bubble.
     class ErrorAfterToolHarness implements Harness {
       readonly id = "error-after-tool";
       async available(): Promise<boolean> {
@@ -2962,6 +2966,9 @@ describe("runTelegramServer narration flush (text-out)", () => {
     expect(
       transport.sent.some((s) => /boom|error:/i.test(s.text)),
     ).toBe(false);
+    expect(transport.sent.some((s) => s.text.includes("could not complete"))).toBe(
+      true,
+    );
   });
 });
 

@@ -1535,6 +1535,13 @@ keeps the static metadata and emits a warning. `/status` refreshes Pi's model
 catalog so a Qwen context-profile restart is visible without restarting
 phantombot.
 
+The same managed extension guards long Pi tool loops: on an intermediate
+`toolUse` boundary it asks Pi's own compaction machinery to compact when live
+usage reaches `contextWindow - 16,384`. Terminal turns are left to Pi's normal
+completion handling. If a failed turn's model-generated recovery also fails,
+the interactive channel emits a concise local failure bubble rather than
+silently completing with no user-visible result.
+
 ## Model Management (`/model`)
 
 `/model` shows and switches the model every configured harness runs — from

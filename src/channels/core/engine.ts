@@ -52,7 +52,10 @@ import {
   DEFAULT_HISTORY_LIMIT,
   runTurn,
 } from "../../orchestrator/turn.ts";
-import { generateRecoveryReply } from "../../orchestrator/recovery.ts";
+import {
+  deterministicFailureReply,
+  generateRecoveryReply,
+} from "../../orchestrator/recovery.ts";
 import { makeRetriever } from "../../orchestrator/retrieval.ts";
 import { makeTurnIndexer } from "../../orchestrator/turnIndexer.ts";
 import {
@@ -1523,8 +1526,8 @@ async function processChatMessage(
   // raw internal string: it's English-only and reads like a crash. Instead
   // re-prompt the chain ONCE for a short, language-matched human reply
   // ("hit a snag, mind trying again?") and deliver that like any normal
-  // message. If even the recovery turn can't produce text, we stay silent —
-  // the diagnostic is already in the journal.
+  // message. If even the recovery turn can't produce text, use a local,
+  // sanitized final error bubble so a failed turn never ends in silence.
   let recoveryText: string | undefined;
   if (errored) {
     log.error("telegram: turn failed; generating recovery reply", {
@@ -1559,14 +1562,18 @@ async function processChatMessage(
   // `errored` itself is left intact so the telemetry below still records
   // that the underlying turn failed.
   const unrecoverable = !!errored && !recoveryText;
+  const deterministicFallback = unrecoverable
+    ? deterministicFailureReply(errored)
+    : undefined;
 
   // The authoritative full reply: a recovery message if we made one, else
   // the harness's done.finalText (possibly reformatted), else whatever
   // streamed live.
-  const fullReply = recoveryText ?? finalReply ?? streamedReply;
+  const fullReply =
+    recoveryText ?? deterministicFallback ?? finalReply ?? streamedReply;
 
   // Compute what still needs to be sent after live streaming:
-  //   - unrecoverable failure: stay silent (diagnostic is logged, never shown)
+  //   - unrecoverable failure: send the sanitized deterministic fallback
   //   - consumed prefix matches: send only the suffix (the part the user
   //     hasn't seen yet, after live final bubbles and classified narration)
   //   - consumed prefix doesn't match (harness reformatted, or a recovery
@@ -1576,7 +1583,7 @@ async function processChatMessage(
   //   - nothing came back BUT progress/final bubbles landed: stay silent
   let outText: string;
   if (unrecoverable) {
-    outText = "";
+    outText = deterministicFallback ?? "The model could not complete this turn. Please retry.";
   } else if (fullReply.length === 0) {
     // Empty reply: in a DM the "(no reply)" placeholder is a useful signal
     // that the turn produced nothing. In a GROUP it's pure noise — a bot
