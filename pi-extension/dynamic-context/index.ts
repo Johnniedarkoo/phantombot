@@ -11,7 +11,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-  installMidLoopCompactionGuard,
   parseRuntimeContexts,
   registeredModelsWithRuntimeContexts,
   runtimeModelsUrl,
@@ -53,8 +52,10 @@ async function configuredVllmProvider(): Promise<StaticProviderConfig | undefine
 }
 
 export default async function dynamicContextExtension(pi: ExtensionAPI): Promise<void> {
-  installMidLoopCompactionGuard(pi);
-
+  // Do not call ctx.compact() from turn_end: Pi 0.84.x can abort the active
+  // tool loop before it emits its normal completion lifecycle. Dynamic
+  // context discovery remains safe here; compaction belongs at Pi's own
+  // agent-loop boundary (or a pinned Pi-side fix).
   const provider = await configuredVllmProvider();
   if (!provider?.baseUrl || !provider.models) return;
 
