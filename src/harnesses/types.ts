@@ -227,7 +227,7 @@ export type HarnessChunk =
        * disabling recovery. Omitted when the failure was not a coordinator
        * kill (spawn failure, non-zero exit, provider 4XX).
        */
-      killCause?: "timeout" | "idle" | "startup" | "aborted" | "policy";
+      killCause?: "timeout" | "idle" | "tool_timeout" | "startup" | "aborted" | "policy";
       /** Exact provider/model selected for this invocation, when the harness knows it. */
       execution?: HarnessExecutionInfo;
       /**

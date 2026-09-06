@@ -157,6 +157,14 @@ describe("parsePiEvent", () => {
     expect(c).toEqual({ type: "heartbeat" });
   });
 
+  test("emits a payload-less heartbeat for tool_execution_end", () => {
+    // The end marker is control-plane state for the shared timeout
+    // coordinator, not user-visible progress.
+    expect(parsePiEvent({ type: "tool_execution_end", toolName: "bash" })).toEqual({
+      type: "heartbeat",
+    });
+  });
+
   test("emits heartbeat for anonymous toolcall_* / tool_use_* assistantMessageEvent noise", () => {
     for (const ameType of [
       // pi 0.79.x names
@@ -317,10 +325,11 @@ describe("parsePiEvent", () => {
 });
 
 describe("piActivity — idle-watchdog classification", () => {
-  test("tool_execution_update counts as in-tool activity (resets the idle timer)", () => {
-    // Crux of 'keep the primary fed': the heartbeat chunk would otherwise be
-    // classified 'model', which does NOT reset the timer once a tool is running.
-    // Forcing 'tool' is what lets a long-but-working coder stay alive.
+  test("tool_execution_update stays in-tool activity without extending its deadline", () => {
+    // The heartbeat chunk would otherwise be classified 'model', which must
+    // not reactivate the model-idle timer once a tool is running. Classifying
+    // it as 'tool' keeps the event useful for liveness without extending the
+    // fixed tool deadline.
     const parsed = { type: "tool_execution_update", toolName: "coder" };
     const chunk = parsePiEvent(parsed)!;
     expect(chunk).toEqual({ type: "heartbeat" });
@@ -330,6 +339,11 @@ describe("piActivity — idle-watchdog classification", () => {
   test("tool_execution_start is in-tool activity", () => {
     const parsed = { type: "tool_execution_start", toolName: "coder" };
     expect(piActivity(parsed, parsePiEvent(parsed)!)).toBe("tool");
+  });
+
+  test("tool_execution_end returns to model-idle activity", () => {
+    const parsed = { type: "tool_execution_end", toolName: "coder" };
+    expect(piActivity(parsed, parsePiEvent(parsed)!)).toBe("tool_end");
   });
 
   test("a plain thinking heartbeat stays 'model' (must NOT reset a running tool)", () => {

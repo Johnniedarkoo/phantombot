@@ -1,11 +1,11 @@
 /**
- * Resume-with-context: recover a turn killed by the idle watchdog AFTER it
+ * Resume-with-context: recover a turn killed by an idle/tool watchdog AFTER it
  * had already produced output (issue #459).
  *
  * The failure this fixes
  * ---------------------
  * A harness attempt streams some narration, starts a tool call, and then the
- * provider wedges. The idle watchdog kills it. Every existing recovery path
+ * provider/tool wedges. The applicable watchdog kills it. Every existing recovery path
  * declines to touch that state:
  *
  *   - Pi's coder-swap ladder (`CODER_SWAP_MAX_ATTEMPTS`) is gated on the
@@ -193,7 +193,7 @@ export class PartialAttempt {
  * Should this error chunk trigger a recovery respawn of the SAME harness?
  *
  * Narrow by construction — every clause is load-bearing:
- *   - `idle` only. A hard-cap `timeout` means a runaway that kept feeding the
+ *   - `idle` or `tool_timeout`. A hard-cap `timeout` means a runaway that kept feeding the
  *     idle timer, and respawning it just burns another wall-clock ceiling.
  *     `startup` means no output at all, which the plain chain already covers.
  *     `aborted` is the user saying /stop and meaning it.
@@ -207,7 +207,7 @@ export function shouldResume(
   resumeAttemptsUsed: number,
 ): boolean {
   if (chunk.type !== "error") return false;
-  if (chunk.killCause !== "idle") return false;
+  if (chunk.killCause !== "idle" && chunk.killCause !== "tool_timeout") return false;
   if (chunk.terminal) return false;
   if (!partial.producedOutput) return false;
   return resumeAttemptsUsed < MAX_RESUME_ATTEMPTS;
@@ -227,9 +227,9 @@ export function buildResumePreamble(partial: PartialAttempt): string {
   const lines: string[] = [
     "[phantombot — automatic recovery of an interrupted turn]",
     "",
-    "Your previous attempt at this turn was terminated mid-flight: it stopped" +
-      " producing output and was killed by the idle watchdog. This is a fresh" +
-      " process with no memory of that attempt beyond what is quoted below.",
+    "Your previous attempt at this turn was terminated mid-flight by the" +
+      " harness watchdog. This is a fresh process with no memory of that" +
+      " attempt beyond what is quoted below.",
   ];
 
   const said = partial.text;

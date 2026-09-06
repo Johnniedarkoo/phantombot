@@ -21,8 +21,15 @@ import { killCauseToErrorChunk } from "../src/lib/harnessRunner.ts";
  * fails these tests instead of silently de-classifying every wedged
  * harness back to "other".
  */
-function killText(cause: "timeout" | "idle" | "startup"): string {
-  const chunk = killCauseToErrorChunk(cause, "pi", 300_000, 300_000, 60_000);
+function killText(cause: "timeout" | "idle" | "tool_timeout" | "startup"): string {
+  const chunk = killCauseToErrorChunk(
+    cause,
+    "pi",
+    300_000,
+    300_000,
+    60_000,
+    1_200,
+  );
   if (!chunk) throw new Error(`no error chunk for kill cause '${cause}'`);
   return chunk.error;
 }
@@ -73,7 +80,7 @@ describe("classifyFailure", () => {
   // Inputs come from the runner itself, not from copies of its wording: the
   // classifier matches on that text, so a rewording there must fail here.
   test("recognises every wedged-harness kill the runner emits", () => {
-    for (const cause of ["timeout", "idle", "startup"] as const) {
+    for (const cause of ["timeout", "idle", "tool_timeout", "startup"] as const) {
       expect(classifyFailure(killText(cause))).toBe("timeout");
     }
   });

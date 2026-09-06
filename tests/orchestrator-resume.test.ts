@@ -216,6 +216,21 @@ describe("shouldResume — when recovery is allowed to fire", () => {
     expect(shouldResume(idleKill(), withOutput(), 0)).toBe(true);
   });
 
+  test("tool timeout after output, budget unused → resume", () => {
+    expect(
+      shouldResume(
+        {
+          type: "error",
+          error: "pi tool execution exceeded 1200000ms without completing",
+          recoverable: true,
+          killCause: "tool_timeout",
+        },
+        withOutput(),
+        0,
+      ),
+    ).toBe(true);
+  });
+
   test("idle kill with no output → no resume (the plain chain owns that)", () => {
     expect(shouldResume(idleKill(), new PartialAttempt(), 0)).toBe(false);
   });

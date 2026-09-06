@@ -113,7 +113,11 @@ const RATE_LIMIT_MARKERS = ["rate_limit", "quota", "resource_exhausted"];
  * de-classify; if that function's wording changes, this list changes with
  * it and the tests below say so.
  */
-const TIMEOUT_MARKERS = ["timed out after", "produced no output within"];
+const TIMEOUT_MARKERS = [
+  "timed out after",
+  "produced no output within",
+  "tool execution exceeded",
+];
 
 /**
  * The literal fallback.ts stamps into noteFailure() when a harness exits

@@ -18,6 +18,11 @@ import {
 import { spawnInNewSession } from "../src/lib/processGroup.ts";
 
 const trackedPids: number[] = [];
+const longLivedChild = (ms = 30_000): string[] => [
+  process.execPath,
+  "-e",
+  `setTimeout(() => {}, ${ms})`,
+];
 afterEach(() => {
   for (const pid of trackedPids) {
     try {
@@ -182,13 +187,40 @@ describe("createKillCoordinator — startup timer", () => {
 });
 
 describe("createKillCoordinator — tool cap (issue #351)", () => {
-  test("sustained 'tool' activity past toolTimeoutMs lets the idle kill fire", async () => {
-    // A wedged-but-chattery tool: we drive touch("tool") forever. Without a
-    // cap that would reset the idle timer indefinitely and defeat the watchdog
-    // up to the hard cap. With toolTimeoutMs the tool-run's idle-reset budget
-    // runs out and the idle timer finally fires — even though tool activity
-    // never stops. That's the fix: the kill is caused by the cap, not silence.
-    const proc = spawnInNewSession(["sleep", "30"], {
+  test("a silent tool outlives model idle until tool_execution_end", async () => {
+    // The tool is silent for longer than the model-idle window, but completes
+    // before its own fixed deadline. The coordinator must not kill it at the
+    // ordinary idle boundary; after tool end, the model-idle timer is active
+    // again.
+    const proc = spawnInNewSession(longLivedChild(), {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    trackedPids.push(proc.pid!);
+
+    const killer = createKillCoordinator({
+      proc,
+      idleTimeoutMs: 150,
+      toolTimeoutMs: 1000,
+      hardTimeoutMs: 10_000,
+      harnessId: "test",
+    });
+
+    killer.touch("tool");
+    await Bun.sleep(300);
+    expect(killer.killCause()).toBeUndefined();
+    killer.touch("tool_end");
+    await proc.exited;
+    await killer.dispose();
+
+    expect(killer.killCause()).toBe("idle");
+  });
+
+  test("sustained tool updates hit the fixed tool timeout", async () => {
+    // A wedged-but-chattery tool: updates prove activity, but they must not
+    // re-arm the fixed per-tool deadline.
+    const proc = spawnInNewSession(longLivedChild(), {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
@@ -206,19 +238,19 @@ describe("createKillCoordinator — tool cap (issue #351)", () => {
     // Hammer tool activity the whole time — proving it's the cap, not a lull.
     const interval = setInterval(() => killer.touch("tool"), 30);
     try {
-      await proc.exited; // killed once the cap + idle window elapse (~450ms)
+      await proc.exited; // killed at the tool cap (~300ms)
     } finally {
       clearInterval(interval);
       await killer.dispose();
     }
-    expect(killer.killCause()).toBe("idle");
+    expect(killer.killCause()).toBe("tool_timeout");
   });
 
   test("without a tool cap, sustained 'tool' activity keeps the process alive", async () => {
-    // Legacy behaviour (toolTimeoutMs omitted): a long-but-working tool that
-    // keeps emitting activity must never be killed. Held well past what the
-    // capped test kills at.
-    const proc = spawnInNewSession(["sleep", "30"], {
+    // Without a tool cap, a long-but-working tool that keeps emitting activity
+    // is not tool-timeout-killed. This is retained for callers that do not
+    // provide a tool deadline.
+    const proc = spawnInNewSession(longLivedChild(), {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
@@ -239,11 +271,8 @@ describe("createKillCoordinator — tool cap (issue #351)", () => {
     expect(killer.killCause()).toBeUndefined();
   });
 
-  test("productive output resets the tool-run budget", async () => {
-    // Two tool-runs, each under the cap, separated by productive output. Total
-    // tool time exceeds toolTimeoutMs, but no SINGLE contiguous run does — so a
-    // healthy turn interleaving tools with text is never killed.
-    const proc = spawnInNewSession(["sleep", "30"], {
+  test("model heartbeats do not extend a running tool deadline", async () => {
+    const proc = spawnInNewSession(longLivedChild(), {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
@@ -252,19 +281,71 @@ describe("createKillCoordinator — tool cap (issue #351)", () => {
 
     const killer = createKillCoordinator({
       proc,
-      idleTimeoutMs: 200,
+      idleTimeoutMs: 100,
       toolTimeoutMs: 300,
       hardTimeoutMs: 10_000,
       harnessId: "test",
     });
+    killer.touch("tool");
+    const interval = setInterval(() => killer.touch("model"), 25);
+    try {
+      await proc.exited;
+    } finally {
+      clearInterval(interval);
+      await killer.dispose();
+    }
+    expect(killer.killCause()).toBe("tool_timeout");
+  });
 
-    const interval = setInterval(() => killer.touch("tool"), 30);
-    await Bun.sleep(250); // first tool-run, under the 300ms cap
-    killer.touch("productive"); // resets the budget (toolRunStart cleared)
-    await Bun.sleep(250); // second tool-run, again under the cap
-    clearInterval(interval);
+  test("a second tool gets a fresh deadline after the first ends", async () => {
+    const proc = spawnInNewSession(longLivedChild(), {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    trackedPids.push(proc.pid!);
+
+    const killer = createKillCoordinator({
+      proc,
+      idleTimeoutMs: 1000,
+      toolTimeoutMs: 300,
+      hardTimeoutMs: 10_000,
+      harnessId: "test",
+    });
+    killer.touch("tool");
+    await Bun.sleep(150);
+    killer.touch("tool_end");
+    killer.touch("model");
+    await Bun.sleep(150);
+    killer.touch("tool");
+    await Bun.sleep(200);
     await killer.dispose();
+
+    // If the first tool's timer had not been cleared/restarted, it would have
+    // killed the process around 300ms from the first start.
     expect(killer.killCause()).toBeUndefined();
+  });
+
+  test("the absolute hard timeout still wins while a tool is running", async () => {
+    const proc = spawnInNewSession(longLivedChild(), {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    trackedPids.push(proc.pid!);
+
+    const killer = createKillCoordinator({
+      proc,
+      idleTimeoutMs: 1000,
+      toolTimeoutMs: 1000,
+      hardTimeoutMs: 250,
+      harnessId: "test",
+    });
+    killer.touch("tool");
+    await proc.exited;
+    await killer.dispose();
+
+    expect(killer.killCause()).toBe("timeout");
   });
 });
 
@@ -359,6 +440,7 @@ describe("killCauseToErrorChunk", () => {
   test.each([
     ["timeout"],
     ["idle"],
+    ["tool_timeout"],
     ["startup"],
     ["aborted"],
     ["policy"],
@@ -385,6 +467,17 @@ describe("killCauseToErrorChunk", () => {
     });
     expect(c?.error).toContain("200ms");
     expect(c?.error).toContain("no output");
+  });
+
+  test("tool_timeout cause → recoverable error naming the tool deadline", () => {
+    const c = killCauseToErrorChunk("tool_timeout", "pi", 60_000, 300, 45_000, 1_200);
+    expect(c).toMatchObject({
+      type: "error",
+      recoverable: true,
+      killCause: "tool_timeout",
+    });
+    expect(c?.error).toContain("1200ms");
+    expect(c?.error).toContain("without completing");
   });
 
   test("startup cause → recoverable error mentioning the startup window", () => {

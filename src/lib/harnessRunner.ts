@@ -4,7 +4,9 @@
  * Every harness needs the same machinery:
  *
  *   - spawn the binary in a fresh process group (so grandchildren die too)
- *   - run an idle timer that resets on useful activity from stdout
+ *   - run an idle timer for model-side silence
+ *   - suspend that idle timer during a known tool execution
+ *   - run a fixed per-tool execution deadline
  *   - optionally run a hard wall-clock timer that never resets
  *   - listen for an external AbortSignal (the user typed /stop)
  *   - on any of those firing, SIGTERM → 5s grace → SIGKILL the whole group
@@ -25,7 +27,7 @@
  *   } finally {
  *     await runner.dispose();
  *   }
- *   const cause = runner.killCause();   // 'timeout' | 'idle' | 'aborted' | undefined
+ *   const cause = runner.killCause();   // 'timeout' | 'idle' | 'tool_timeout' | 'aborted' | undefined
  */
 
 import type { FileSink, Subprocess, SpawnOptions } from "bun";
@@ -43,11 +45,12 @@ type HarnessSubprocess = Subprocess<
 export type KillCause =
   | "timeout"
   | "idle"
+  | "tool_timeout"
   | "startup"
   | "aborted"
   | "policy"
   | undefined;
-export type HarnessActivity = "model" | "tool" | "productive";
+export type HarnessActivity = "model" | "tool" | "tool_end" | "productive";
 
 export interface KillCoordinatorOpts {
   proc: HarnessSubprocess;
@@ -69,13 +72,9 @@ export interface KillCoordinatorOpts {
    */
   startupTimeoutMs?: number;
   /**
-   * Wall-clock cap on how long a SINGLE contiguous tool-run may keep resetting
-   * the idle timer via `"tool"` activity WITHOUT any productive output.
-   * Measured from the start of the tool-run; any productive output resets the
-   * budget. Past this cap, tool activity stops deferring the idle kill, so a
-   * wedged-but-chattery tool trips the idle timeout instead of surviving to the
-   * hard cap. Omit to disable (tool activity resets the idle timer for as long
-   * as it keeps arriving — the legacy behaviour). See touch() and issue #351.
+   * Wall-clock cap on a SINGLE tool execution. The model idle timer is
+   * suspended from tool start until tool end; this deadline is not extended by
+   * tool updates. Omit to disable the tool-specific deadline.
    */
   toolTimeoutMs?: number;
   /** External abort, e.g. user typed /stop. */
@@ -90,10 +89,13 @@ export interface KillCoordinator {
   /**
    * Record subprocess activity.
    *
-   * - productive: visible text, completed tool output, non-JSON stdout, done
+   * - productive: visible text, completed tool output, non-JSON stdout, done;
+   *   for harnesses without an explicit tool-end event, this also closes the
+   *   current tool execution
    * - model: model-side thinking/progress while no tool is known to be running
-   * - tool: tool invocation/start; later generic model heartbeats do not extend
-   *   the idle window until productive output arrives
+   * - tool: tool invocation/update; suspends the model-idle timer and starts a
+   *   fixed tool deadline
+   * - tool_end: releases the tool deadline and starts a fresh model-idle window
    */
   touch(activity?: HarnessActivity): void;
   /**
@@ -123,10 +125,11 @@ export function createKillCoordinator(
   let cause: KillCause;
   let disposed = false;
   let toolRunning = false;
-  // Wall-clock start of the current contiguous tool-run (undefined when no tool
-  // is running). Used with opts.toolTimeoutMs to cap how long tool activity
-  // alone may keep deferring the idle kill. See touch().
+  // Wall-clock start of the current tool execution. Kept separately from the
+  // idle timer so tool updates cannot turn the tool deadline into a sliding
+  // window.
   let toolRunStart: number | undefined;
+  let toolTimer: ReturnType<typeof setTimeout> | undefined;
 
   const triggerKill = (newCause: Exclude<KillCause, undefined>): void => {
     if (cause || disposed) return;
@@ -134,6 +137,13 @@ export function createKillCoordinator(
     log.warn(`${opts.harnessId}.invoke killed: ${newCause}`, {
       idleTimeoutMs: opts.idleTimeoutMs,
       hardTimeoutMs: opts.hardTimeoutMs ?? "disabled",
+      ...(newCause === "tool_timeout"
+        ? {
+            toolTimeoutMs: opts.toolTimeoutMs ?? "disabled",
+            toolRunElapsedMs:
+              toolRunStart === undefined ? undefined : Date.now() - toolRunStart,
+          }
+        : {}),
     });
     // Fire-and-forget; the for-await over stdout will end naturally as
     // the kernel closes the pipe after SIGKILL.
@@ -144,6 +154,16 @@ export function createKillCoordinator(
     () => triggerKill("idle"),
     opts.idleTimeoutMs,
   );
+  const clearToolTimer = (): void => {
+    if (toolTimer) {
+      clearTimeout(toolTimer);
+      toolTimer = undefined;
+    }
+  };
+  const armIdleTimer = (): void => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => triggerKill("idle"), opts.idleTimeoutMs);
+  };
   const hardTimer: ReturnType<typeof setTimeout> | undefined =
     opts.hardTimeoutMs === undefined
       ? undefined
@@ -172,35 +192,47 @@ export function createKillCoordinator(
         if (!toolRunning) {
           toolRunning = true;
           toolRunStart = Date.now();
-        } else if (
-          opts.toolTimeoutMs !== undefined &&
-          toolRunStart !== undefined &&
-          Date.now() - toolRunStart >= opts.toolTimeoutMs
-        ) {
-          // This contiguous tool-run has kept the idle timer alive via tool
-          // activity for longer than the tool cap WITHOUT any productive
-          // (text) output. Past the cap a tool update no longer counts as
-          // liveness: fall through WITHOUT re-arming the idle timer, so the
-          // last-armed idle window runs out and triggerKill("idle") finally
-          // fires — a wedged-but-chattery tool (e.g. a stalled router that
-          // keeps trickling tool_execution_update) fails over in minutes
-          // instead of surviving to the hard cap (issue #351). Any productive
-          // output resets the budget (the "productive" branch clears
-          // toolRunStart), so a healthy turn interleaving tools with text is
-          // never affected.
-          return;
+          // A known-running tool is governed by its own fixed deadline, not
+          // by the ordinary model-idle timer. Updates never re-arm either
+          // timer.
+          clearTimeout(idleTimer);
+          if (opts.toolTimeoutMs !== undefined) {
+            toolTimer = setTimeout(
+              () => triggerKill("tool_timeout"),
+              opts.toolTimeoutMs,
+            );
+          }
         }
-      } else if (activity === "productive") {
-        toolRunning = false;
-        toolRunStart = undefined;
-      } else if (toolRunning) {
         return;
       }
-      clearTimeout(idleTimer);
-      idleTimer = setTimeout(
-        () => triggerKill("idle"),
-        opts.idleTimeoutMs,
-      );
+      if (activity === "tool_end") {
+        toolRunning = false;
+        toolRunStart = undefined;
+        clearToolTimer();
+        // The model-idle window starts anew only after the tool has actually
+        // reported completion. Re-arm even if its start event was missed so
+        // an isolated end marker cannot leave a stale idle deadline in place.
+        armIdleTimer();
+        return;
+      }
+      // Non-Pi harnesses report a completed tool result as productive output.
+      // Treat that as the equivalent of Pi's explicit tool_execution_end so
+      // their tool state is not left suspended indefinitely.
+      if (activity === "productive") {
+        if (toolRunning) {
+          toolRunning = false;
+          toolRunStart = undefined;
+          clearToolTimer();
+        }
+        armIdleTimer();
+        return;
+      }
+      if (toolRunning) {
+        // Model heartbeats and incidental output do not shorten or extend the
+        // tool deadline, and they must not reactivate the model-idle timer.
+        return;
+      }
+      armIdleTimer();
     },
     firstOutput(): void {
       if (cause || disposed) return;
@@ -216,6 +248,7 @@ export function createKillCoordinator(
       if (disposed) return;
       disposed = true;
       clearTimeout(idleTimer);
+      clearToolTimer();
       if (hardTimer) clearTimeout(hardTimer);
       if (startupTimer) clearTimeout(startupTimer);
       if (opts.signal && !opts.signal.aborted) {
@@ -244,8 +277,9 @@ export function isHardCapError(error: string): boolean {
  * Render the standard "killed by X" HarnessChunk for a kill cause.
  * Returns undefined if the process exited naturally (no kill).
  *
- *   - "timeout"  → recoverable (orchestrator advances to next harness)
- *   - "idle"     → recoverable (same — wedged subprocess, try a different one)
+ *   - "timeout"      → recoverable (orchestrator advances to next harness)
+ *   - "idle"         → recoverable (same — wedged subprocess, try a different one)
+ *   - "tool_timeout" → recoverable (a started tool exceeded its fixed deadline)
  *   - "startup"  → recoverable (never produced output — likely wedged on init;
  *     orchestrator falls through fast instead of eating the full idle window)
  *   - "aborted"  → non-recoverable (user said /stop and meant it)
@@ -254,9 +288,9 @@ export function isHardCapError(error: string): boolean {
  *     generator returned — this is the belt-and-suspenders fallback)
  *
  * The cause is also carried STRUCTURALLY on the chunk as `killCause`, because
- * the orchestrator branches on it: an `idle` kill that had already produced
- * output gets a resume-with-context respawn (issue #459). Keep the two in sync
- * — the string is for humans, the field is for code.
+ * the orchestrator branches on it: an `idle` or `tool_timeout` kill that had
+ * already produced output gets a resume-with-context respawn (issue #459).
+ * Keep the two in sync — the string is for humans, the field is for code.
  */
 export function killCauseToErrorChunk(
   cause: KillCause,
@@ -264,12 +298,13 @@ export function killCauseToErrorChunk(
   hardTimeoutMs: number | undefined,
   idleTimeoutMs: number,
   startupTimeoutMs?: number,
+  toolTimeoutMs?: number,
 ):
   | {
       type: "error";
       error: string;
       recoverable: boolean;
-      killCause?: "timeout" | "idle" | "startup" | "aborted" | "policy";
+      killCause?: "timeout" | "idle" | "tool_timeout" | "startup" | "aborted" | "policy";
     }
   | undefined {
   if (cause === "timeout") {
@@ -284,6 +319,14 @@ export function killCauseToErrorChunk(
     return {
       type: "error",
       error: `${harnessId} timed out after ${idleTimeoutMs}ms with no output (likely wedged on a tool call)`,
+      recoverable: true,
+      killCause: cause,
+    };
+  }
+  if (cause === "tool_timeout") {
+    return {
+      type: "error",
+      error: `${harnessId} tool execution exceeded ${toolTimeoutMs ?? "unknown"}ms without completing`,
       recoverable: true,
       killCause: cause,
     };
@@ -447,13 +490,9 @@ export interface HarnessProcessSpec {
    */
   requireCompletion?: boolean;
   /**
-   * Wall-clock cap (ms) on how long a SINGLE contiguous tool-run may keep the
-   * idle watchdog alive via `"tool"` activity alone, with no productive output.
-   * Forwarded to the kill coordinator. Guards against a wedged-but-chattery
-   * tool (e.g. a stalled router or a hung retry that keeps trickling output)
-   * resetting the idle timer up to the hard cap with no fallback (issue #351).
-   * Omit to disable (legacy: any tool activity resets the idle timer as long as
-   * it keeps arriving).
+   * Wall-clock cap (ms) for a SINGLE tool execution. While the tool is
+   * running, the model idle watchdog is suspended and this fixed deadline is
+   * not extended by tool updates. Omit to disable the tool-specific deadline.
    */
   toolTimeoutMs?: number;
   /**
@@ -690,6 +729,7 @@ export async function* runHarnessProcess(
     req.hardTimeoutMs,
     req.idleTimeoutMs,
     req.startupTimeoutMs,
+    spec.toolTimeoutMs,
   );
   if (errChunk) {
     await awaitStderrDrained();
