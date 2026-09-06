@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+  installMidLoopCompactionGuard,
   parseRuntimeContexts,
   registeredModelsWithRuntimeContexts,
   runtimeModelsUrl,
@@ -52,6 +53,8 @@ async function configuredVllmProvider(): Promise<StaticProviderConfig | undefine
 }
 
 export default async function dynamicContextExtension(pi: ExtensionAPI): Promise<void> {
+  installMidLoopCompactionGuard(pi);
+
   const provider = await configuredVllmProvider();
   if (!provider?.baseUrl || !provider.models) return;
 
@@ -111,4 +114,3 @@ export default async function dynamicContextExtension(pi: ExtensionAPI): Promise
   // unrelated models from disappearing; other providers are untouched.
   pi.registerProvider(PROVIDER_ID, { models });
 }
-
