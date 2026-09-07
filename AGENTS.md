@@ -41,6 +41,12 @@ with the configured Gmail scopes and stores the refreshable credential in the
 encrypted persona vault; it must not create a plaintext credentials file or
 print token values.
 
+The same pattern is available as `phantombot mcp calendar-auth --persona <name>`
+for the controlled safe Google Calendar stdio fork. Calendar uses its own vault
+token (`MCP_CALENDAR_OAUTH`), the shared static Google client, narrow Calendar
+scopes, and no persistent credential file; Calendar write notifications are
+suppressed at the MCP API layer.
+
 `bun-version` is pinned to `1.x` in CI for reproducibility (see `.github/workflows/release.yml`).
 
 The build target **must remain `bun-linux-x64-baseline`** (not plain `bun-linux-x64`). The supervisor box that runs kai is pre-AVX2 silicon; the non-baseline binary SIGILLs on launch there. If you "optimise" to plain x64, you'll break production. See PR #37 for the post-mortem.
