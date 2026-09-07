@@ -82,6 +82,13 @@ export const GMAIL_OAUTH_SCOPES = [
   "https://www.googleapis.com/auth/gmail.settings.basic",
 ] as const;
 
+/** The only Calendar scopes requested by the controlled Calendar fork. */
+export const CALENDAR_OAUTH_SCOPES = [
+  "https://www.googleapis.com/auth/calendar.events",
+  "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+  "https://www.googleapis.com/auth/calendar.events.freebusy",
+] as const;
+
 const GMAIL_SCOPE_PREFIX = "https://www.googleapis.com/auth/";
 
 type GmailAuthEnvelope = {
@@ -91,6 +98,10 @@ type GmailAuthEnvelope = {
 
 function normalizeGmailScope(scope: string): string {
   return scope.startsWith("https://") ? scope : `${GMAIL_SCOPE_PREFIX}${scope}`;
+}
+
+function normalizeCalendarScope(scope: string): string {
+  return scope.startsWith("https://") ? scope : `https://www.googleapis.com/auth/${scope}`;
 }
 
 /**
@@ -238,6 +249,82 @@ export async function runMcpGmailAuth(input: {
   } finally {
     vault.close();
   }
+}
+
+/** Run the Calendar fork's browser OAuth flow and store its result in vault. */
+export async function runMcpCalendarAuth(input: {
+  persona?: string;
+  redirectUrl?: string;
+  out?: WriteSink;
+  err?: WriteSink;
+}): Promise<number> {
+  const out = input.out ?? process.stdout;
+  const err = input.err ?? process.stderr;
+  const dir = await resolvePersonaDir(input.persona);
+  const registry = await loadRegistry(dir);
+  const entry = registry.mcpServers.calendar;
+  if (!entry) { err.write("no registered MCP server named 'calendar'\n"); return 1; }
+  if (entry.transport !== "stdio" || entry.auth?.type !== "env") {
+    err.write("MCP server 'calendar' must be a stdio server using env vault injection\n");
+    return 1;
+  }
+  const clientVaultKey = entry.auth.env.GOOGLE_CALENDAR_MCP_OAUTH_CLIENT_JSON;
+  const tokenVaultKey = entry.auth.env.GOOGLE_CALENDAR_MCP_OAUTH_TOKEN_JSON;
+  if (!clientVaultKey || !tokenVaultKey) {
+    err.write("MCP server 'calendar' is missing its OAuth client/token vault mappings\n");
+    return 1;
+  }
+
+  const vault = await openPersonaVault(dir);
+  try {
+    const clientJson = vault.get(clientVaultKey);
+    if (!clientJson) { err.write(`missing Calendar OAuth client in vault key ${clientVaultKey}\n`); return 1; }
+    const child = spawn(entry.command!, [...(entry.args ?? []), "auth", ...(input.redirectUrl ? [input.redirectUrl] : [])], {
+      cwd: dir,
+      env: {
+        ...process.env,
+        GOOGLE_CALENDAR_MCP_OAUTH_CLIENT_JSON: clientJson,
+        GOOGLE_CALENDAR_MCP_AUTH_OUTPUT: "pipe",
+        GOOGLE_CALENDAR_MCP_OAUTH_TOKEN_JSON: "",
+        ...(input.redirectUrl ? { GOOGLE_CALENDAR_MCP_REDIRECT_URL: input.redirectUrl } : {}),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      shell: false,
+    });
+    let stdout = "";
+    let spawnError: Error | undefined;
+    child.stdout.on("data", (chunk: Buffer | string) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk: Buffer | string) => { err.write(chunk.toString()); });
+    child.on("error", (error) => { spawnError = error instanceof Error ? error : new Error(String(error)); });
+    const exitCode = await new Promise<number>((resolve) => child.once("close", (code) => resolve(code ?? 1)));
+    if (spawnError) { err.write(`Calendar OAuth process could not start: ${spawnError.message}\n`); return 1; }
+    if (exitCode !== 0) { err.write(`Calendar OAuth process exited with code ${exitCode}\n`); return 1; }
+
+    const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (lines.length !== 1) { err.write("Calendar OAuth returned an unexpected credential response\n"); return 1; }
+    let parsed: unknown;
+    try { parsed = JSON.parse(lines[0]!); } catch { err.write("Calendar OAuth returned invalid credential JSON\n"); return 1; }
+    const envelope = parsed as Record<string, unknown>;
+    const tokenValue = envelope?.tokens;
+    const tokens = tokenValue && typeof tokenValue === "object" && !Array.isArray(tokenValue)
+      ? tokenValue as Record<string, unknown> : undefined;
+    if (!tokens || typeof tokens.refresh_token !== "string" || tokens.refresh_token.trim().length === 0) {
+      err.write("Calendar OAuth did not return a refresh token; authorization was not stored\n"); return 1;
+    }
+    const scopeValue = typeof tokens.scope === "string"
+      ? tokens.scope.split(/\s+/).filter(Boolean)
+      : Array.isArray(envelope.scopes) && envelope.scopes.every((s) => typeof s === "string")
+        ? envelope.scopes as string[] : [];
+    const granted = scopeValue.map(normalizeCalendarScope);
+    const allowed = new Set<string>(CALENDAR_OAUTH_SCOPES);
+    if (granted.some((scope) => !allowed.has(scope)) || CALENDAR_OAUTH_SCOPES.some((scope) => !granted.includes(scope))) {
+      err.write("Calendar OAuth returned scopes outside the configured Calendar policy\n"); return 1;
+    }
+    vault.set(tokenVaultKey, JSON.stringify({ tokens, scopes: [...granted] }));
+    out.write("Calendar OAuth completed; refreshable credentials stored in the encrypted vault.\n");
+    return 0;
+  } finally { vault.close(); }
 }
 
 // ─── add ────────────────────────────────────────────────────────────────────
@@ -845,6 +932,22 @@ export default defineCommand({
       },
       async run({ args }) {
         process.exitCode = await runMcpGmailAuth({
+          persona: args.persona ? String(args.persona) : undefined,
+          redirectUrl: args["redirect-url"] ? String(args["redirect-url"]) : undefined,
+        });
+      },
+    }),
+    "calendar-auth": defineCommand({
+      meta: { name: "calendar-auth", description: "Authorize the safe Google Calendar stdio server into the encrypted vault." },
+      args: {
+        "redirect-url": {
+          type: "string",
+          description: "Registered loopback OAuth callback URL (for example http://127.0.0.1:18080/callback).",
+        },
+        ...personaArg,
+      },
+      async run({ args }) {
+        process.exitCode = await runMcpCalendarAuth({
           persona: args.persona ? String(args.persona) : undefined,
           redirectUrl: args["redirect-url"] ? String(args["redirect-url"]) : undefined,
         });
