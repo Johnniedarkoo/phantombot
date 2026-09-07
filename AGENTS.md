@@ -377,17 +377,24 @@ It is diagnostic only: no routing, timeout, retry or compaction behavior may
 depend on it. Raw event files may contain prompts and tool results, so tests
 must use temporary directories and operators must keep the directory private.
 
-**Local vLLM context is runtime metadata.** The managed
+**Local-provider model metadata is runtime-derived.** The managed
 `pi-extension/dynamic-context/` extension probes the configured local `vllm`
 provider's `/v1/models` during Pi startup, before model resolution, and applies
 only the numeric `max_model_len` value to matching configured model entries.
-Profile names are never a capability map. Static model metadata, including the
-16,384-token output ceiling, must be preserved; probe failure falls back to
-the static entry with a warning. `PiHarness.refreshModelInfo()` uses Pi's
-`--list-models` table for `/status`, and the parser must retain provider, model,
-context, and max-output fields. `--offline` remains enabled: Pi's installed
-0.84.2 semantics permit this localhost extension fetch while disabling Pi's
-own startup network refreshes.
+For `llamacpp`, the router's `/v1/models` catalog is authoritative for
+selectable profile ids, profile context arguments, and reported input
+modalities, so valid profiles absent from static Pi config are registered and
+failed/unavailable profiles are omitted. Profile names are never a capability
+map. Static model metadata, including the 16,384-token output ceiling, must be
+preserved where present. When llama.cpp does not report an output limit, newly
+discovered profiles use the existing conservative 16,384-token Pi request
+ceiling because Pi 0.84.2 requires a finite `maxTokens` for extension models;
+this is not a native model-limit claim. Probe failure falls back to static
+entries with a warning. `PiHarness.refreshModelInfo()`
+uses Pi's `--list-models` table for `/status`, and the parser must retain
+provider, model, context, and max-output fields. `--offline` remains enabled:
+Pi's installed 0.84.2 semantics permit this localhost extension fetch while
+disabling Pi's own startup network refreshes.
 
 The extension also installs a mid-loop context guard using Pi's `turn_end`,
 `getContextUsage()` and `compact()` APIs: only an intermediate `toolUse` turn

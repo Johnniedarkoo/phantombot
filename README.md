@@ -1542,6 +1542,27 @@ completion handling. If a failed turn's model-generated recovery also fails,
 the interactive channel emits a concise local failure bubble rather than
 silently completing with no user-visible result.
 
+### Local llama.cpp model discovery
+
+For the local `llamacpp` provider, the same managed Pi extension reads the
+router's `/v1/models` catalog before Pi resolves a model or renders
+`pi --list-models`. The router's profile ids are authoritative: valid unloaded
+and loaded profiles are registered dynamically, while failed or unavailable
+profiles are omitted. This means configured profiles such as
+`gemma4-26b-a4b-qat` and `gemma4-31b-qat` appear in `/model list` without a
+second manually maintained Pi model list.
+
+The router's profile arguments supply the context window, and its reported
+input modalities supply image capability. Static Pi metadata remains in force
+for fields the router does not report, such as reasoning preferences and an
+explicit output-token limit. For newly discovered profiles, PhantomBot uses
+its existing conservative 16,384-token request ceiling because Pi 0.84.2
+requires a finite `maxTokens` field for extension-registered models; this is
+not inferred as Gemma's native output limit. Pi still sends the selected
+profile id to the router, so selecting a profile is a real llama.cpp
+load/switch request; a load failure is surfaced rather than silently falling
+back to another profile.
+
 ## Model Management (`/model`)
 
 `/model` shows and switches the model every configured harness runs — from
