@@ -1,8 +1,9 @@
 /**
- * Pure data handling for the dynamic vLLM context extension.
+ * Pure data handling for the dynamic local-provider extension.
  *
- * The endpoint is authoritative for contextWindow. The provider's static
- * models.json entries remain the source for every other model property.
+ * vLLM exposes one static model list with runtime context metadata. llama.cpp
+ * exposes the router's actual profile catalog, so that catalog is authoritative
+ * for which model ids Pi may select and for runtime-derived capabilities.
  */
 
 export const MIN_CONTEXT_WINDOW = 1_024;
@@ -51,8 +52,8 @@ export interface RegisteredModelConfig {
     cacheWrite: number;
     [key: string]: unknown;
   };
-  contextWindow: number;
-  maxTokens: number;
+  contextWindow?: number;
+  maxTokens?: number;
   samplingParams?: Record<string, unknown>;
   headers?: Record<string, string>;
   compat?: Record<string, unknown>;
@@ -83,6 +84,108 @@ export function parseRuntimeContexts(payload: unknown): Map<string, number> {
     }
   }
   return contexts;
+}
+
+export interface RuntimeModelCatalogEntry {
+  id: string;
+  name?: string;
+  contextWindow?: number;
+  reasoning?: boolean;
+  input?: Array<"text" | "image">;
+}
+
+function runtimeStatusFailed(item: Record<string, unknown>): boolean {
+  if (
+    item.failed === true ||
+    (item.error !== undefined && item.error !== null)
+  ) {
+    return true;
+  }
+  const status = item.status;
+  if (isRecord(status) && status.failed === true) return true;
+  const value =
+    typeof status === "string"
+      ? status
+      : isRecord(status) && typeof status.value === "string"
+        ? status.value
+        : undefined;
+  return (
+    value !== undefined &&
+    ["failed", "error", "unavailable"].includes(value.toLowerCase())
+  );
+}
+
+function contextFromArgs(value: unknown): number | undefined {
+  if (!Array.isArray(value)) return undefined;
+  for (let index = 0; index < value.length; index += 1) {
+    if (typeof value[index] !== "string") continue;
+    const argument = value[index];
+    const equals = argument.match(/^(?:--ctx-size|--context-size|-c)=(\d+)$/);
+    if (equals?.[1] && validContextWindow(Number(equals[1]))) return Number(equals[1]);
+    if (!["--ctx-size", "--context-size", "-c"].includes(argument)) continue;
+    const next = value[index + 1];
+    if (
+      typeof next === "string" &&
+      /^\d+$/.test(next) &&
+      validContextWindow(Number(next))
+    ) {
+      return Number(next);
+    }
+  }
+  return undefined;
+}
+
+function runtimeContextWindow(item: Record<string, unknown>): number | undefined {
+  const status = isRecord(item.status) ? item.status : undefined;
+  const argsContext = contextFromArgs(status?.args ?? item.args);
+  if (argsContext !== undefined) return argsContext;
+  for (const value of [
+    item.context_length,
+    item.active_context_length,
+    item.n_ctx,
+    isRecord(item.meta) ? item.meta.n_ctx : undefined,
+  ]) {
+    if (validContextWindow(value)) return value;
+  }
+  return undefined;
+}
+
+function runtimeInput(item: Record<string, unknown>): Array<"text" | "image"> | undefined {
+  const architecture = isRecord(item.architecture) ? item.architecture : undefined;
+  const modalities = architecture?.input_modalities;
+  if (
+    !Array.isArray(modalities) ||
+    !modalities.every((value) => typeof value === "string")
+  ) {
+    return undefined;
+  }
+  return modalities.includes("image") ? ["text", "image"] : ["text"];
+}
+
+/** Read the llama.cpp router's live `/v1/models` profile catalog. */
+export function parseRuntimeModelCatalog(
+  payload: unknown,
+): RuntimeModelCatalogEntry[] | undefined {
+  if (!isRecord(payload) || !Array.isArray(payload.data)) return undefined;
+
+  const catalog: RuntimeModelCatalogEntry[] = [];
+  for (const item of payload.data) {
+    if (!isRecord(item) || typeof item.id !== "string" || !item.id.trim()) continue;
+    if (item.id === "default" || runtimeStatusFailed(item)) continue;
+    const contextWindow = runtimeContextWindow(item);
+    const input = runtimeInput(item);
+    const entry: RuntimeModelCatalogEntry = {
+      id: item.id,
+      ...(typeof item.name === "string" ? { name: item.name } : {}),
+      ...(contextWindow !== undefined
+        ? { contextWindow }
+        : {}),
+      ...(typeof item.reasoning === "boolean" ? { reasoning: item.reasoning } : {}),
+      ...(input ? { input } : {}),
+    };
+    catalog.push(entry);
+  }
+  return catalog;
 }
 
 function staticEntries(
@@ -127,6 +230,44 @@ export function registeredModelsWithRuntimeContexts(
     ...(model.headers ? { headers: model.headers } : {}),
     ...(model.compat ? { compat: model.compat } : {}),
   }));
+}
+
+/**
+ * Register exactly the profiles the llama.cpp router advertises. Static Pi
+ * metadata is overlaid where available; newly discovered profiles receive
+ * only metadata that the router actually reports.
+ */
+export function registeredModelsWithRuntimeCatalog(
+  provider: StaticProviderConfig,
+  catalog: readonly RuntimeModelCatalogEntry[],
+): RegisteredModelConfig[] {
+  const configured = new Map(staticEntries(provider.models));
+  return catalog.map((runtime) => {
+    const model = configured.get(runtime.id) ?? {};
+    return {
+      id: runtime.id,
+      name: model.name ?? runtime.name ?? runtime.id,
+      ...(model.api ?? provider.api ? { api: model.api ?? provider.api } : {}),
+      ...(model.baseUrl ?? provider.baseUrl
+        ? { baseUrl: model.baseUrl ?? provider.baseUrl }
+        : {}),
+      reasoning: model.reasoning ?? runtime.reasoning ?? false,
+      ...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}),
+      input: model.input ?? runtime.input ?? ["text"],
+      cost: model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      ...(runtime.contextWindow !== undefined || model.contextWindow !== undefined
+        ? { contextWindow: runtime.contextWindow ?? model.contextWindow }
+        : {}),
+      // Pi 0.84.2's --list-models formatter requires a finite maxTokens
+      // value for extension-registered models. This is the existing
+      // conservative request ceiling, not a claim about the model's native
+      // output limit (which llama.cpp does not report here).
+      maxTokens: model.maxTokens ?? 16_384,
+      ...(model.samplingParams ? { samplingParams: model.samplingParams } : {}),
+      ...(model.headers ? { headers: model.headers } : {}),
+      ...(model.compat ? { compat: model.compat } : {}),
+    };
+  });
 }
 
 export function runtimeModelsUrl(baseUrl: string): string {
