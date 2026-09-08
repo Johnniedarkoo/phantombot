@@ -173,6 +173,25 @@ export interface PiHarnessConfig {
   reasoningReplay?: Partial<ReasoningReplayConfig>;
 }
 
+/**
+ * Pi prints the model column without its provider prefix, while phantombot
+ * may persist the same selection as `provider/model`. Accept both identities
+ * when resolving the refreshed capability row.
+ */
+export function piModelMatchesRouting(
+  model: Pick<PiModel, "provider" | "model">,
+  provider: string,
+  configuredModel: string,
+): boolean {
+  const bareModel = configuredModel.startsWith(`${provider}/`)
+    ? configuredModel.slice(provider.length + 1)
+    : configuredModel;
+  return (
+    model.provider === provider &&
+    (model.model === configuredModel || model.model === bareModel)
+  );
+}
+
 export class PiHarness implements Harness {
   readonly id: string;
   private resolvedModel?: PiModel;
@@ -233,8 +252,7 @@ export class PiHarness implements Harness {
     // unrelated catalog/network refresh is suppressed.
     const models = await listPiModels(this.command(), undefined, { PI_OFFLINE: "1" });
     this.resolvedModel = models.find(
-      (model) =>
-        model.provider === routing.provider && model.model === routing.primaryModel,
+      (model) => piModelMatchesRouting(model, routing.provider!, routing.primaryModel!),
     );
     if (!this.resolvedModel) {
       log.warn("pi model capability discovery did not resolve the configured model", {
