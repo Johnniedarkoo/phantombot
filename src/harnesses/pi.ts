@@ -123,8 +123,9 @@ export class PiHarness implements Harness {
     const provider = r?.provider;
     const resolved =
       this.resolvedModel &&
-      this.resolvedModel.model === model &&
-      this.resolvedModel.provider === provider
+      provider &&
+      model &&
+      piModelMatchesRouting(this.resolvedModel, provider, model)
         ? this.resolvedModel
         : undefined;
     return {
