@@ -6,11 +6,28 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { PiHarness } from "../src/harnesses/pi.ts";
+import { PiHarness, piModelMatchesRouting } from "../src/harnesses/pi.ts";
 import { ClaudeHarness } from "../src/harnesses/claude.ts";
 import { CodexHarness } from "../src/harnesses/codex.ts";
 
 describe("PiHarness.modelInfo", () => {
+  test("matches Pi's bare model row to a provider-qualified routing id", () => {
+    expect(
+      piModelMatchesRouting(
+        { provider: "llamacpp", model: "gemma4-26b-a4b-qat" },
+        "llamacpp",
+        "llamacpp/gemma4-26b-a4b-qat",
+      ),
+    ).toBe(true);
+    expect(
+      piModelMatchesRouting(
+        { provider: "llamacpp", model: "gemma4-26b-a4b-qat" },
+        "llamacpp",
+        "other/gemma4-26b-a4b-qat",
+      ),
+    ).toBe(false);
+  });
+
   test("with full routing configured", () => {
     const h = new PiHarness({
       bin: "pi",
