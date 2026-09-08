@@ -8,6 +8,12 @@
 
 export const MIN_CONTEXT_WINDOW = 1_024;
 export const MAX_CONTEXT_WINDOW = 10_000_000;
+const CONTEXT_ARGS = new Set([
+  "--ctx-size",
+  "--context-size",
+  "-c",
+  "-ctx",
+]);
 
 export interface StaticProviderConfig {
   api?: string;
@@ -120,9 +126,9 @@ function contextFromArgs(value: unknown): number | undefined {
   for (let index = 0; index < value.length; index += 1) {
     if (typeof value[index] !== "string") continue;
     const argument = value[index];
-    const equals = argument.match(/^(?:--ctx-size|--context-size|-c)=(\d+)$/);
-    if (equals?.[1] && validContextWindow(Number(equals[1]))) return Number(equals[1]);
-    if (!["--ctx-size", "--context-size", "-c"].includes(argument)) continue;
+    const equals = argument.match(/^(--ctx-size|--context-size|-c|-ctx)=(\d+)$/);
+    if (equals?.[2] && validContextWindow(Number(equals[2]))) return Number(equals[2]);
+    if (!CONTEXT_ARGS.has(argument)) continue;
     const next = value[index + 1];
     if (
       typeof next === "string" &&

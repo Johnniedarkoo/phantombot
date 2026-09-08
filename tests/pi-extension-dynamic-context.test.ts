@@ -136,6 +136,52 @@ describe("dynamic Pi context extension data handling", () => {
     expect(models.find((model) => model.id === "gemma4-26b-a4b-qat")?.maxTokens).toBe(16_384);
   });
 
+  test("accepts llama.cpp context flag aliases, including router -ctx", () => {
+    const catalog = parseRuntimeModelCatalog({
+      data: [
+        { id: "ctx-size", status: { args: ["--ctx-size", "192000"] } },
+        { id: "ctx-size-equals", status: { args: ["--ctx-size=192000"] } },
+        { id: "context-size", status: { args: ["--context-size", "192000"] } },
+        { id: "context-size-equals", status: { args: ["--context-size=192000"] } },
+        { id: "short-c", status: { args: ["-c", "192000"] } },
+        { id: "short-c-equals", status: { args: ["-c=192000"] } },
+        { id: "router-ctx", status: { args: ["-ctx", "192000"] } },
+        { id: "router-ctx-equals", status: { args: ["-ctx=192000"] } },
+      ],
+    });
+
+    expect(catalog?.map((model) => model.contextWindow)).toEqual(
+      Array(8).fill(192_000),
+    );
+  });
+
+  test("command-line context takes precedence and invalid values are ignored", () => {
+    const catalog = parseRuntimeModelCatalog({
+      data: [
+        {
+          id: "explicit-wins",
+          status: { args: ["-ctx", "192000"] },
+          context_length: 65_536,
+          active_context_length: 65_536,
+          n_ctx: 65_536,
+          meta: { n_ctx: 65_536 },
+        },
+        { id: "bad-text", status: { args: ["-ctx", "abc"] } },
+        { id: "bad-negative", status: { args: ["-ctx", "-1"] } },
+        { id: "bad-zero", status: { args: ["-ctx", "0"] } },
+        { id: "bad-large", status: { args: ["-ctx", "999999999999"] } },
+      ],
+    });
+
+    expect(catalog).toEqual([
+      { id: "explicit-wins", contextWindow: 192_000 },
+      { id: "bad-text" },
+      { id: "bad-negative" },
+      { id: "bad-zero" },
+      { id: "bad-large" },
+    ]);
+  });
+
   test("does not register failed or malformed runtime profiles", () => {
     expect(
       parseRuntimeModelCatalog({
