@@ -1575,7 +1575,7 @@ harness model config is baked in at process start.
 ```text
 /model                      what the primary harness is running now
 /model list [filter]        Pi model catalog (pi --list-models), optionally filtered
-/model <slug>               switch the primary harness's model
+/model <alias|model-id>     switch the primary harness's model
 /model primary <slug>       same, spelled out (Pi primary role)
 /model coding <slug>        set the Pi coding-brain model
 /model image <slug>         set the Pi vision/image model
@@ -1599,8 +1599,22 @@ Per-harness behavior:
   so the CLI's own default applies again (in a persona file it writes
   `model = ""` instead, since deleting the key would inherit the host's pin).
 
-Model choice is per-harness config, not per-chat — switching brains affects
-every conversation that harness serves. `/status` always shows the result: a
+Short names are configured in the host config and resolve exactly (no fuzzy
+matching):
+
+```toml
+[models.aliases]
+gemma = "llamacpp/gemma4-26b-a4b-qat"
+qwen = "llamacpp/qwen3.8-27b-code-c2"
+```
+
+`/model qwen` is equivalent to selecting the full id through the normal Pi
+primary-model path. A full provider-qualified id remains accepted. Alias names
+are case-insensitive; an unknown short name is rejected with the available
+names. Model choice is persisted in the active persona's config, so switching
+brains affects every conversation that persona serves after the restart.
+`/coder` remains a separate per-conversation coding-brain override.
+`/status` always shows the result: a
 `models:` line with each harness's configured model (and provider, for Pi),
 next to the phantom name, PID, version, and the availability-annotated
 harness chain.

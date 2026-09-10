@@ -163,6 +163,7 @@ describe("loadConfig — defaults (no file)", () => {
     // the standing default that keeps the agent anchored on long runs.
     expect(c.chattiness).toBe(true);
     expect(c.promptCache).toEqual(DEFAULT_PROMPT_CACHE);
+    expect(c.models).toEqual({ aliases: {} });
   });
 
   test("durable-facts defaults are pinned (drift guard)", async () => {
@@ -342,6 +343,10 @@ max_payload_bytes = 500000
 [harnesses.codex]
 bin = "/opt/codex/codex"
 model = "gpt-5.3-codex"
+
+[models.aliases]
+Gemma = "llamacpp/gemma4-26b-a4b-qat"
+QWEN = "llamacpp/qwen3.8-27b-code-c2"
 `,
       "utf8",
     );
@@ -363,6 +368,24 @@ model = "gpt-5.3-codex"
     expect(c.harnesses.codex).toBeDefined();
     expect(c.harnesses.codex!.bin).toBe("/opt/codex/codex");
     expect(c.harnesses.codex!.model).toBe("gpt-5.3-codex");
+    expect(c.models?.aliases).toEqual({
+      gemma: "llamacpp/gemma4-26b-a4b-qat",
+      qwen: "llamacpp/qwen3.8-27b-code-c2",
+    });
+  });
+
+  test("rejects invalid model alias configuration at load time", async () => {
+    const cfgDir = join(workdir, "config", "phantombot");
+    await mkdir(cfgDir, { recursive: true });
+    await writeFile(
+      join(cfgDir, "config.toml"),
+      `[models.aliases]
+gemma = "a"
+GEMMA = "b"
+`,
+      "utf8",
+    );
+    await expect(loadConfig()).rejects.toThrow("case-insensitive");
   });
 
   test("reads per-persona harness chain overrides", async () => {

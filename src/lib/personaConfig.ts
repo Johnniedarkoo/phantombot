@@ -63,7 +63,9 @@ import { log } from "./logger.ts";
  * unless the operator deliberately pinned one.
  *
  * Notably absent: `personas_dir`, `memory_db`, `update_channel`,
- * `default_persona`, `autostart_personas`.
+ * `default_persona`, `autostart_personas`, and `models` (model aliases are
+ * host-wide convenience names; the selected model remains persona-scoped in
+ * `[harnesses.pi.routing]`).
  */
 export const PERSONA_SCOPED_KEYS: readonly string[] = [
   "channels",
@@ -91,6 +93,7 @@ export const HOST_ONLY_KEYS: readonly string[] = [
   "update_channel",
   "personas_dir",
   "memory_db",
+  "models",
 ];
 
 /** Drop host-level keys from a persona layer. Returns a new object. */

@@ -19,6 +19,7 @@ import {
   formatModelShow,
   parseModelRequest,
 } from "../src/lib/modelCommand.ts";
+import { parseModelAliases } from "../src/lib/modelAliases.ts";
 import { getIn, readConfigToml } from "../src/lib/configWriter.ts";
 
 const TOUCHED_ENV = [
@@ -59,6 +60,7 @@ function makeConfig(overrides: Partial<Config["harnesses"]> = {}): Config {
     personasDir: dir,
     memoryDbPath: ":memory:",
     configPath,
+    models: { aliases: {} },
     harnesses: {
       chain: ["pi"],
       claude: { bin: "claude", model: "opus", fallbackModel: "sonnet" },
@@ -155,6 +157,24 @@ describe("formatModelShow", () => {
     expect(out).toContain("(none)");
   });
 
+  test("pi shows the matching alias and available aliases", () => {
+    const out = formatModelShow(
+      "pi",
+      {
+        model: "llamacpp/qwen3.8-27b-code-c2",
+        provider: "llamacpp",
+      },
+      {
+        gemma: "llamacpp/gemma4-26b-a4b-qat",
+        qwen: "llamacpp/qwen3.8-27b-code-c2",
+      },
+    );
+    expect(out).toContain("pi primary: qwen");
+    expect(out).toContain("model:      llamacpp/qwen3.8-27b-code-c2");
+    expect(out).toContain("gemma → llamacpp/gemma4-26b-a4b-qat");
+    expect(out).toContain("qwen → llamacpp/qwen3.8-27b-code-c2");
+  });
+
   test("claude includes fallback when set", () => {
     const out = formatModelShow("claude", {
       model: "opus",
@@ -214,6 +234,62 @@ describe("applyModelRequest pi", () => {
     );
     expect(process.env.PHANTOMBOT_CODING_MODEL).toBe("qwen-coder");
     expect(process.env.PHANTOMBOT_IMAGE_MODEL).toBe("qwen-vl");
+  });
+
+  test("resolves aliases case-insensitively and keeps full ids working", async () => {
+    const config = makeConfig();
+    config.models = {
+      aliases: {
+        gemma: "llamacpp/gemma4-26b-a4b-qat",
+        qwen: "llamacpp/qwen3.8-27b-code-c2",
+      },
+    };
+    const alias = await applyModelRequest(
+      { kind: "set", role: "primary", slug: "QWEN" },
+      "pi",
+      config,
+    );
+    expect(alias).toEqual({ ok: true, summary: "pi primary model → llamacpp/qwen3.8-27b-code-c2" });
+    expect(config.harnesses.pi.routing?.primaryModel).toBe(
+      "llamacpp/qwen3.8-27b-code-c2",
+    );
+
+    const full = await applyModelRequest(
+      {
+        kind: "set",
+        role: "primary",
+        slug: "llamacpp/gemma4-26b-a4b-qat",
+      },
+      "pi",
+      config,
+    );
+    expect(full.ok).toBe(true);
+    expect(config.harnesses.pi.routing?.primaryModel).toBe(
+      "llamacpp/gemma4-26b-a4b-qat",
+    );
+  });
+
+  test("rejects an unknown short alias with available names", async () => {
+    const config = makeConfig();
+    config.models = { aliases: { gemma: "llamacpp/gemma4-26b-a4b-qat" } };
+    const result = await applyModelRequest(
+      { kind: "set", role: "primary", slug: "quwen" },
+      "pi",
+      config,
+    );
+    expect(result).toEqual({
+      ok: false,
+      error: "unknown model alias 'quwen' — available aliases: gemma",
+    });
+    expect(config.harnesses.pi.routing?.primaryModel).toBeUndefined();
+  });
+
+  test("alias validation rejects case-folded duplicates and reserved words", () => {
+    expect(() =>
+      parseModelAliases({ gemma: "a", GEMMA: "b" }),
+    ).toThrow("case-insensitive");
+    expect(() => parseModelAliases({ list: "a" })).toThrow("reserved");
+    expect(() => parseModelAliases({ gemma: " " })).toThrow("non-empty");
   });
 
   test("clear is refused — pi has no default to fall back to", async () => {

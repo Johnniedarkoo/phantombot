@@ -943,15 +943,14 @@ async function handleHarness(
 /**
  * /model — view, list, and flip the primary harness's model (issue #313).
  *
- * Every write persists to BOTH config.toml and ~/.env (env wins at startup,
- * so a TOML-only write would be silently ignored on wizard-configured
- * installs), syncs the in-memory Config, then restarts — all four harnesses
- * bake their model config at construction, so nothing short of a bounce
- * activates the new model. Same afterSend dance as /restart: the user reads
- * the confirmation first, THEN we go down.
+ * Every write persists to the persona's config.toml, syncs the in-memory
+ * Config, then restarts — all four harnesses bake their model config at
+ * construction, so nothing short of a bounce activates the new model. Same
+ * afterSend dance as /restart: the user reads the confirmation first, THEN we
+ * go down.
  */
 const MODEL_USAGE =
-  "usage: /model [list [filter] | <slug> | primary <slug> | coding <slug> | image <slug> | clear]\n" +
+  "usage: /model [list [filter] | <alias|model-id> | primary <alias|model-id> | coding <alias|model-id> | image <alias|model-id> | clear]\n" +
   "  /model            — show the primary harness's current model\n" +
   "  /model list       — list models the primary harness can run (pi only)\n" +
   "  /model <slug>     — switch the primary model (restarts phantombot)\n" +
@@ -969,7 +968,13 @@ async function handleModel(
   if (!primary) return { reply: "no harnesses configured" };
 
   if (req.kind === "show") {
-    return { reply: formatModelShow(primary.id, primary.modelInfo?.()) };
+    return {
+      reply: formatModelShow(
+        primary.id,
+        primary.modelInfo?.(),
+        ctx.config?.models?.aliases,
+      ),
+    };
   }
   if (req.kind === "list") {
     return await handleModelList(req.filter, primary, ctx);
