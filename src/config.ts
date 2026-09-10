@@ -69,6 +69,7 @@ import {
 } from "./lib/decisionModelJudge.ts";
 import { DECISION_MODEL_ROUTER_DEFAULT_TIMEOUT_MS } from "./lib/decisionModelRouter.ts";
 import { currentEngineScope, hostLocationEnv } from "./lib/engineScope.ts";
+import { parseModelAliases, type ModelAliases } from "./lib/modelAliases.ts";
 
 /**
  * Read the legacy `turn_timeout_s` (TOML) or `PHANTOMBOT_TURN_TIMEOUT_MS`
@@ -784,6 +785,11 @@ export interface Config {
   /** Path to the config file we loaded (whether it existed or not). */
   configPath: string;
 
+  /** Host-level short names accepted by the `/model` command. */
+  models?: {
+    aliases: ModelAliases;
+  };
+
   harnesses: {
     /**
      * Order = primary → fallback. Recognized ids: "claude", "codex", "native"
@@ -1392,6 +1398,11 @@ export async function loadConfig(persona?: string): Promise<Config> {
   });
 
   const tomlChannels = (toml.channels ?? {}) as Record<string, unknown>;
+  if (toml.models !== undefined && !isTomlTable(toml.models)) {
+    throw new Error("[models] must be a TOML table");
+  }
+  const tomlModels = (toml.models ?? {}) as Record<string, unknown>;
+  const modelAliases = parseModelAliases(tomlModels.aliases);
   const tomlTelegram = (tomlChannels.telegram ?? {}) as Record<string, unknown>;
   const tomlP2p = (toml.p2p ?? {}) as Record<string, unknown>;
   const tomlEmbeddings = (toml.embeddings ?? {}) as Record<string, unknown>;
@@ -1662,6 +1673,8 @@ export async function loadConfig(persona?: string): Promise<Config> {
       join(dataDir, "memory.sqlite"),
 
     configPath,
+
+    models: { aliases: modelAliases },
 
     harnesses: {
       chain: mapLegacyChain(migratedChain, legacyPiFacts),

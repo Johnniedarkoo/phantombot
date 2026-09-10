@@ -1295,6 +1295,12 @@ describe("/model", () => {
       // shape that cannot exist on a host.
       defaultPersona: "phantom",
       personasDir: join(dir, "personas"),
+      models: {
+        aliases: {
+          gemma: "llamacpp/gemma4-26b-a4b-qat",
+          qwen: "llamacpp/qwen3.8-27b-code-c2",
+        },
+      },
       harnesses: {
         chain: ["pi"],
         claude: { bin: "claude", model: "opus", fallbackModel: "sonnet" },
@@ -1318,6 +1324,25 @@ describe("/model", () => {
     );
     expect(r!.reply).toContain("pi primary: deepseek-v3");
     expect(r!.reply).toContain("openrouter");
+  });
+
+  test("bare /model shows the active alias and its configured ids", async () => {
+    const config = modelConfig();
+    const r = await handleSlashCommand(
+      "/model",
+      ctx({
+        config,
+        harnesses: [
+          new StubHarness("pi", true, {
+            model: "llamacpp/qwen3.8-27b-code-c2",
+            provider: "llamacpp",
+          }),
+        ],
+      }),
+    );
+    expect(r!.reply).toContain("pi primary: qwen");
+    expect(r!.reply).toContain("qwen → llamacpp/qwen3.8-27b-code-c2");
+    expect(r!.reply).toContain("gemma → llamacpp/gemma4-26b-a4b-qat");
   });
 
   test("bad args show usage", async () => {
@@ -1368,6 +1393,27 @@ describe("/model", () => {
     expect(getIn(toml, ["harnesses", "pi", "routing", "primary_model"])).toBe(
       "deepseek-v3",
     );
+  });
+
+  test("/model alias uses normal primary selection and leaves coder routing alone", async () => {
+    const config = modelConfig();
+    config.harnesses.pi.routing = {
+      provider: "llamacpp",
+      primaryModel: "llamacpp/gemma4-26b-a4b-qat",
+      codingModel: "qwen3.8-27b-code-c2",
+    };
+    const r = await handleSlashCommand(
+      "/model qwen",
+      ctx({
+        harnesses: [new StubHarness("pi", true, { model: "old-model" })],
+        config,
+      }),
+    );
+    expect(r!.reply).toContain("pi primary model → llamacpp/qwen3.8-27b-code-c2");
+    expect(config.harnesses.pi.routing.primaryModel).toBe(
+      "llamacpp/qwen3.8-27b-code-c2",
+    );
+    expect(config.harnesses.pi.routing.codingModel).toBe("qwen3.8-27b-code-c2");
   });
 
   test("/model in a NON-default persona's chat writes that persona's file", async () => {

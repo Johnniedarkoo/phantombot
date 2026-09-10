@@ -866,5 +866,18 @@ describe("makeExtractionComplete", () => {
 
   test("is undefined only for an EMPTY chain", () => {
     expect(makeExtractionComplete([], cfg)).toBeUndefined();
+  test("uses the active primary harness and never the fallback", async () => {
+    const primary = recording();
+    const fallback = recording();
+    await makeExtractionComplete([primary.harness, fallback.harness], cfg)!(
+      "system",
+      "user",
+    );
+    expect(primary.seen.req).toBeDefined();
+    expect(fallback.seen.req).toBeUndefined();
+    // `/model` changes the persona's primary routing before the harness chain
+    // is rebuilt; the extractor deliberately follows chain[0] and therefore
+    // needs no separate model-selection or scheduler semantics.
+    expect(primary.seen.req?.toolsMode).toBe("none");
   });
 });

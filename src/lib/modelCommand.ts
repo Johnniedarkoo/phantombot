@@ -41,6 +41,7 @@ import {
   suffixEnvKeys,
 } from "./harnessWriteTarget.ts";
 import type { HarnessModelInfo } from "../harnesses/types.ts";
+import { modelAliasFor, resolveModelAlias } from "./modelAliases.ts";
 
 // ---------------------------------------------------------------------------
 // Parsing
@@ -100,16 +101,27 @@ export function parseModelRequest(arg: string): ModelRequest {
 export function formatModelShow(
   harnessId: string,
   info: HarnessModelInfo | undefined,
+  aliases?: Readonly<Record<string, string>>,
 ): string {
   if (!info) {
     return `${harnessId}: model info unavailable (harness doesn't report it)`;
   }
   if (harnessId === "pi" || harnessId === "native" || harnessId.startsWith("pi-")) {
-      const lines = [`${harnessId} primary: ${info.model}`];
-      if (info.provider) lines.push(`provider:   ${info.provider}`);
-      lines.push(`coding:     ${info.codingModel ?? "(same as primary)"}`);
-      lines.push(`image:      ${info.imageModel ?? "(none)"}`);
-      return lines.join("\n");
+    const alias = modelAliasFor(info.model, aliases, info.provider);
+    const lines = [`${harnessId} primary: ${alias ?? info.model}`];
+    if (alias) lines.push(`model:      ${info.model}`);
+    if (info.provider) lines.push(`provider:   ${info.provider}`);
+    lines.push(`coding:     ${info.codingModel ?? "(same as primary)"}`);
+    lines.push(`image:      ${info.imageModel ?? "(none)"}`);
+    if (aliases && Object.keys(aliases).length > 0) {
+      lines.push("aliases:");
+      for (const [name, model] of Object.entries(aliases).sort(([a], [b]) =>
+        a.localeCompare(b),
+      )) {
+        lines.push(`  ${name} → ${model}`);
+      }
+    }
+    return lines.join("\n");
   }
   switch (harnessId) {
     case "claude":
@@ -208,6 +220,9 @@ async function applyPi(
         "use /model <slug> to switch, or `phantombot harness` to re-run the routing wizard",
     };
   }
+  const resolved = resolveModelAlias(req.slug, config.models?.aliases);
+  if (!resolved.ok) return resolved;
+  req = { ...req, slug: resolved.model };
   const { tomlKey, envVar, routingField } = PI_ROLE_WRITES[req.role];
   const base = instanceId
     ? ["harnesses", "instances", instanceId, "routing"]
