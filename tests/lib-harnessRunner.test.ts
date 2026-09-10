@@ -16,6 +16,8 @@ import {
   runHarnessProcess,
 } from "../src/lib/harnessRunner.ts";
 import { spawnInNewSession } from "../src/lib/processGroup.ts";
+import { parsePiEvent } from "../src/harnesses/pi.ts";
+import type { HarnessChunk } from "../src/harnesses/types.ts";
 
 const trackedPids: number[] = [];
 const longLivedChild = (ms = 30_000): string[] => [
@@ -721,6 +723,104 @@ describe("runHarnessProcess — terminal policy tripwire", () => {
       { type: "error", error: "transient", recoverable: true },
       { type: "text", text: "still here" },
       { type: "done", finalText: "still here", meta: {} },
+    ]);
+    expect(await proc.exited).toBe(0);
+  });
+});
+
+describe("runHarnessProcess — empty post-tool Pi completion", () => {
+  test("fails visibly and does not synthesize success after tool activity", async () => {
+    const proc = spawnInNewSession(
+      [
+        process.execPath,
+        "-e",
+        `const events=${JSON.stringify([
+          { type: "tool_execution_start", toolName: "bash" },
+          { type: "turn_end", message: { stopReason: "stop", content: [] } },
+        ])}; for (const event of events) console.log(JSON.stringify(event));`,
+      ],
+      { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+    );
+    trackedPids.push(proc.pid!);
+
+    const chunks: HarnessChunk[] = [];
+    for await (const chunk of runHarnessProcess({
+      proc,
+      harnessId: "pi",
+      req: {
+        idleTimeoutMs: 5_000,
+        hardTimeoutMs: 10_000,
+        workingDir: process.cwd(),
+        persona: "test",
+        trusted: true,
+        conversation: "test",
+        userMessage: "check mail",
+      } as any,
+      parseEvent: parsePiEvent,
+      activity: () => "productive",
+      buildDoneMeta: () => ({}),
+      requireCompletion: true,
+      rejectEmptyPostToolCompletion: true,
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks.map((c) => c.type)).toEqual(["progress", "error"]);
+    expect(chunks.at(-1)).toMatchObject({
+      type: "error",
+      error: "pi completed after tool use without a user-facing answer",
+      recoverable: false,
+    });
+    expect(chunks.some((c) => c.type === "done")).toBe(false);
+    expect(await proc.exited).toBe(0);
+  });
+
+  test("allows a normal post-tool terminal answer", async () => {
+    const proc = spawnInNewSession(
+      [
+        process.execPath,
+        "-e",
+        `const events=${JSON.stringify([
+          { type: "tool_execution_start", toolName: "bash" },
+          { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "done" } },
+          { type: "turn_end", message: { stopReason: "stop", content: [{ type: "text", text: "done" }] } },
+        ])}; for (const event of events) console.log(JSON.stringify(event));`,
+      ],
+      { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+    );
+    trackedPids.push(proc.pid!);
+
+    const chunks: HarnessChunk[] = [];
+    for await (const chunk of runHarnessProcess({
+      proc,
+      harnessId: "pi",
+      req: {
+        idleTimeoutMs: 5_000,
+        hardTimeoutMs: 10_000,
+        workingDir: process.cwd(),
+        persona: "test",
+        trusted: true,
+        conversation: "test",
+        userMessage: "check mail",
+      } as any,
+      parseEvent: parsePiEvent,
+      activity: () => "productive",
+      buildDoneMeta: (_text, captured) => captured ?? {},
+      requireCompletion: true,
+      rejectEmptyPostToolCompletion: true,
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks).toEqual([
+      { type: "progress", note: "tool: bash", tool: { title: "tool: bash", kind: "execute", locations: [] } },
+      { type: "text", text: "done" },
+      { type: "done", finalText: "done", meta: {
+        completionMarker: "turn_end",
+        terminalStopReason: "stop",
+        nativeTerminalTextEmpty: false,
+        nativeTerminalTextChars: 4,
+      } },
     ]);
     expect(await proc.exited).toBe(0);
   });

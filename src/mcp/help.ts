@@ -93,11 +93,15 @@ REGISTERING FROM A "LEARN MORE" LINK (zero-config-file flow)
   before reporting success.
 
 LAZY DISCOVERY (don't dump every tool into the prompt)
-    phantombot mcp search "<query>"     find tools across registered servers
-    phantombot mcp describe <id>        load the schemas for just one server
-    phantombot mcp call <id> <tool> --args '{"...":"..."}'   invoke a tool
-  Search first; only describe/load schemas when a task actually needs them —
-  the same reflex as memory_search and the deferred-tool ToolSearch primitive.
+    Unknown capability/service:  phantombot mcp search "inbox"
+                             or  phantombot mcp search "calendar"
+    Known server:             phantombot mcp describe <id>
+    Known server + tool:      phantombot mcp call <id> <tool> --args '{"...":"..."}'
+  Search is for finding an unknown capability. If the server id is already
+  known (for example gmail or calendar), use describe for that server and then
+  call the selected tool. An exact server-id search is also accepted as a
+  targeted discovery shortcut. Keep discovery lazy; do not load every schema
+  into the prompt up front.
 
 COMMANDS
     add       register a server (--stdio/--http, an auth method, or --from-url)

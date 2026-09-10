@@ -490,6 +490,12 @@ export interface HarnessProcessSpec {
    */
   requireCompletion?: boolean;
   /**
+   * Reject a native terminal completion with no terminal text after tool
+   * activity. This is intentionally opt-in for Pi: replaying the request to
+   * obtain a missing answer could repeat an already-executed side effect.
+   */
+  rejectEmptyPostToolCompletion?: boolean;
+  /**
    * Wall-clock cap (ms) for a SINGLE tool execution. While the tool is
    * running, the model idle watchdog is suspended and this fixed deadline is
    * not extended by tool updates. Omit to disable the tool-specific deadline.
@@ -588,6 +594,7 @@ export async function* runHarnessProcess(
   // finished this turn" marker (pi's turn_end, codex's turn.completed). Only
   // consulted when spec.requireCompletion is set; see the exit-0 gate below.
   let sawCompletion = false;
+  let sawToolExecution = false;
   // Set when a parser returns a terminal policy error (e.g. the subagent
   // tripwire). The error chunk is yielded, the subprocess is killed NOW,
   // and every line after it — same batch or later — is dropped: nothing a
@@ -606,6 +613,7 @@ export async function* runHarnessProcess(
   function* consume(parsed: unknown): Generator<HarnessChunk> {
     const c = spec.parseEvent(parsed);
     if (!c) return;
+    if (parsedIsToolExecution(parsed)) sawToolExecution = true;
     if (c.type === "error" && c.terminal) {
       terminalError = c;
       killer.terminate(); // SIGTERM → grace → SIGKILL the whole group
@@ -620,6 +628,21 @@ export async function* runHarnessProcess(
     killer.touch(spec.activity(parsed, c));
     if (c.type === "text") finalText += c.text;
     if (c.type === "done") {
+      if (
+        spec.rejectEmptyPostToolCompletion &&
+        sawToolExecution &&
+        nativeTerminalTextIsEmpty(c.meta)
+      ) {
+        const error: HarnessChunk = {
+          type: "error",
+          error: `${harnessId} completed after tool use without a user-facing answer`,
+          recoverable: false,
+        };
+        parsedError = error;
+        killer.terminate();
+        yield error;
+        return;
+      }
       captured = c.meta;
       sawCompletion = true;
       return;
@@ -806,6 +829,18 @@ export async function* runHarnessProcess(
     finalText,
     meta: spec.buildDoneMeta(finalText, captured),
   };
+}
+
+function parsedIsToolExecution(parsed: unknown): boolean {
+  return (
+    typeof parsed === "object" &&
+    parsed !== null &&
+    (parsed as { type?: unknown }).type === "tool_execution_start"
+  );
+}
+
+function nativeTerminalTextIsEmpty(meta: Record<string, unknown> | undefined): boolean {
+  return meta?.nativeTerminalTextEmpty === true || meta?.nativeTerminalTextChars === 0;
 }
 
 /**

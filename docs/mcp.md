@@ -146,8 +146,11 @@ deferred-tool / `ToolSearch` primitive:
 - **Always present (cheap):** a one-line persona-prompt hint that the
   `phantombot mcp` toolbox exists (see `MCP_TOOLS_SECTION` in
   `src/persona/builder.ts`). No upstream schemas loaded up front.
-- **On demand:** `phantombot mcp search "<query>"` → `mcp describe <server>`
-  (loads schemas for just that server) → `mcp call <server> <tool> --args '{…}'`.
+- **On demand:** search an unknown capability such as `inbox` or `attachment`;
+  for a known server use `phantombot mcp describe <server>` →
+  `mcp call <server> <tool> --args '{…}'`. An exact server-id search is also a
+  targeted discovery shortcut, but does not replace `describe` in the normal
+  known-server workflow.
 
 For **pi (CLI facade):** identical to how it already reaches `vault`/`memory`/
 `task`. For **Claude/Codex (proxy):** the loopback proxy exposes a discovery

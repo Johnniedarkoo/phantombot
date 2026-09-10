@@ -92,16 +92,20 @@ export class McpHub {
   }
 
   /**
-   * Lazy tool discovery across every registered server: substring match on tool
-   * name + description. Servers that fail to connect are reported in `errors`
-   * rather than aborting the whole search — one broken server must not blind the
-   * agent to the others.
+   * Lazy tool discovery across registered servers. An exact server-id query is
+   * server-targeted and returns that server's tools; other queries are
+   * substring matches over server id + tool name + description. Servers that
+   * fail to connect are reported in `errors` rather than aborting the whole
+   * search — one broken server must not blind the agent to the others.
    */
   async search(query: string): Promise<{ hits: McpToolHit[]; errors: Record<string, string> }> {
     const q = query.trim().toLowerCase();
     const hits: McpToolHit[] = [];
     const errors: Record<string, string> = {};
-    for (const serverId of this.serverIds()) {
+    const registeredServerIds = this.serverIds();
+    const exactServerId = registeredServerIds.find((id) => id.toLowerCase() === q);
+    const serverIds = exactServerId ? [exactServerId] : registeredServerIds;
+    for (const serverId of serverIds) {
       let tools: McpToolInfo[];
       try {
         tools = await this.tools(serverId);
@@ -110,8 +114,8 @@ export class McpHub {
         continue;
       }
       for (const tool of tools) {
-        const hay = `${tool.name} ${tool.description ?? ""}`.toLowerCase();
-        if (q.length === 0 || hay.includes(q)) {
+        const hay = `${serverId} ${tool.name} ${tool.description ?? ""}`.toLowerCase();
+        if (exactServerId || q.length === 0 || hay.includes(q)) {
           hits.push({ server: serverId, qualifiedName: qualify(serverId, tool.name), tool });
         }
       }

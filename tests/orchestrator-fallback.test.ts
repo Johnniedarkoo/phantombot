@@ -255,6 +255,29 @@ describe("runWithFallback — empty done falls through", () => {
     expect(chunks[0]).toMatchObject({ type: "done", finalText: "" });
   });
 
+  test("a terminal post-tool empty error never replays the tool on a fallback", async () => {
+    const primary = new FakeHarness("pi", [
+      { type: "progress", note: "tool: bash", tool: { title: "tool: bash", kind: "execute", locations: [] } },
+      {
+        type: "error",
+        error: "pi completed after tool use without a user-facing answer",
+        recoverable: false,
+      },
+    ]);
+    const backup = new FakeHarness("claude", [{ type: "done", finalText: "must not replay" }]);
+
+    const chunks = await collect(
+      runWithFallback([primary, backup], newRequest(), { cooldown: new CooldownStore() }),
+    );
+    expect(primary.invocations).toBe(1);
+    expect(backup.invocations).toBe(0);
+    expect(chunks.at(-1)).toMatchObject({
+      type: "error",
+      recoverable: false,
+      error: expect.stringContaining("without a user-facing answer"),
+    });
+  });
+
   test("empty done does NOT put the harness into cooldown (#499)", async () => {
     // An empty `done` means the process ran cleanly — a model-output
     // flake, not a harness-health failure. Cooling it would bench the
