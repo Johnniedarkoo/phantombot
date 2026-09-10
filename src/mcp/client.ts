@@ -18,6 +18,7 @@ import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotoc
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 import type { Vault } from "../lib/vault.ts";
+import { log } from "../lib/logger.ts";
 import { VERSION } from "../version.ts";
 import { VaultOAuthClientProvider } from "./authProvider.ts";
 import { type McpServerEntry, resolveServerSecrets } from "./registry.ts";
@@ -53,6 +54,34 @@ export class McpMissingSecretError extends Error {
   }
 }
 
+/** The SDK's JSON-RPC error code for a request deadline. */
+export const MCP_REQUEST_TIMEOUT_CODE = -32001;
+
+/**
+ * Adds the server/tool context that the SDK cannot know at the transport
+ * layer. The original JSON-RPC code and data are kept intact for callers that
+ * need to inspect them.
+ */
+export class McpRequestTimeoutError extends Error {
+  readonly code = MCP_REQUEST_TIMEOUT_CODE;
+  readonly data: unknown;
+  readonly cause: unknown;
+
+  constructor(
+    public readonly serverId: string,
+    public readonly operation: string,
+    public readonly elapsedMs: number,
+    timeoutMs: number,
+    cause: unknown,
+  ) {
+    const deadline = timeoutMs % 1000 === 0 ? `${timeoutMs / 1000}s` : `${timeoutMs}ms`;
+    super(`${serverId}/${operation} timed out after ${deadline} (MCP RequestTimeout)`);
+    this.name = "McpRequestTimeoutError";
+    this.data = isRecord(cause) ? cause.data : undefined;
+    this.cause = cause;
+  }
+}
+
 export interface ConnectOptions {
   /** Persona vault (open) for secret + OAuth-token resolution. */
   vault: Pick<Vault, "get" | "set" | "unset">;
@@ -83,6 +112,7 @@ export async function connectServer(
       env: { ...getDefaultEnvironment(), ...env },
       stderr: "pipe",
     });
+    drainStdioStderr(serverId, transport);
     await client.connect(transport);
     return { client, close: () => client.close() };
   }
@@ -152,4 +182,31 @@ function isUnauthorized(err: unknown): boolean {
     return err.name === "UnauthorizedError" || /unauthor/i.test(err.message);
   }
   return false;
+}
+
+/**
+ * `StdioClientTransport` exposes a PassThrough when stderr is "pipe". The
+ * SDK pipes the child into it, so leaving it unread eventually backpressures
+ * the child and can look like an unrelated request timeout. Drain it without
+ * copying server output (which could contain private diagnostics) into logs.
+ */
+function drainStdioStderr(
+  serverId: string,
+  transport: StdioClientTransport,
+): void {
+  const stderr = transport.stderr;
+  if (!stderr) return;
+  let bytes = 0;
+  stderr.on("data", (chunk: Buffer | string) => {
+    bytes += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.byteLength;
+  });
+  stderr.on("end", () => {
+    // Keep this at debug: the content is intentionally discarded, while the
+    // count is useful when diagnosing a noisy long-lived child.
+    log.debug("mcp stdio stderr drained", { serverId, bytes });
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

@@ -19,6 +19,13 @@ const server = new Server(
   { capabilities: { tools: {} } },
 );
 
+// Used by the client integration test to prove a piped stderr stream is
+// drained. Without a reader, this exceeds the OS pipe buffer before the MCP
+// handshake can complete.
+if (process.argv.includes("--chatty-stderr")) {
+  process.stderr.write("diagnostic\n".repeat(128 * 1024));
+}
+
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {

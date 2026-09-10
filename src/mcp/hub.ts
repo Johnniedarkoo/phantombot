@@ -10,9 +10,11 @@
  */
 
 import type { Vault } from "../lib/vault.ts";
+import { log } from "../lib/logger.ts";
 import {
   callServerTool,
   connectServer,
+  McpRequestTimeoutError,
   type ConnectOptions,
   listServerTools,
   type McpConnection,
@@ -78,7 +80,13 @@ export class McpHub {
     const cached = this.toolCache.get(serverId);
     if (cached) return cached;
     const conn = await this.connection(serverId);
-    const tools = await listServerTools(conn.client);
+    const startedAt = Date.now();
+    let tools: McpToolInfo[];
+    try {
+      tools = await listServerTools(conn.client);
+    } catch (err) {
+      throw this.withTimeoutContext(serverId, "tools/list", startedAt, err);
+    }
     this.toolCache.set(serverId, tools);
     return tools;
   }
@@ -114,7 +122,31 @@ export class McpHub {
   /** Call a tool by server + (unqualified) tool name. */
   async call(serverId: string, toolName: string, args: Record<string, unknown>): Promise<unknown> {
     const conn = await this.connection(serverId);
-    return callServerTool(conn.client, toolName, args);
+    const startedAt = Date.now();
+    try {
+      return await callServerTool(conn.client, toolName, args);
+    } catch (err) {
+      throw this.withTimeoutContext(serverId, toolName, startedAt, err);
+    }
+  }
+
+  private withTimeoutContext(
+    serverId: string,
+    operation: string,
+    startedAt: number,
+    err: unknown,
+  ): unknown {
+    if (!isRequestTimeout(err)) return err;
+    const elapsedMs = Date.now() - startedAt;
+    const timeoutMs = requestTimeoutMs(err);
+    log.warn("mcp request timeout", {
+      serverId,
+      operation,
+      elapsedMs,
+      deadlineMs: timeoutMs,
+      code: -32001,
+    });
+    return new McpRequestTimeoutError(serverId, operation, elapsedMs, timeoutMs, err);
   }
 
   /** Close every open connection. */
@@ -129,4 +161,21 @@ export class McpHub {
     this.conns.clear();
     this.toolCache.clear();
   }
+}
+
+function isRequestTimeout(err: unknown): boolean {
+  return isRecord(err) && err.code === -32001;
+}
+
+function requestTimeoutMs(err: unknown): number {
+  if (!isRecord(err)) return 60_000;
+  const data = err.data;
+  if (isRecord(data) && typeof data.timeout === "number" && Number.isFinite(data.timeout)) {
+    return data.timeout;
+  }
+  return 60_000;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

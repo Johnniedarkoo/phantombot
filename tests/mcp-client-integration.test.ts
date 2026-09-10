@@ -25,11 +25,11 @@ import type { McpServerEntry } from "../src/mcp/registry.ts";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "mcp-echo-server.ts");
 
-function stdioEntry(withSecret: boolean): McpServerEntry {
+function stdioEntry(withSecret: boolean, args: string[] = []): McpServerEntry {
   return {
     transport: "stdio",
     command: process.execPath, // bun under `bun test`
-    args: [FIXTURE],
+    args: [FIXTURE, ...args],
     auth: withSecret ? { type: "env", env: { FIXTURE_SECRET: "MY_FIXTURE_KEY" } } : { type: "none" },
   };
 }
@@ -69,6 +69,18 @@ describe("stdio client against a real MCP server", () => {
         content: Array<{ type: string; text: string }>;
       };
       expect(result.content[0]?.text).toBe("s3cr3t-from-vault");
+    } finally {
+      await conn.close();
+    }
+  }, 20_000);
+
+  test("drains a noisy child stderr stream", async () => {
+    const conn = await connectServer("chatty", stdioEntry(false, ["--chatty-stderr"]), { vault });
+    try {
+      const result = (await callServerTool(conn.client, "echo", { message: "after stderr" })) as {
+        content: Array<{ type: string; text: string }>;
+      };
+      expect(result.content[0]?.text).toBe("after stderr");
     } finally {
       await conn.close();
     }
