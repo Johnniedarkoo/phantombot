@@ -34,4 +34,11 @@ describe("mcp help coverage", () => {
     }
     expect(MCP_HELP).toMatch(/vault key/i);
   });
+
+  test("teaches capability search versus known-server describe", () => {
+    expect(MCP_HELP).toMatch(/search "inbox"/);
+    expect(MCP_HELP).toMatch(/search "calendar"/);
+    expect(MCP_HELP).toMatch(/known server[\s\S]*describe/i);
+    expect(MCP_HELP).toMatch(/exact server-id search/i);
+  });
 });

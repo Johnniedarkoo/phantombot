@@ -604,14 +604,13 @@ export interface HarnessProcessSpec {
    * behaviour every other harness relies on).
    */
   requireCompletion?: boolean;
+  /** Reject Pi's terminal signal when tool activity produced no user-facing answer. */
+  rejectEmptyPostToolCompletion?: boolean;
   /**
-   * Wall-clock cap (ms) on one parser-identified in-flight tool. The idle
-   * watchdog is suspended while tools run; this separate timer bounds both
-   * silent and chattery tools without replaying them through fallback.
-   *
-   * When omitted, defaults across all harnesses (pi, claude, codex) to
-   * `Math.min(req.hardTimeoutMs ?? Infinity, Math.max(req.idleTimeoutMs * 4, 1_200_000))`,
-   * bounding contiguous tool runs without productive output to ~20 minutes.
+   * Wall-clock cap for an in-flight tool execution. The model idle watchdog is
+   * suspended while tools run; tool updates do not extend this fixed deadline.
+   * When omitted, the shared runner derives a bounded default from the idle
+   * timeout and hard cap.
    */
   toolTimeoutMs?: number;
   /**
@@ -762,6 +761,7 @@ export async function* runHarnessProcess(
   // must not satisfy the guard.
   let sawTool = false;
   let textAfterLastTool = false;
+  let sawToolExecution = false;
   // Set when a parser returns a terminal policy error (e.g. the subagent
   // tripwire). The error chunk is yielded, the subprocess is killed NOW,
   // and every line after it — same batch or later — is dropped: nothing a
@@ -810,6 +810,7 @@ export async function* runHarnessProcess(
       c = res;
     }
     if (c.type === "error") sawErrorChunk = true;
+    if (parsedIsToolExecution(parsed)) sawToolExecution = true;
     if (c.type === "error" && c.terminal) {
       terminalError = c;
       killer.terminate(); // SIGTERM → grace → SIGKILL the whole group
@@ -832,6 +833,21 @@ export async function* runHarnessProcess(
       textAfterLastTool = true;
     }
     if (c.type === "done") {
+      if (
+        spec.rejectEmptyPostToolCompletion &&
+        sawToolExecution &&
+        nativeTerminalTextIsEmpty(c.meta)
+      ) {
+        const error: HarnessChunk = {
+          type: "error",
+          error: `${harnessId} completed after tool use without a user-facing answer`,
+          recoverable: false,
+        };
+        parsedError = error;
+        killer.terminate();
+        yield error;
+        return;
+      }
       captured = c.meta;
       sawCompletion = true;
       return;
@@ -1144,6 +1160,18 @@ export async function* runHarnessProcess(
     finalText,
     meta: spec.buildDoneMeta(finalText, captured),
   };
+}
+
+function parsedIsToolExecution(parsed: unknown): boolean {
+  return (
+    typeof parsed === "object" &&
+    parsed !== null &&
+    (parsed as { type?: unknown }).type === "tool_execution_start"
+  );
+}
+
+function nativeTerminalTextIsEmpty(meta: Record<string, unknown> | undefined): boolean {
+  return meta?.nativeTerminalTextEmpty === true || meta?.nativeTerminalTextChars === 0;
 }
 
 /**

@@ -23,8 +23,10 @@ phantombot mcp describe github
 phantombot mcp call github TOOL_NAME --args '{"key":"value"}'
 ```
 
-Search returns only the tools relevant to the task, keeping the model's tool
-surface small. `describe` loads exact schemas for one registered server.
+Search an unknown capability (for example, “inbox” or “attachment”). For a
+known server, use `describe` to load its exact schemas before calling a tool.
+An exact server-id search is a targeted discovery shortcut, but does not
+replace `describe` in the normal known-server workflow.
 
 ## Authentication and trust
 

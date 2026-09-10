@@ -103,4 +103,29 @@ describe("stdio client against a real MCP server", () => {
       await hub.close();
     }
   }, 20_000);
+
+  test("an exact server id targets discovery, and server ids are searchable", async () => {
+    const hub = new McpHub(
+      {
+        mcpServers: {
+          gmail: stdioEntry(false),
+          calendar: stdioEntry(false),
+        },
+      },
+      vault,
+    );
+    try {
+      const targeted = await hub.search("gmail");
+      expect(targeted.errors).toEqual({});
+      expect(targeted.hits.every((h) => h.server === "gmail")).toBe(true);
+      expect(targeted.hits.map((h) => h.tool.name).sort()).toEqual(["echo", "whoami"]);
+
+      const byServerId = await hub.search("calendar");
+      expect(byServerId.errors).toEqual({});
+      expect(byServerId.hits.every((h) => h.server === "calendar")).toBe(true);
+      expect(byServerId.hits.map((h) => h.tool.name).sort()).toEqual(["echo", "whoami"]);
+    } finally {
+      await hub.close();
+    }
+  }, 20_000);
 });

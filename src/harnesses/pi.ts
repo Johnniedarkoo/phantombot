@@ -20,6 +20,9 @@
  *     synthesize the terminal `done` on exit 0, so an exit-0 that stopped
  *     mid-task (only tool narration, no turn_end) falls through to the next
  *     harness instead of being stored as a finished answer (issue #352).
+ *   A terminal turn_end with no native terminal text after tool execution is
+ *     surfaced as a terminal error by the shared runner. It is not retried,
+ *     because replaying a completed tool could repeat side effects.
  *   anything else (agent_start, agent_end, agent_settled,
  *     tool_execution_end, extension_*) → ignored
  *
@@ -910,6 +913,7 @@ export class PiHarness implements Harness {
         // above any realistic tool-run yet well under the hard cap, so a
         // wedged-but-chattery turn fails over in minutes, not an hour. Derived
         // from the idle window, floored at 20 min, and never above the hard cap.
+        rejectEmptyPostToolCompletion: true,
         toolTimeoutMs: Math.min(
           req.hardTimeoutMs ?? Number.POSITIVE_INFINITY,
           Math.max(req.idleTimeoutMs * 4, 1_200_000),
