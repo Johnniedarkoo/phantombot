@@ -1552,6 +1552,7 @@ async function processChatMessage(
     }
     recoveryText = await generateRecoveryReply({
       harnesses,
+      conversation: conversationKey,
       userMessage: msg.text,
       history: recoveryHistory,
       personaName: input.persona,
@@ -1562,6 +1563,14 @@ async function processChatMessage(
   // `errored` itself is left intact so the telemetry below still records
   // that the underlying turn failed.
   const unrecoverable = !!errored && !recoveryText;
+  if (errored) {
+    log.error("turn_failed", {
+      chatId: msg.conversationId,
+      primary_failure: /timed out after .*no output/i.test(errored) ? "harness_idle_timeout" : errored,
+      recovery_failure: recoveryText ? undefined : "recovery_failed_or_timeout",
+      terminal_condition: recoveryText ? "recovered_reply" : "no_user_facing_answer",
+    });
+  }
   const deterministicFallback = unrecoverable
     ? deterministicFailureReply(errored)
     : undefined;

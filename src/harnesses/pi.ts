@@ -75,6 +75,7 @@ import {
 } from "../lib/piDiagnostics.ts";
 import { xdgDataHome } from "../config.ts";
 import { listPiModels, type PiModel } from "../lib/piModels.ts";
+import { HarnessDiagnostics } from "../lib/harnessDiagnostics.ts";
 
 export interface PiHarnessConfig {
   /** Path to the `pi` CLI binary. Default: "pi" (looked up in PATH). */
@@ -430,6 +431,24 @@ export class PiHarness implements Harness {
         captureRaw: Boolean(explicitTraceRoot),
         invocationNumber,
       });
+      const diagnostics = new HarnessDiagnostics();
+      const turnStartedAt = Date.now();
+      const diagnosticActivity = ({ parsed, activity }: { parsed: unknown; activity: HarnessActivity }): void => {
+        const event = parsed && typeof parsed === "object" && typeof (parsed as { type?: unknown }).type === "string"
+          ? (parsed as { type: string }).type : activity;
+        const obj = parsed as Record<string, unknown>;
+        const toolName = typeof obj.toolName === "string" ? obj.toolName : typeof obj.tool_name === "string" ? obj.tool_name : undefined;
+        const callId = typeof obj.toolCallId === "string" ? obj.toolCallId : typeof obj.tool_call_id === "string" ? obj.tool_call_id : `tool-${diagnostics.snapshot().toolCallsStarted + 1}`;
+        if (event === "tool_execution_start" || activity === "tool") {
+          diagnostics.toolStart(toolName ?? "unknown", callId);
+          log.info("tool_start", { turn: req.turnId, phase: "primary", tool_call: callId, tool: toolName ?? "unknown" });
+        } else if (event === "tool_execution_end" || activity === "tool_end") {
+          const before = diagnostics.snapshot();
+          diagnostics.toolEnd("tool_end");
+          log.info("tool_end", { turn: req.turnId, phase: "primary", tool_call: before.activeToolCallId ?? callId, tool: before.activeTool ?? toolName ?? "unknown", elapsed_ms: before.activeToolStartedAt === undefined ? undefined : Date.now() - before.activeToolStartedAt });
+        }
+        else diagnostics.event(event, activity !== "model");
+      };
       let proc: ReturnType<typeof spawnInNewSession>;
       try {
         proc = spawnInNewSession([this.config.bin, ...args], {
@@ -467,6 +486,31 @@ export class PiHarness implements Harness {
         activity: piActivity,
         onStdoutLine: (line, parsed) => trace?.recordStdout(line, parsed),
         onStderrLine: (line) => trace?.recordStderr(line),
+        onActivity: diagnosticActivity,
+        onKill: (cause) => {
+          const s = diagnostics.snapshot();
+          const now = Date.now();
+          if (s.activeTool) log.warn("tool_cancel", {
+            turn: req.turnId, phase: "primary", tool_call: s.activeToolCallId,
+            tool: s.activeTool, elapsed_ms: now - (s.activeToolStartedAt ?? now),
+            reason: cause === "idle" ? "harness_idle_timeout" : cause,
+          });
+          log.warn(cause === "idle" ? "turn_idle_timeout" : "turn_watchdog_kill", {
+            turn: req.turnId,
+            phase: "primary",
+            cause,
+            idle_timeout_ms: req.idleTimeoutMs,
+            turn_elapsed_ms: now - turnStartedAt,
+            last_event: s.lastEvent,
+            last_event_age_ms: now - s.lastEventAt,
+            active_tool: s.activeTool ?? "none",
+            active_tool_call: s.activeToolCallId ?? "none",
+            ...(s.activeToolStartedAt !== undefined ? { active_tool_elapsed_ms: now - s.activeToolStartedAt } : {}),
+            tool_calls_started: s.toolCallsStarted,
+            tool_calls_completed: s.toolCallsCompleted,
+          });
+          trace?.record("turn_timeout_diagnostic", { cause, ...s, turnElapsedMs: now - turnStartedAt });
+        },
         buildDoneMeta: (_finalText, captured) => ({
           harnessId: this.id,
           payloadBytes: totalBytes,

@@ -42,6 +42,8 @@ const RECOVERY_IDLE_TIMEOUT_MS = 30_000;
 const RECOVERY_HARD_TIMEOUT_MS = 60_000;
 
 export interface RecoveryReplyInput {
+  /** Correlation context for diagnostic logs. */
+  conversation?: string;
   /** The harness chain the failed turn used. */
   harnesses: Harness[];
   /** The user's original message — carries the language to mirror. */
@@ -110,6 +112,12 @@ export async function generateRecoveryReply(
   if (input.harnesses.length === 0) return undefined;
 
   let text = "";
+  const startedAt = Date.now();
+  log.info("recovery_start", {
+    conversation: input.conversation,
+    reason: "harness_failure",
+    timeout_ms: RECOVERY_HARD_TIMEOUT_MS,
+  });
   try {
     for await (const chunk of runWithFallback(
       input.harnesses,
@@ -132,17 +140,23 @@ export async function generateRecoveryReply(
         if (chunk.finalText.length > 0) text = chunk.finalText;
       }
       if (chunk.type === "error") {
-        log.warn("recovery: reply generation failed", { error: chunk.error });
+        log.warn("recovery_error", { conversation: input.conversation, elapsed_ms: Date.now() - startedAt, error: chunk.error });
         return undefined;
       }
     }
   } catch (e) {
-    log.warn("recovery: reply generation threw", {
+    log.warn("recovery_error", {
+      conversation: input.conversation,
+      elapsed_ms: Date.now() - startedAt,
       error: (e as Error).message,
     });
     return undefined;
   }
 
   const trimmed = text.trim();
+  log.info(trimmed.length > 0 ? "recovery_success" : "recovery_timeout", {
+    conversation: input.conversation,
+    elapsed_ms: Date.now() - startedAt,
+  });
   return trimmed.length > 0 ? trimmed : undefined;
 }

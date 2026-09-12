@@ -83,6 +83,7 @@ export interface KillCoordinatorOpts {
   harnessId: string;
   /** Grace period between SIGTERM and SIGKILL. Default 5000ms. */
   graceMs?: number;
+  onKill?: (cause: Exclude<KillCause, undefined>) => void;
 }
 
 export interface KillCoordinator {
@@ -134,6 +135,7 @@ export function createKillCoordinator(
   const triggerKill = (newCause: Exclude<KillCause, undefined>): void => {
     if (cause || disposed) return;
     cause = newCause;
+    opts.onKill?.(newCause);
     log.warn(`${opts.harnessId}.invoke killed: ${newCause}`, {
       idleTimeoutMs: opts.idleTimeoutMs,
       hardTimeoutMs: opts.hardTimeoutMs ?? "disabled",
@@ -508,7 +510,10 @@ export interface HarnessProcessSpec {
    */
   earlyError?: () =>
     | { type: "error"; error: string; recoverable: boolean; httpStatus?: number }
-    | undefined;
+      | undefined;
+  /** Diagnostic-only activity hooks; must not affect streaming behavior. */
+  onActivity?: (event: { parsed: unknown; chunk: HarnessChunk; activity: HarnessActivity }) => void;
+  onKill?: (cause: Exclude<KillCause, undefined>) => void;
 }
 
 export async function* runHarnessProcess(
@@ -530,6 +535,7 @@ export async function* runHarnessProcess(
     toolTimeoutMs: spec.toolTimeoutMs,
     signal: req.signal,
     harnessId,
+    onKill: spec.onKill,
   });
 
   // Write stdin then close. EPIPE-tolerant: a proc killed between spawn and
@@ -625,7 +631,9 @@ export async function* runHarnessProcess(
       yield c;
       return;
     }
-    killer.touch(spec.activity(parsed, c));
+    const activity = spec.activity(parsed, c);
+    killer.touch(activity);
+    spec.onActivity?.({ parsed, chunk: c, activity });
     if (c.type === "text") finalText += c.text;
     if (c.type === "done") {
       if (
