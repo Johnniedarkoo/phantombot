@@ -255,8 +255,13 @@ describe("applyModelRequest pi", () => {
       .toBe("openrouter-new");
     expect(config.harnesses.instances?.["pi-fallback"]?.routing?.primaryModel)
       .toBe("gemini-old");
+  });
+
   test("resolves aliases case-insensitively and keeps full ids working", async () => {
-    const config = makeConfig();
+    const config = makeConfig({
+      chain: ["pi-native"],
+      instances: { "pi-native": { type: "native", bin: "pi" } },
+    });
     config.models = {
       aliases: {
         gemma: "llamacpp/gemma4-26b-a4b-qat",
@@ -265,11 +270,11 @@ describe("applyModelRequest pi", () => {
     };
     const alias = await applyModelRequest(
       { kind: "set", role: "primary", slug: "QWEN" },
-      "pi",
+      "pi-native",
       config,
     );
-    expect(alias).toEqual({ ok: true, summary: "pi primary model → llamacpp/qwen3.8-27b-code-c2" });
-    expect(config.harnesses.pi.routing?.primaryModel).toBe(
+    expect(alias).toEqual({ ok: true, summary: "pi-native primary model → llamacpp/qwen3.8-27b-code-c2" });
+    expect(config.harnesses.instances?.["pi-native"]?.routing?.primaryModel).toBe(
       "llamacpp/qwen3.8-27b-code-c2",
     );
 
@@ -279,28 +284,31 @@ describe("applyModelRequest pi", () => {
         role: "primary",
         slug: "llamacpp/gemma4-26b-a4b-qat",
       },
-      "pi",
+      "pi-native",
       config,
     );
     expect(full.ok).toBe(true);
-    expect(config.harnesses.pi.routing?.primaryModel).toBe(
+    expect(config.harnesses.instances?.["pi-native"]?.routing?.primaryModel).toBe(
       "llamacpp/gemma4-26b-a4b-qat",
     );
   });
 
   test("rejects an unknown short alias with available names", async () => {
-    const config = makeConfig();
+    const config = makeConfig({
+      chain: ["pi-native"],
+      instances: { "pi-native": { type: "native", bin: "pi" } },
+    });
     config.models = { aliases: { gemma: "llamacpp/gemma4-26b-a4b-qat" } };
     const result = await applyModelRequest(
       { kind: "set", role: "primary", slug: "quwen" },
-      "pi",
+      "pi-native",
       config,
     );
     expect(result).toEqual({
       ok: false,
       error: "unknown model alias 'quwen' — available aliases: gemma",
     });
-    expect(config.harnesses.pi.routing?.primaryModel).toBeUndefined();
+    expect(config.harnesses.instances?.["pi-native"]?.routing?.primaryModel).toBeUndefined();
   });
 
   test("alias validation rejects case-folded duplicates and reserved words", () => {

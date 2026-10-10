@@ -108,7 +108,6 @@ import {
   createPiTrace,
   traceError,
 } from "../lib/piDiagnostics.ts";
-import { xdgDataHome } from "../config.ts";
 import { listPiModels, type PiModel } from "../lib/piModels.ts";
 import { HarnessDiagnostics } from "../lib/harnessDiagnostics.ts";
 
@@ -946,6 +945,7 @@ export class PiHarness implements Harness {
         // finished answer, so a narration-only mid-task exit falls through to the
         // next harness rather than being stored as the reply (issue #352).
         requireCompletion: true,
+        stopOnError: true,
         // Bound how long a single contiguous tool-run may keep the idle watchdog
         // alive via tool_execution_* activity alone, with no user-facing text. pi
         // only emits tool_execution_update on genuine new output (bash streams

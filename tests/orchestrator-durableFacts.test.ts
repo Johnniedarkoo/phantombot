@@ -802,7 +802,7 @@ describe("makeExtractionComplete", () => {
     // of that prompt must stay inside the persona's tmp.
     const scoped = recording();
     await makeExtractionComplete([scoped.harness], cfg, "/srv/personas/robbie")!("s", "u");
-    expect(scoped.seen.req?.tmpBaseDir).toBe("/srv/personas/robbie/tmp");
+    expect(scoped.seen.req?.tmpBaseDir).toBe(join("/srv/personas/robbie", "tmp"));
 
     // No persona dir given: follows the same homedir() floor as workingDir.
     const floored = recording();
@@ -866,10 +866,17 @@ describe("makeExtractionComplete", () => {
 
   test("is undefined only for an EMPTY chain", () => {
     expect(makeExtractionComplete([], cfg)).toBeUndefined();
+  });
+
   test("uses the active primary harness and never the fallback", async () => {
     const primary = recording();
     const fallback = recording();
-    await makeExtractionComplete([primary.harness, fallback.harness], cfg)!(
+    await makeExtractionComplete(
+      [primary.harness, fallback.harness],
+      cfg,
+      undefined,
+      new CooldownStore(),
+    )!(
       "system",
       "user",
     );

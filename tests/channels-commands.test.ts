@@ -38,6 +38,16 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+async function withProcessPlatform<T>(platform: string, body: () => Promise<T>): Promise<T> {
+  const original = process.platform;
+  Object.defineProperty(process, "platform", { value: platform });
+  try {
+    return await body();
+  } finally {
+    Object.defineProperty(process, "platform", { value: original });
+  }
+}
+
 class StubHarness implements Harness {
   constructor(
     public readonly id: string,
@@ -965,7 +975,7 @@ describe("lifecycle commands: single-flight, not owned (#439, #519)", () => {
       ctx({ persona: "kai", config: multiPersonaConfig(), serviceControl }),
     );
     expect(r!.reply).toContain("restarting");
-    await r!.afterSend!();
+    await withProcessPlatform("linux", () => r!.afterSend!());
     expect(restarted).toBe(true);
   });
 
@@ -1070,7 +1080,7 @@ describe("lifecycle commands: single-flight, not owned (#439, #519)", () => {
       );
       // Nothing is sent until the restart is actually about to happen.
       expect(sent).toEqual([]);
-      await r!.afterSend!();
+      await withProcessPlatform("linux", () => r!.afterSend!());
 
       expect(sent.map((s) => s.token).sort()).toEqual(["tok-kai", "tok-robbie"]);
       expect(sent[0]!.text).toContain("lena");
@@ -1143,7 +1153,7 @@ describe("lifecycle commands: single-flight, not owned (#439, #519)", () => {
           }),
         }),
       );
-      await r!.afterSend!();
+      await withProcessPlatform("linux", () => r!.afterSend!());
 
       // Restart happened despite the hanging send...
       expect(restartCalled).toBe(true);
@@ -1409,7 +1419,7 @@ describe("/model", () => {
         config,
       }),
     );
-    expect(r!.reply).toContain("pi primary model → llamacpp/qwen3.8-27b-code-c2");
+    expect(r!.reply).toContain("native primary model → llamacpp/qwen3.8-27b-code-c2");
     expect(config.harnesses.pi.routing.primaryModel).toBe(
       "llamacpp/qwen3.8-27b-code-c2",
     );

@@ -838,7 +838,7 @@ describe("runHarnessProcess — empty post-tool Pi completion", () => {
     }
 
     expect(chunks).toEqual([
-      { type: "progress", note: "tool: bash", tool: { title: "tool: bash", kind: "execute", locations: [] } },
+      { type: "progress", note: "tool: bash", tool: { title: "tool: bash", kind: "execute", name: "bash", locations: [] } },
       { type: "text", text: "done" },
       { type: "done", finalText: "done", meta: {
         completionMarker: "turn_end",

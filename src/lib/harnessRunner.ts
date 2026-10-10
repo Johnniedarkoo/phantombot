@@ -62,7 +62,7 @@ export type KillCause =
   | "abandoned"
   | "soft"
   | undefined;
-export type HarnessActivity = "model" | "tool" | "productive";
+export type HarnessActivity = "model" | "tool" | "tool_end" | "productive";
 export type ToolBoundary = { phase: "start" | "end"; id: string };
 
 export interface KillCoordinatorOpts {
@@ -606,6 +606,8 @@ export interface HarnessProcessSpec {
    * behaviour every other harness relies on).
    */
   requireCompletion?: boolean;
+  /** Stop consuming the stream after an adapter-level semantic error. */
+  stopOnError?: boolean;
   /** Reject Pi's terminal signal when tool activity produced no user-facing answer. */
   rejectEmptyPostToolCompletion?: boolean;
   /**
@@ -823,7 +825,7 @@ export async function* runHarnessProcess(
       yield c;
       return;
     }
-    if (c.type === "error") {
+    if (c.type === "error" && spec.stopOnError) {
       parsedError = c;
       yield c;
       return;
