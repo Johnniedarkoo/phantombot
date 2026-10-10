@@ -572,10 +572,15 @@ export class PiHarness implements Harness {
     const piApiKey = this.config.mode !== "native" || routing?.useLocalConfig
       ? undefined
       : spawnEnv[this.config.apiKeyEnv ?? ENV_PI_API_KEY]?.trim();
+    // Local llama.cpp routers commonly run without authentication. Pi's
+    // OpenAI-compatible provider accepts an omitted key for these endpoints,
+    // so do not make PhantomBot's vault key a prerequisite for the local path.
+    // Remote providers still fail here with the actionable credential error.
     if (
       this.config.mode === "native" &&
       !routing?.useLocalConfig &&
       provider &&
+      provider !== "llamacpp" &&
       !piApiKey
     ) {
       const secret = this.config.apiKeyEnv ?? ENV_PI_API_KEY;

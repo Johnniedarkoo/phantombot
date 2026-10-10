@@ -1664,6 +1664,27 @@ describe("PiHarness routing (subprocess)", () => {
     expect(argv).not.toContain("--api-key");
   });
 
+  test("native llama.cpp provider can run without an API key", async () => {
+    process.env.FAKE_PI_MODE = "argv";
+    delete process.env.PHANTOMBOT_PI_API_KEY;
+    const argv = (
+      await collect(
+        new PiHarness({
+          bin: FAKE_PI,
+          mode: "native",
+          command: [FAKE_PI],
+          routing: { provider: "llamacpp", primaryModel: "swift-1.5-qwen3.8-27b" },
+        }).invoke(newRequest()),
+      )
+    )
+      .filter((c) => c.type === "text")
+      .map((c) => (c as { text: string }).text)
+      .join("");
+    expect(argv).toContain("--provider llamacpp");
+    expect(argv).toContain("--model swift-1.5-qwen3.8-27b");
+    expect(argv).not.toContain("--api-key");
+  });
+
   test("an opted-out persona passes NO provider/model/api-key, even with a host key in the env", async () => {
     // The persona picked "use Pi's own config". That opt-out has to cover the
     // API KEY as well as the models: the key is read from the ambient env,
