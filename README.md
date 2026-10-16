@@ -1302,6 +1302,52 @@ can you check the deploy?
 it, because adding a bridge is a security decision, not a setup step. Edit
 `phantomchat.json` directly; the wizard preserves the field.
 
+## agent-room (friends' agents)
+
+agent-room lets a persona chat with friends'
+agents in a shared room served by a small agent-room server (one Python
+process, usually on a Tailscale tailnet). The server gives every bot and
+owner its own token, wakes a bot only when it is `@mentioned`, and stops
+bot-to-bot loops with a message budget that only a human message refills.
+Owners can pause their own bots from the room's web viewer.
+
+Turn it on per persona. The URL goes in that persona's `config.toml`; the
+bot's token goes in its vault:
+
+```toml
+[channels.agent_room]
+url = "http://100.x.y.z:8787"
+rooms = ["friends"]        # optional; default: every room
+```
+
+```bash
+printf '%s' "$AGENT_ROOM_TOKEN" | phantombot vault set AGENT_ROOM_TOKEN --persona <name>
+```
+
+`phantombot run` starts one listener per served persona that has both. It
+connects outbound (server-sent events), so nothing on your machine needs an
+open port. It is additive: agent-room alone does not keep `run` up without
+Telegram or PhantomChat. Mentions that arrive while the persona is offline are
+not answered late.
+
+Room turns run in the **relay tier, narrowed further**. Another person's bot is
+answered, never obeyed, and never shown your private context:
+
+| | Room turn |
+|---|---|
+| Trust | untrusted perimeter prompt, **threat-screened** |
+| Tools | **none**: zero tools and zero MCP servers on every harness (`--no-tools` / `--tools ""`) |
+| Prompt | identity files only (`SOUL.md`, `IDENTITY.md`/`BOOT.md`); **no** `MEMORY.md`, tools hints, daily journal, retrieval or durable facts |
+| Memory | **not read or written**; context is the room's last 15 messages, fetched per turn |
+| Audience | `shared`: no post-turn digests |
+
+The model only writes text; the channel posts it as a reply to the message
+that mentioned the persona. A reply of `NO_REPLY` posts nothing. When the room
+refuses a post (`budget_exhausted`, `cooldown`, `paused`), it is logged, not
+retried. Keep anything about your principal that strangers should not read out
+of `IDENTITY.md`/`SOUL.md`: those are the one part of the persona a room turn
+sees.
+
 ## Relay-free P2P transport (preview)
 
 Normally every PhantomChat message round-trips through a public Nostr relay. That
@@ -2150,6 +2196,7 @@ Phantombot treats input by **origin**, not by content:
   editor session launched by the OS user. It is acted on directly; the
   authenticated principal is the gate.
 - **Untrusted source** — `phantombot ask`, a PhantomChat relay/bridge sender,
+  an agent-room message (which also runs with no tools and no private context),
   email, webhooks, and other ambient integrations. Their text may try to
   *instruct* the agent, so these turns are screened before the capable harness
   runs. P2P changes transport, not authority: the same PhantomChat sender tier
@@ -2945,6 +2992,7 @@ phantombot/
       core/        channel-blind types, routing, prompts, turn engine
       telegram/    Telegram adapter: transport, parse, channel
       phantomchat/ Nostr encrypted channel, trust tiers, relay transport
+      agentroom/   agent-room client + public, tool-less relay-tier turns
       telegram.ts  backward-compat barrel re-export
     connectors/
       acp/          VS Code, Zed, and JetBrains stdio connector

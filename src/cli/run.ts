@@ -18,6 +18,8 @@ import {
 import { TELEGRAM_BOT_COMMANDS } from "../channels/commands.ts";
 import { createPhantomchatChannel } from "../channels/phantomchat/channel.ts";
 import { runPhantomchatServer } from "../channels/phantomchat/server.ts";
+import { runAgentRoomServer } from "../channels/agentroom/server.ts";
+import { getPersonaSecretStrict } from "../lib/vaultSecrets.ts";
 import { SimplePoolPhantomchatTransport } from "../channels/phantomchat/transport.ts";
 import {
   listPhantomchatPersonas,
@@ -132,6 +134,8 @@ export interface RunInput {
    * stub so run-wiring can be asserted without touching real relays.
    */
   runPhantomchatServer?: typeof runPhantomchatServer;
+  /** Test seam for the agent-room listener. */
+  runAgentRoomServer?: typeof runAgentRoomServer;
   /**
    * Test seam for per-persona config resolution (phantombot#439). Production
    * calls `loadConfig(persona)`, which layers `<persona>/config.toml` over the
@@ -1273,6 +1277,55 @@ export async function runRun(input: RunInput = {}): Promise<number> {
         }
       }
     }
+    // agent-room listeners: a shared chat room with
+    // friends' agents. Opt-in per served persona: `[channels.agent_room] url`
+    // in its config.toml plus `AGENT_ROOM_TOKEN` in its vault. Additive to
+    // Telegram/PhantomChat; agent-room alone does not keep `run` up. The
+    // listener never throws, so a dead room server cannot take siblings down.
+    const startAgentRoom = input.runAgentRoomServer ?? runAgentRoomServer;
+    for (const persona of servedPersonasOf(config)) {
+      const personaConfig = withHostHarnessBins(
+        personaConfigs.get(persona) ?? config,
+        config,
+      );
+      const settings = personaConfig.agentRoom;
+      if (!settings || !existsSync(personaDir(config, persona))) continue;
+      const token = await getPersonaSecretStrict(
+        config,
+        "AGENT_ROOM_TOKEN",
+        persona,
+      );
+      if (!token) {
+        err.write(
+          `warning: agent-room is configured for '${persona}' but its vault has no AGENT_ROOM_TOKEN — skipping
+`,
+        );
+        continue;
+      }
+      const roomHarnesses = buildHarnessChain(personaConfig, err, persona);
+      if (roomHarnesses.length === 0) {
+        err.write(
+          `warning: agent-room persona '${persona}' has no usable harnesses — skipping
+`,
+        );
+        continue;
+      }
+      tasks.push(
+        startAgentRoom({
+          config: personaConfig,
+          persona,
+          agentDir: personaDir(config, persona),
+          harnesses: roomHarnesses,
+          memory,
+          settings,
+          token,
+          signal: ac.signal,
+          out,
+          err,
+        }),
+      );
+    }
+
     try {
       await Promise.all(tasks);
     } catch (e) {

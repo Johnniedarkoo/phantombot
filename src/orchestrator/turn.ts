@@ -132,8 +132,24 @@ export interface TurnInput {
    * background turns whose job is known up front (nightly); claude honours
    * it, pi/codex ignore it. See HarnessRequest.toolsMode — and note it is
    * defence-in-depth, NOT a trust boundary.
+   *
+   * `"none"` is the real boundary: zero tools on every harness (claude
+   * `--tools ""`, pi `--no-tools`). Used by agent-room turns, which only
+   * converse — the channel posts the reply itself.
    */
-  toolsMode?: { allow: string[] };
+  toolsMode?: "none" | { allow: string[] };
+  /**
+   * PUBLIC CONTEXT: build this turn's prompt from the persona's identity
+   * (SOUL.md / IDENTITY.md / BOOT.md) ONLY. Drops MEMORY.md and the tools
+   * hints, and skips the daily journal, `retrieve`, `pullFacts`,
+   * `indexTurns` and `extractFacts` even if the caller passes them.
+   *
+   * For turns whose reply goes to OTHER PEOPLE'S agents (agent-room): the
+   * principal's private notes must not be in a prompt that strangers can
+   * talk to. Pair with `noHistory` so nothing is persisted either, and with
+   * `replyAudience: "shared"` so no digest is injected.
+   */
+  publicContext?: boolean;
   /**
    * Append PRE_TOOL_NARRATION_INSTRUCTION to the system prompt — asks
    * the model to say one short sentence before each tool call so
@@ -366,7 +382,18 @@ async function* runTurnBody(
     input.persona,
     input.conversation,
   );
-  const persona = await loadPersona(input.agentDir);
+  const loadedPersona = await loadPersona(input.agentDir);
+  // Public-context turns see who the persona IS, never what it knows about
+  // its principal (see TurnInput.publicContext).
+  const persona = input.publicContext
+    ? {
+        ...loadedPersona,
+        memory: undefined,
+        memorySource: undefined,
+        tools: undefined,
+        toolsSource: undefined,
+      }
+    : loadedPersona;
 
   const history = input.noHistory
     ? []
@@ -442,7 +469,7 @@ async function* runTurnBody(
   // die on retrieval. Reached only for trusted turns or untrusted turns that
   // PASSED the screen above.
   let retrievedMemory: string | undefined;
-  if (input.retrieve) {
+  if (input.retrieve && !input.publicContext) {
     try {
       retrievedMemory = await input.retrieve(input.userMessage, input.signal);
     } catch {
@@ -456,7 +483,7 @@ async function* runTurnBody(
   // suspenders try/catch: pullFacts already swallows its own failures, but a
   // turn must never die on the fact read.
   let durableFacts: string | undefined;
-  if (input.pullFacts) {
+  if (input.pullFacts && !input.publicContext) {
     try {
       durableFacts = await input.pullFacts(input.signal);
     } catch {
@@ -472,7 +499,7 @@ async function* runTurnBody(
   // which are handed the exact date they are distilling and would otherwise
   // read the same content twice. Pure disk + JSON, no LLM, never throws.
   let dailyRecall: string | undefined;
-  if (!input.skipDailyRecall && !isNightlyConversation(input.conversation)) {
+  if (!input.skipDailyRecall && !input.publicContext && !isNightlyConversation(input.conversation)) {
     try {
       dailyRecall = (
         await buildDailyRecall(
@@ -641,7 +668,7 @@ async function* runTurnBody(
       trusted: input.trusted === true,
       screening: effectiveScreening,
       mcpMode: input.mcpMode ?? "default",
-      tools: input.toolsMode?.allow,
+      tools: input.toolsMode === "none" ? [] : input.toolsMode?.allow,
     }),
   };
   let epochPlan: PromptCacheEpochPlan | undefined;
@@ -840,7 +867,7 @@ async function* runTurnBody(
       }
     }
 
-    if (input.indexTurns) {
+    if (input.indexTurns && !input.publicContext) {
       try {
         await input.indexTurns();
       } catch {
@@ -855,7 +882,7 @@ async function* runTurnBody(
     // is already fully streamed by now; extraction catches up in the
     // background. A throw is swallowed so a failing extraction can never break
     // the turn. `false`/undefined skips it entirely (the test seam).
-    if (input.extractFacts) {
+    if (input.extractFacts && !input.publicContext) {
       const extract = input.extractFacts;
       void Promise.resolve()
         .then(() => extract())

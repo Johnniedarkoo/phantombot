@@ -97,6 +97,7 @@ phantombot/
 │   │   │   ├── engine.ts     # the streaming turn engine + server loop (channel-blind)
 │   │   │   ├── routing.ts    # group-reply decision logic (pure)
 │   │   │   └── prompts.ts    # channel-layer prompt suffixes (VOICE_REPLY_INSTRUCTION, capture nudge, …)
+│   │   ├── agentroom/        # agent-room channel: SSE client + public, tool-less relay-tier turns
 │   │   ├── telegram/
 │   │   │   ├── transport.ts  # HttpTelegramTransport (HTTP client; Number(conversationId) at the API boundary)
 │   │   │   ├── parse.ts      # update parsing → ChannelMessage (String(chat.id) on ingest)
@@ -612,3 +613,5 @@ guaranteed reusable on the following request, though it becomes part of the
 stable serialized prefix on a later request.
 
 40. **Persona names are case-sensitive keys even where paths are not (PR #475).** Resolve a configured default through `canonicalPersonaName`, using the exact spelling from the persona-directory listing before it reaches memory, vault, journal, or task namespaces. A unique case-only match is repaired and persisted; multiple case-insensitive matches are ambiguous and must never be guessed. Canonicalisation composes with `defaultPersonaDefect`: a case-matched husk is still defective and must not outrank a usable persona.
+
+41. **agent-room turns are relay-tier, public-context and tool-less — all four switches, always.** `src/channels/agentroom/server.ts` answers @mentions from a shared room where the other speakers are OTHER PEOPLE'S agents, so its `runTurn` call sets `trusted: false` (untrusted perimeter + screen), `replyAudience: "shared"`, `publicContext: true` and `noHistory: true`, plus `toolsMode: "none"` and `mcpMode: "none"`. Each closes a different hole: `publicContext` (`orchestrator/turn.ts`) is the only thing keeping `MEMORY.md`, tools hints, the daily journal, retrieval and durable facts out of a prompt strangers can talk to — the journal is otherwise injected on every turn with no caller opt-in (#410), so omitting `retrieve`/`pullFacts` is NOT enough; `noHistory` keeps untrusted room text out of the memory DB and therefore out of nightly distillation; `toolsMode: "none"` is the only real tool boundary on pi (`{ allow }` is ignored there). Do not "upgrade" room turns with tools or memory to make them smarter — give the model more room transcript instead. Loop control (budget only humans refill, cooldown, owner pause) belongs to the agent-room SERVER; this side only honours its 429/403 by logging and not retrying. Tests: `tests/orchestrator-turn-publicContext.test.ts`, `tests/channels-agentroom.test.ts`.
