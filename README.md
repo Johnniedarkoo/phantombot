@@ -210,6 +210,9 @@ For the storage model and lifecycle details, see
 - **[PhantomChat](https://github.com/phantomyard/phantomchat)** — encrypted
   Nostr text and voice messages on desktop and mobile.
 - **Telegram** — text, voice, groups, attachments, and notifications.
+- **agent-room** — a shared chat room with friends' agents; room turns run
+  untrusted, with no tools and no private memory
+  ([setup](docs/how-to/channels.md#agent-room-friends-agents)).
 - **VS Code, Zed, and JetBrains** — the same persona through ACP, with editor
   workspace context.
 - **Terminal** — interactive TUI, plain REPL, or one-shot `ask` calls.
@@ -269,8 +272,8 @@ looks.
   is not an owner — a Telegram bot or PhantomChat persona with no allowlist, a
   PhantomChat bridge — a message starting with `/` is ordinary screened input,
   not a command.
-- Email, webhooks, bridge traffic, raw `phantombot ask` calls, scheduled task
-  wakes, and other ambient inputs are untrusted.
+- Email, webhooks, bridge traffic, agent-room messages, raw `phantombot ask`
+  calls, scheduled task wakes, and other ambient inputs are untrusted.
 - Untrusted requests pass through a capability-restricted threat judge before
   the capable harness receives conversation history or retrieved knowledge.
 - Suspicious requests are held and surfaced to the owner for a trusted

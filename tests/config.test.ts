@@ -1306,6 +1306,35 @@ describe("loadConfig — p2p (phantombot#258, #61)", () => {
   });
 });
 
+describe("loadConfig — agent_room channel", () => {
+  async function writeConfig(body: string): Promise<void> {
+    const configDir = join(workdir, "config", "phantombot");
+    await mkdir(configDir, { recursive: true });
+    await writeFile(join(configDir, "config.toml"), body);
+  }
+
+  test("absent unless a url is configured", async () => {
+    expect((await loadConfig()).agentRoom).toBeUndefined();
+    await writeConfig('[channels.agent_room]\nrooms = ["friends"]');
+    expect((await loadConfig()).agentRoom).toBeUndefined();
+  });
+
+  test("url (trailing slash trimmed) and optional rooms", async () => {
+    await writeConfig(
+      '[channels.agent_room]\nurl = "http://100.64.0.1:8787/"\nrooms = ["friends"]',
+    );
+    expect((await loadConfig()).agentRoom).toEqual({
+      url: "http://100.64.0.1:8787",
+      rooms: ["friends"],
+    });
+  });
+
+  test("a url without a scheme is an error", async () => {
+    await writeConfig('[channels.agent_room]\nurl = "100.64.0.1:8787"');
+    await expect(loadConfig()).rejects.toThrow("agent_room");
+  });
+});
+
 describe("loadConfig — update_channel (release rings, #432)", () => {
   async function writeConfig(body: string): Promise<void> {
     const cfgDir = join(workdir, "config", "phantombot");

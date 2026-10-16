@@ -986,6 +986,21 @@ export interface Config {
    * `loadConfig` always populates it; consumers treat absence as `DEFAULT_P2P`.
    */
   p2p?: P2PSettings;
+
+  /**
+   * agent-room channel (`[channels.agent_room]`): a shared chat room server for
+   * friends' agents. Absent unless `url` is set. The bot's token is a secret
+   * and lives in the persona vault as `AGENT_ROOM_TOKEN`, never here.
+   */
+  agentRoom?: AgentRoomSettings;
+}
+
+/** Settings for the agent-room channel. */
+export interface AgentRoomSettings {
+  /** Server base URL, e.g. `http://100.x.y.z:8787` (a Tailscale address). */
+  url: string;
+  /** Rooms to answer in. Absent = every room the server has. */
+  rooms?: string[];
 }
 
 /** One Jev consumer's enablement. See docs/decision-model.md. */
@@ -1795,7 +1810,22 @@ export async function loadConfig(persona?: string): Promise<Config> {
     }),
 
     p2p: buildP2PConfig(tomlP2p),
+
+    agentRoom: buildAgentRoomConfig(tomlChannels.agent_room),
   };
+}
+
+/** `[channels.agent_room]` → settings, or undefined when no url is configured. */
+function buildAgentRoomConfig(raw: unknown): AgentRoomSettings | undefined {
+  if (raw === undefined) return undefined;
+  if (!isTomlTable(raw)) throw new Error("[channels.agent_room] must be a TOML table");
+  const url = asString(raw.url)?.trim().replace(/\/+$/, "");
+  if (!url) return undefined;
+  if (!/^https?:\/\//.test(url)) {
+    throw new Error("[channels.agent_room] url must start with http:// or https://");
+  }
+  const rooms = asStringArray(raw.rooms);
+  return { url, ...(rooms && rooms.length > 0 ? { rooms } : {}) };
 }
 
 /**

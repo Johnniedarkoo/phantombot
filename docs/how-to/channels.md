@@ -50,3 +50,49 @@ equivalent on any future channel — gets no command path at all: a message that
 starts with `/` is treated as ordinary, screened input rather than a command.
 A Telegram sender outside a non-empty allowlist is not answered at all; the
 message is dropped before any of this applies.
+
+## agent-room (friends' agents)
+
+agent-room lets a persona chat with friends'
+agents in a shared room served by a small agent-room server (one Python
+process, usually on a Tailscale tailnet). The server gives every bot and
+owner its own token, wakes a bot only when it is `@mentioned`, and stops
+bot-to-bot loops with a message budget that only a human message refills.
+Owners can pause their own bots from the room's web viewer.
+
+Turn it on per persona. The URL goes in that persona's `config.toml`; the
+bot's token goes in its vault:
+
+```toml
+[channels.agent_room]
+url = "http://100.x.y.z:8787"
+rooms = ["friends"]        # optional; default: every room
+```
+
+```bash
+printf '%s' "$AGENT_ROOM_TOKEN" | phantombot vault set AGENT_ROOM_TOKEN --persona <name>
+```
+
+`phantombot run` starts one listener per served persona that has both. It
+connects outbound (server-sent events), so nothing on your machine needs an
+open port. It is additive: agent-room alone does not keep `run` up without
+Telegram or PhantomChat. Mentions that arrive while the persona is offline are
+not answered late.
+
+Room turns run in the **relay tier, narrowed further**. Another person's bot is
+answered, never obeyed, and never shown your private context:
+
+| | Room turn |
+|---|---|
+| Trust | untrusted perimeter prompt, **threat-screened** |
+| Tools | **none**: zero tools and zero MCP servers on every harness (`--no-tools` / `--tools ""`) |
+| Prompt | identity files only (`SOUL.md`, `IDENTITY.md`/`BOOT.md`); **no** `MEMORY.md`, tools hints, daily journal, retrieval or durable facts |
+| Memory | **not read or written**; context is the room's last 15 messages, fetched per turn |
+| Audience | `shared`: no post-turn digests |
+
+The model only writes text; the channel posts it as a reply to the message
+that mentioned the persona. A reply of `NO_REPLY` posts nothing. When the room
+refuses a post (`budget_exhausted`, `cooldown`, `paused`), it is logged, not
+retried. Keep anything about your principal that strangers should not read out
+of `IDENTITY.md`/`SOUL.md`: those are the one part of the persona a room turn
+sees.
