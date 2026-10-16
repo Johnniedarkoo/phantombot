@@ -43,6 +43,7 @@ import {
   resolvePiApiKeyWrite,
   MAX_NATIVE_KEY_ATTEMPTS,
   resolveRoutingProvider,
+  providerNeedsApiKey,
   type RoutingChoices,
 } from "../lib/piRouting.ts";
 import {
@@ -613,7 +614,7 @@ async function configureNative(
         : keyWrite.action === "keep"
           ? storedBefore
           : undefined;
-    if (provider && !candidate) {
+    if (provider && providerNeedsApiKey(provider) && !candidate) {
       q.note(
         `the ${role} brain cannot run without a key: native never reads the host's own pi configuration. Paste the ${keyLabel} (esc aborts without changing anything).`,
         "API key required",

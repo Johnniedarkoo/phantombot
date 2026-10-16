@@ -405,3 +405,18 @@ export function computeRoutingClears(): {
     },
   };
 }
+
+
+/**
+ * Local providers that run without authentication. Native normally refuses a
+ * slot with no resolvable key (it never reads the host ~/.pi), but a local
+ * llama.cpp router has no key to give. The harness, the key copy pass, doctor,
+ * the legacy-`pi` reconcile and both Brain wizards all ask THIS function, so
+ * none of them can disagree about whether a slot can run.
+ */
+export const KEYLESS_PI_PROVIDERS: ReadonlySet<string> = new Set(["llamacpp"]);
+
+/** Does a native slot on `provider` need an API key to run? */
+export function providerNeedsApiKey(provider: string | undefined): boolean {
+  return !provider || !KEYLESS_PI_PROVIDERS.has(provider);
+}

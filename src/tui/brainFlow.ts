@@ -38,6 +38,7 @@ import {
 } from "../lib/piModels.ts";
 import {
   MAX_NATIVE_KEY_ATTEMPTS,
+  providerNeedsApiKey,
   resolvePiApiKeyWrite,
   type RoutingChoices,
 } from "../lib/piRouting.ts";
@@ -383,7 +384,7 @@ export async function configureNative(
         : gateWrite.action === "keep"
           ? current.storedKey
           : undefined;
-    if (!provider || gateCandidate) break;
+    if (!provider || !providerNeedsApiKey(provider) || gateCandidate) break;
     if (attempt > MAX_NATIVE_KEY_ATTEMPTS) {
       q.note(
         "API key required",

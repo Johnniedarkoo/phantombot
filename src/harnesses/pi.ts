@@ -62,6 +62,7 @@ import {
   ENV_PI_PROVIDER,
   ENV_ROUTING_JSON,
   type PiRoutingConfig,
+  providerNeedsApiKey,
 } from "../lib/piRouting.ts";
 import { PI_PROVIDER_CATALOG } from "../lib/piModels.ts";
 import type { ParseEventResult } from "./reasoningReplay.ts";
@@ -580,7 +581,7 @@ export class PiHarness implements Harness {
       this.config.mode === "native" &&
       !routing?.useLocalConfig &&
       provider &&
-      provider !== "llamacpp" &&
+      providerNeedsApiKey(provider) &&
       !piApiKey
     ) {
       const secret = this.config.apiKeyEnv ?? ENV_PI_API_KEY;

@@ -590,6 +590,8 @@ export interface DoctorReport {
       secretName: string;
       provider?: string;
       resolved: boolean;
+      /** Keyless local provider: resolved because no key is needed. */
+      keyless?: boolean;
       repairedWith?: string;
     }[];
   };
@@ -2092,7 +2094,10 @@ export async function runDoctor(input: RunDoctorInput = {}): Promise<number> {
     }
     for (const k of r.nativeKeys ?? []) {
       const where = k.persona ? `persona '${k.persona}'` : "default chain";
-      if (k.resolved) {
+      if (k.keyless) {
+        out.write(`  native key (${where}, ${k.id}): OK — none needed for local provider '${k.provider}'
+`);
+      } else if (k.resolved) {
         const how = k.repairedWith ? ` (${k.repairedWith})` : "";
         out.write(`  native key (${where}, ${k.id}): OK — ${k.secretName}${how}\n`);
       } else {
@@ -2461,6 +2466,7 @@ export async function computeHarnessConfigReport(
         secretName: slot.secretName,
         provider: slot.provider,
         resolved: slot.source !== "missing",
+        ...(slot.source === "not-required" ? { keyless: true } : {}),
         ...(repairedWith.has(p) && slot.source !== "missing"
           ? { repairedWith: repairedWith.get(p) }
           : {}),

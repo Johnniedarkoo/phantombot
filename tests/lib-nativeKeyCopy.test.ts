@@ -130,6 +130,29 @@ describe("readAuthStoreKey", () => {
 });
 
 describe("copyNativeKeys", () => {
+  test("a keyless local llamacpp slot resolves as not-required and copies nothing", async () => {
+    const config = await configFor(
+      [
+        "[harnesses]",
+        'chain = ["native"]',
+        "[harnesses.pi.routing]",
+        'provider = "llamacpp"',
+        'primary_model = "llamacpp/swift"',
+      ].join("\n"),
+    );
+    const vault = fakeVault();
+    const r = await copyNativeKeys({
+      config,
+      persona: "alice",
+      vault,
+      vaultInjected: true,
+      authPath: authStore({}),
+    });
+    expect(r.slots.map((s) => s.source)).toEqual(["not-required"]);
+    expect(r.stillMissing).toEqual([]);
+    expect(vault.writes).toEqual([]);
+  });
+
   test("a stored key is kept and nothing is written", async () => {
     const config = await configFor(TWO_NATIVE);
     const vault = fakeVault({ [PRIMARY]: "sk-1", [FALLBACK]: "sk-2" });

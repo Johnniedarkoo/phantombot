@@ -43,6 +43,7 @@ import { nativeApiKeyNameFor } from "../harnesses/buildChain.ts";
 import { identityFromNsec } from "./nostrIdentity.ts";
 import { readPersonaIdentityNsec } from "./personaIdentity.ts";
 import { piAuthJsonPath } from "./piAuthStore.ts";
+import { providerNeedsApiKey } from "./piRouting.ts";
 import { openPersonaVault, openVaultWithSecret, vaultPath } from "./vault.ts";
 
 export interface NativeSlotKey {
@@ -60,6 +61,8 @@ export type NativeKeySource =
   | "auth-store"
   | "openrouter-row"
   | "sibling"
+  /** A keyless local provider (llama.cpp): there is no key to resolve. */
+  | "not-required"
   | "missing";
 
 export interface NativeKeyStatus {
@@ -239,7 +242,11 @@ export async function copyNativeKeys(
       if (stored) values.set(slot.secretName, stored);
       statuses.push({
         ...slot,
-        source: stored ? "stored" : "missing",
+        source: stored
+          ? "stored"
+          : slot.provider && !providerNeedsApiKey(slot.provider)
+            ? "not-required"
+            : "missing",
       });
     }
 

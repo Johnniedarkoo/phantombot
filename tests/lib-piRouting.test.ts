@@ -258,3 +258,12 @@ describe("resolvePiApiKeyWrite — blank key only kept when provider unchanged",
     });
   });
 });
+
+describe("providerNeedsApiKey", () => {
+  test("only keyless local providers skip the key requirement", async () => {
+    const { providerNeedsApiKey } = await import("../src/lib/piRouting.ts");
+    expect(providerNeedsApiKey("llamacpp")).toBe(false);
+    expect(providerNeedsApiKey("openrouter")).toBe(true);
+    expect(providerNeedsApiKey(undefined)).toBe(true);
+  });
+});
